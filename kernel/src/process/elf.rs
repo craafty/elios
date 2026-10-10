@@ -10,6 +10,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::address_space::{AddressSpace, PROT_EXEC, PROT_READ, PROT_WRITE, STACK_SIZE, STACK_TOP, USER_END};
+use super::credentials::Credentials;
 use crate::errno::{Errno, Result};
 use crate::memory::PAGE_SIZE;
 use crate::random;
@@ -226,6 +227,7 @@ pub fn build_stack(
     arguments: &[String],
     environment: &[String],
     path: &str,
+    credentials: &Credentials,
 ) -> Result<u64> {
     let total: usize = arguments.iter().chain(environment).map(|s| s.len() + 1).sum();
     if total > MAX_ARGUMENT_BYTES {
@@ -251,14 +253,14 @@ pub fn build_stack(
         (AT_BASE, program.interpreter_base),
         (AT_FLAGS, 0),
         (AT_ENTRY, program.entry),
-        (AT_UID, 0),
-        (AT_EUID, 0),
-        (AT_GID, 0),
-        (AT_EGID, 0),
+        (AT_UID, u64::from(credentials.uid)),
+        (AT_EUID, u64::from(credentials.euid)),
+        (AT_GID, u64::from(credentials.gid)),
+        (AT_EGID, u64::from(credentials.egid)),
         (AT_PLATFORM, platform),
         (AT_HWCAP, hardware_capabilities),
         (AT_CLKTCK, 100),
-        (AT_SECURE, 0),
+        (AT_SECURE, u64::from(credentials.is_elevated())),
         (AT_RANDOM, random_address),
         (AT_EXECFN, execfn),
         (AT_NULL, 0),

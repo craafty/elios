@@ -43,7 +43,7 @@ pub fn create() -> (Arc<OpenFile>, Arc<OpenFile>) {
 impl Inode for Pipe {
     fn metadata(&self) -> Metadata {
         let size = self.state.lock().buffer.len() as u64;
-        Metadata { kind: FileKind::Fifo, inode: self.inode, size, permissions: 0o600, modified: 0 }
+        Metadata { size, ..Metadata::virtual_file(FileKind::Fifo, self.inode, 0o600) }
     }
 
     fn seekable(&self) -> bool {

@@ -20,7 +20,7 @@ commands:
   image        build a fresh disk image (for a USB stick or another VM)
   session      boot, type the given steps at the shell, print a transcript
                (steps: `command`, `@raw TEXT`, `@sleep S`, `@key NAME`,
-               `@screenshot FILE.png`, `@monitor COMMAND`; see
+               `@screenshot FILE.png`, `@monitor COMMAND`, `@wait TEXT`; see
                xtask/src/session.rs)
 
 options:
@@ -301,14 +301,21 @@ fn build_initrd() -> Result<PathBuf, String> {
     for (name, _) in APPLETS {
         symlink("eliutils", &bin.join(name))?;
     }
+    let eliauth = eliutils.with_file_name("eliauth");
+    fs::copy(&eliauth, bin.join("eliauth")).map_err(|e| format!("copying eliauth: {e}"))?;
+    for (name, _) in AUTH_APPLETS {
+        symlink("eliauth", &bin.join(name))?;
+    }
     symlink("/bin/eliutils", &sbin.join("init"))?;
+    // Root's home starts out like everyone else's.
+    copy_tree(&rootfs.join("etc/skel"), &rootfs.join("root"))?;
     build_c_programs(&root.join("user/c"), &rootfs)?;
     add_busybox(&rootfs)?;
 
     let mut archive = Vec::new();
     let mut inode = 1;
     add_to_cpio(&mut archive, &rootfs, "", &mut inode)?;
-    cpio_entry(&mut archive, 0, "TRAILER!!!", 0, &[]);
+    cpio_entry(&mut archive, 0, "TRAILER!!!", 0, 0, &[]);
     let path = root.join("target/initrd.cpio");
     fs::write(&path, archive).map_err(|e| format!("writing {}: {e}", path.display()))?;
     Ok(path)
@@ -438,6 +445,18 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Files whose permissions differ from the usual (0755 for directories and
+/// programs, 0644 for everything else). Everything belongs to root.
+const SPECIAL_PERMISSIONS: &[(&str, u32)] = &[
+    // su, sudo and passwd run as root whoever starts them.
+    ("bin/eliauth", 0o4755),
+    // Password hashes are for root's eyes only.
+    ("etc/shadow", 0o600),
+    ("root", 0o700),
+    // Anyone may create files here, but only delete their own.
+    ("tmp", 0o1777),
+];
+
 /// Adds a directory tree to a cpio archive, parents before children, in a
 /// stable order.
 fn add_to_cpio(archive: &mut Vec<u8>, directory: &Path, prefix: &str, inode: &mut u32) -> Result<(), String> {
@@ -450,17 +469,24 @@ fn add_to_cpio(archive: &mut Vec<u8>, directory: &Path, prefix: &str, inode: &mu
         let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
         let kind = entry.file_type().map_err(|e| e.to_string())?;
         *inode += 1;
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |age| age.as_secs() as u32);
+        let special = SPECIAL_PERMISSIONS.iter().find(|(path, _)| *path == name).map(|(_, permissions)| *permissions);
         if kind.is_symlink() {
             let target = fs::read_link(entry.path()).map_err(|e| e.to_string())?;
-            cpio_entry(archive, *inode, &name, 0o120777, target.to_string_lossy().as_bytes());
+            cpio_entry(archive, *inode, &name, 0o120777, modified, target.to_string_lossy().as_bytes());
         } else if kind.is_dir() {
-            cpio_entry(archive, *inode, &name, 0o040755, &[]);
+            cpio_entry(archive, *inode, &name, 0o040000 | special.unwrap_or(0o755), modified, &[]);
             add_to_cpio(archive, &entry.path(), &format!("{name}/"), inode)?;
         } else {
             let data = fs::read(entry.path()).map_err(|e| format!("reading {}: {e}", entry.path().display()))?;
             let executable = name.starts_with("bin/") || name.starts_with("usr/bin/") || name.contains(".so");
-            let mode = if executable { 0o100755 } else { 0o100644 };
-            cpio_entry(archive, *inode, &name, mode, &data);
+            let permissions = special.unwrap_or(if executable { 0o755 } else { 0o644 });
+            cpio_entry(archive, *inode, &name, 0o100000 | permissions, modified, &data);
         }
     }
     Ok(())
@@ -468,8 +494,9 @@ fn add_to_cpio(archive: &mut Vec<u8>, directory: &Path, prefix: &str, inode: &mu
 
 /// One entry in the cpio "newc" format: a header of 8-digit hex fields, the
 /// name, the data, each padded to 4 bytes.
-fn cpio_entry(archive: &mut Vec<u8>, inode: u32, name: &str, mode: u32, data: &[u8]) {
-    let fields = [inode, mode, 0, 0, 1, 0, data.len() as u32, 0, 0, 0, 0, name.len() as u32 + 1, 0];
+/// Everything belongs to root (user and group 0).
+fn cpio_entry(archive: &mut Vec<u8>, inode: u32, name: &str, mode: u32, modified: u32, data: &[u8]) {
+    let fields = [inode, mode, 0, 0, 1, modified, data.len() as u32, 0, 0, 0, 0, name.len() as u32 + 1, 0];
     archive.extend_from_slice(b"070701");
     for field in fields {
         archive.extend_from_slice(format!("{field:08X}").as_bytes());

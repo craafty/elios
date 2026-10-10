@@ -21,6 +21,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::errno::{Errno, Result};
+use crate::process::credentials::{self, Credentials, Gid, Uid};
 use crate::sync::{Once, SpinLock};
 use crate::task::WaitQueue;
 
@@ -81,8 +82,35 @@ pub struct Metadata {
     pub size: u64,
     /// Permission bits (the low 12 bits of `st_mode`).
     pub permissions: u32,
+    pub uid: Uid,
+    pub gid: Gid,
+    /// How many directory entries refer to it.
+    pub links: u32,
     /// Seconds since the Unix epoch.
     pub modified: u64,
+}
+
+impl Metadata {
+    /// Metadata for something owned by root that isn't stored anywhere (a
+    /// device, a pipe, a /proc file): one link, never modified.
+    pub const fn virtual_file(kind: FileKind, inode: u64, permissions: u32) -> Self {
+        Self { kind, inode, size: 0, permissions, uid: 0, gid: 0, links: 1, modified: 0 }
+    }
+}
+
+/// Who a new file belongs to and its permission bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Attributes {
+    pub permissions: u32,
+    pub uid: Uid,
+    pub gid: Gid,
+}
+
+impl Attributes {
+    /// Root's, with these permissions (for files the kernel makes).
+    pub const fn root(permissions: u32) -> Self {
+        Self { permissions, uid: 0, gid: 0 }
+    }
 }
 
 /// A file system object. Every operation has a default that refuses it, so
@@ -123,8 +151,25 @@ pub trait Inode: Send + Sync {
         Err(Errno::ENOTDIR)
     }
 
-    fn create(&self, _name: &str, _kind: FileKind) -> Result<Arc<dyn Inode>> {
+    /// Makes a new, empty entry. Symbolic links start with an empty target,
+    /// written with `write_at`.
+    fn create(&self, _name: &str, _kind: FileKind, _attributes: Attributes) -> Result<Arc<dyn Inode>> {
         Err(Errno::ENOTDIR)
+    }
+
+    /// Changes the permission bits (the low 12 of the mode).
+    fn set_permissions(&self, _permissions: u32) -> Result<()> {
+        Err(Errno::EPERM)
+    }
+
+    /// Changes the owner and group.
+    fn set_owner(&self, _uid: Uid, _gid: Gid) -> Result<()> {
+        Err(Errno::EPERM)
+    }
+
+    /// Changes the modification time (seconds since the Unix epoch).
+    fn set_modified(&self, _time: u64) -> Result<()> {
+        Ok(())
     }
 
     /// Adds an existing inode under another name (hard link or rename).
@@ -209,7 +254,7 @@ static ROOT: Once<Arc<dyn Inode>> = Once::new();
 /// Sets up the root file system: an in-memory directory tree, unpacked from
 /// the initrd (if there is one), with devices under /dev.
 pub fn init(initrd: Option<&[u8]>) {
-    let root: Arc<dyn Inode> = ramfs::Directory::new(0o755);
+    let root: Arc<dyn Inode> = ramfs::Directory::new(Attributes::root(0o755));
     let _ = ROOT.set(root.clone());
     if let Some(archive) = initrd {
         match cpio::unpack(archive) {
@@ -219,13 +264,14 @@ pub fn init(initrd: Option<&[u8]>) {
     }
     let dev = match root.lookup("dev") {
         Ok(dev) => dev,
-        Err(_) => root.create("dev", FileKind::Directory).expect("can't create /dev"),
+        Err(_) => root.create("dev", FileKind::Directory, Attributes::root(0o755)).expect("can't create /dev"),
     };
     devfs::populate(&dev);
     let _ = root.link("proc", procfs::create());
-    for directory in ["tmp", "home"] {
+    // /tmp is for everyone, but people can only delete their own files.
+    for (directory, permissions) in [("tmp", 0o1777), ("home", 0o755), ("root", 0o700), ("run", 0o755)] {
         if root.lookup(directory).is_err() {
-            let _ = root.create(directory, FileKind::Directory);
+            let _ = root.create(directory, FileKind::Directory, Attributes::root(permissions));
         }
     }
 }
@@ -261,13 +307,25 @@ pub fn normalize(cwd: &str, path: &str) -> String {
 
 const MAX_SYMLINK_DEPTH: usize = 8;
 
-/// Finds the inode at `path`. A symbolic link as the last component is
-/// followed only if `follow` is set.
+/// Finds the inode at `path`, as the running process. A symbolic link as
+/// the last component is followed only if `follow` is set. Every directory
+/// passed through must be searchable (have execute permission).
 pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<Arc<dyn Inode>> {
-    lookup_depth(cwd, path, follow, 0)
+    lookup_as(&credentials::current(), cwd, path, follow)
 }
 
-fn lookup_depth(cwd: &str, path: &str, follow: bool, depth: usize) -> Result<Arc<dyn Inode>> {
+/// [`lookup`] with someone else's credentials.
+pub fn lookup_as(credentials: &Credentials, cwd: &str, path: &str, follow: bool) -> Result<Arc<dyn Inode>> {
+    lookup_depth(credentials, cwd, path, follow, 0)
+}
+
+fn lookup_depth(
+    credentials: &Credentials,
+    cwd: &str,
+    path: &str,
+    follow: bool,
+    depth: usize,
+) -> Result<Arc<dyn Inode>> {
     if path.is_empty() {
         return Err(Errno::ENOENT);
     }
@@ -275,6 +333,9 @@ fn lookup_depth(cwd: &str, path: &str, follow: bool, depth: usize) -> Result<Arc
     let components: Vec<&str> = full.split('/').filter(|c| !c.is_empty()).collect();
     let mut inode = root();
     for (index, name) in components.iter().enumerate() {
+        if !credentials.is_root() {
+            check_access(credentials, &inode.metadata(), MAY_EXEC)?;
+        }
         let next = inode.lookup(name)?;
         let last = index + 1 == components.len();
         if next.metadata().kind == FileKind::Symlink && (follow || !last) {
@@ -287,7 +348,7 @@ fn lookup_depth(cwd: &str, path: &str, follow: bool, depth: usize) -> Result<Arc
             let target = normalize(&directory, &next.read_link()?);
             let rest = format_path(&components[index + 1..]);
             let combined = if rest == "/" { target } else { target + &rest };
-            return lookup_depth("/", &combined, follow, depth + 1);
+            return lookup_depth(credentials, "/", &combined, follow, depth + 1);
         }
         inode = next;
     }
@@ -310,6 +371,83 @@ pub fn lookup_parent(cwd: &str, path: &str) -> Result<(Arc<dyn Inode>, String)> 
         return Err(Errno::ENOTDIR);
     }
     Ok((parent, name.to_string()))
+}
+
+// Access kinds for permission checks (the bits of each rwx triple).
+pub const MAY_EXEC: u32 = 1;
+pub const MAY_WRITE: u32 = 2;
+pub const MAY_READ: u32 = 4;
+
+/// Whether `credentials` grant every access in `want` (`MAY_*` bits) to a
+/// file: the owner's bits apply to its owner, the group's to members of its
+/// group, and the rest to everyone else. Root may read and write anything,
+/// and execute anything with an execute bit (or search any directory).
+pub fn check_access(credentials: &Credentials, metadata: &Metadata, want: u32) -> Result<()> {
+    let permissions = metadata.permissions;
+    if credentials.is_root() {
+        let executable = metadata.kind == FileKind::Directory || permissions & 0o111 != 0;
+        return if want & MAY_EXEC == 0 || executable { Ok(()) } else { Err(Errno::EACCES) };
+    }
+    let granted = if credentials.euid == metadata.uid {
+        permissions >> 6
+    } else if credentials.in_group(metadata.gid) {
+        permissions >> 3
+    } else {
+        permissions
+    } & 7;
+    if granted & want == want { Ok(()) } else { Err(Errno::EACCES) }
+}
+
+/// [`check_access`] for the running process.
+pub fn check(metadata: &Metadata, want: u32) -> Result<()> {
+    check_access(&credentials::current(), metadata, want)
+}
+
+/// Whether the running process may add or remove entries in `directory`.
+pub fn check_writable_directory(directory: &Arc<dyn Inode>) -> Result<()> {
+    check(&directory.metadata(), MAY_WRITE | MAY_EXEC)
+}
+
+/// The sticky bit: in a directory with it (like /tmp), only an entry's
+/// owner, the directory's owner, or root may delete or rename it.
+pub const STICKY: u32 = 0o1000;
+pub const SET_GROUP_ID: u32 = 0o2000;
+pub const SET_USER_ID: u32 = 0o4000;
+
+/// Whether the running process may remove (or rename away) entry `name` of
+/// `directory`.
+pub fn check_removable(directory: &Arc<dyn Inode>, entry: &Arc<dyn Inode>) -> Result<()> {
+    let credentials = credentials::current();
+    let directory_metadata = directory.metadata();
+    check_access(&credentials, &directory_metadata, MAY_WRITE | MAY_EXEC)?;
+    if directory_metadata.permissions & STICKY != 0
+        && !credentials.is_root()
+        && credentials.euid != directory_metadata.uid
+        && credentials.euid != entry.metadata().uid
+    {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
+}
+
+/// The attributes of a file the running process creates in `parent`: owned
+/// by its effective user, with `permissions` less its umask. The group is
+/// the process's, or the directory's if that has the setgid bit (which new
+/// subdirectories inherit), as on Linux.
+pub fn new_file_attributes(parent: &Arc<dyn Inode>, kind: FileKind, permissions: u32) -> Attributes {
+    let credentials = credentials::current();
+    let umask = crate::task::current_process().map_or(0o022, |process| process.umask());
+    let parent = parent.metadata();
+    let mut permissions = permissions & 0o7777 & !umask;
+    let gid = if parent.permissions & SET_GROUP_ID != 0 {
+        if kind == FileKind::Directory {
+            permissions |= SET_GROUP_ID;
+        }
+        parent.gid
+    } else {
+        credentials.egid
+    };
+    Attributes { permissions, uid: credentials.euid, gid }
 }
 
 // Open flags (Linux values).
@@ -492,7 +630,7 @@ mod tests {
 
         fn files_can_be_created_written_and_read() {
             let tmp = lookup("/", "/tmp", true).unwrap();
-            let file = tmp.create("vfs-test", FileKind::Regular).unwrap();
+            let file = tmp.create("vfs-test", FileKind::Regular, Attributes::root(0o644)).unwrap();
             let open = OpenFile::new(file, "/tmp/vfs-test".into(), O_RDWR);
             assert_eq!(open.write(b"hello, world"), Ok(12));
             open.seek(7, 0).unwrap();
@@ -506,9 +644,9 @@ mod tests {
 
         fn symlinks_are_followed() {
             let tmp = lookup("/", "/tmp", true).unwrap();
-            let target = tmp.create("link-target", FileKind::Directory).unwrap();
-            target.create("inside", FileKind::Regular).unwrap();
-            let link = tmp.create("link", FileKind::Symlink).unwrap();
+            let target = tmp.create("link-target", FileKind::Directory, Attributes::root(0o755)).unwrap();
+            target.create("inside", FileKind::Regular, Attributes::root(0o644)).unwrap();
+            let link = tmp.create("link", FileKind::Symlink, Attributes::root(0o777)).unwrap();
             link.write_at(0, b"link-target").unwrap();
             assert_eq!(lookup("/", "/tmp/link/inside", true).unwrap().metadata().kind, FileKind::Regular);
             assert_eq!(lookup("/", "/tmp/link", false).unwrap().metadata().kind, FileKind::Symlink);

@@ -50,6 +50,29 @@ pub const RENAMEAT: usize = 264;
 pub const SYMLINKAT: usize = 266;
 pub const READLINKAT: usize = 267;
 pub const GETRANDOM: usize = 318;
+pub const PREAD64: usize = 17;
+pub const PWRITE64: usize = 18;
+pub const FSYNC: usize = 74;
+pub const UMASK: usize = 95;
+pub const GETUID: usize = 102;
+pub const GETGID: usize = 104;
+pub const SETUID: usize = 105;
+pub const SETGID: usize = 106;
+pub const GETEUID: usize = 107;
+pub const GETEGID: usize = 108;
+pub const GETGROUPS: usize = 115;
+pub const SETGROUPS: usize = 116;
+pub const SETRESUID: usize = 117;
+pub const SETRESGID: usize = 119;
+pub const SYNC: usize = 162;
+pub const MOUNT: usize = 165;
+pub const UMOUNT2: usize = 166;
+pub const SETHOSTNAME: usize = 170;
+pub const FCHOWNAT: usize = 260;
+pub const LINKAT: usize = 265;
+pub const FCHMODAT: usize = 268;
+pub const FACCESSAT: usize = 269;
+pub const UTIMENSAT: usize = 280;
 /// eliOS's own calls.
 pub const ELI_PROCESS_LIST: usize = 0x1000;
 pub const ELI_KERNEL_LOG: usize = 0x1001;
@@ -101,6 +124,7 @@ pub unsafe fn call(number: usize, args: [usize; 6]) -> Result<usize> {
 pub struct Error(pub i32);
 
 impl Error {
+    pub const NOT_PERMITTED: Error = Error(1);
     pub const NOT_FOUND: Error = Error(2);
     pub const INTERRUPTED: Error = Error(4);
     pub const BAD_FILE: Error = Error(9);
@@ -110,6 +134,8 @@ impl Error {
     pub const NOT_DIRECTORY: Error = Error(20);
     pub const IS_DIRECTORY: Error = Error(21);
     pub const INVALID: Error = Error(22);
+    pub const ACCESS: Error = Error(13);
+    pub const BUSY: Error = Error(16);
     pub const AGAIN: Error = Error(11);
     pub const TIMED_OUT: Error = Error(110);
 

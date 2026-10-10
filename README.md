@@ -30,7 +30,8 @@ cargo xtask run
 ```
 
 The first build installs the nightly Rust toolchain eliOS uses and takes a
-few minutes. A QEMU window opens and eliOS boots to a shell. You can type in the
+few minutes. A QEMU window opens and eliOS boots to a shell, logged in as
+root (the live system has no password for root). You can type in the
 window, or in the terminal you ran the command from (the serial port is a
 second console). QEMU uses hardware virtualization (KVM) when it's
 available.
@@ -54,6 +55,9 @@ cp notes.txt /disk/           # /disk is the boot disk: files there persist
 ifconfig; ping -c 3 10.0.2.2  # the network (QEMU's virtual router)
 wget -O - http://example.com/ # the internet, if the host has it
 nettest                       # sockets through glibc: TCP, UDP, poll...
+adduser --admin alice         # an account (--admin: may use sudo)
+su - alice                    # become alice; or `logout` and log in as her
+sudo whoami                   # as alice: run a command as root
 poweroff                      # shut down (QEMU exits)
 ```
 
@@ -67,7 +71,7 @@ cargo xtask run --gdb         # wait for a debugger on localhost:1234
 cargo xtask run --trace       # log interrupts and CPU resets to target/qemu.log
 cargo xtask run --cpus 8      # more (or fewer) CPUs; the default is 4
 cargo xtask run --forward 8080:80  # reach port 80 in eliOS at localhost:8080
-cargo xtask test              # boot a test kernel and run its 75 tests
+cargo xtask test              # boot a test kernel and run its tests
 cargo xtask image             # a fresh bootable disk image, target/eliOS.img
 ```
 
@@ -103,7 +107,7 @@ may work too, but QEMU is the one eliOS is tested on.
 3. The kernel sets up its own descriptor tables, interrupt controllers,
    timers, page tables, heap and scheduler, unpacks the initrd into an
    in-memory file system, mounts the boot disk at `/disk`, and starts
-   `/sbin/init`, which starts the shell.
+   `/sbin/init`, which runs `login`, which starts your shell.
 
 ### The kernel
 
@@ -115,6 +119,9 @@ may work too, but QEMU is the one eliOS is tested on.
   linkers), `wait`, process groups, and Linux-style signals with handlers.
 - **Files:** a VFS over an in-memory file system, a FAT32 driver for disks,
   `/dev`, `/proc`, pipes, and a terminal with line editing and job control.
+- **Users:** Unix users and groups with real, effective and saved ids,
+  owners and permission bits on every file, the sticky bit, umask, and
+  setuid programs, all with Linux's rules.
 - **Devices:** framebuffer console (with ANSI escape codes and its own 8x16
   font), PS/2 and USB keyboards (an xHCI driver), serial port, Local and
   I/O APICs, PIT/TSC/APIC timers, CMOS clock, PCI with MSI/MSI-X, AHCI and
@@ -131,8 +138,10 @@ may work too, but QEMU is the one eliOS is tested on.
 - `user/eli` is **libeli**, the runtime for eliOS's own Rust programs:
   startup, a memory allocator, and a small standard library. It only uses
   Linux system calls, so these programs are ordinary Linux executables.
-- `user/utils` is **eliutils**: the shell, `init`, a text editor and about
-  40 commands in one binary, linked under each command's name in `/bin`.
+- `user/utils` is **eliutils**: the shell, `init`, `login`, a text editor
+  and about 60 commands in one binary, linked under each command's name in
+  `/bin`. `su`, `sudo` and `passwd` are a second, small program, eliauth,
+  installed setuid root.
 - `user/c` holds C programs compiled by the host's C compiler and glibc. Ones
   named `*-dynamic.c` are dynamically linked, and the libraries they need are
   copied from the host.
@@ -180,7 +189,7 @@ glyph and rebuild.
 | `user/eli/`     | libeli, the runtime for eliOS's Rust programs                |
 | `user/utils/`   | eliutils: shell, init, editor and commands                   |
 | `user/c/`       | C test programs built with the host's toolchain              |
-| `rootfs/`       | Files for the root file system (`/etc`, `/home`)             |
+| `rootfs/`       | Files for the root file system (`/etc`; `/etc/skel` is a new home) |
 | `xtask/`        | The build tool: builds everything and the disk image, runs QEMU |
 
 ## Roadmap
@@ -204,5 +213,8 @@ glyph and rebuild.
       unplugging
 - [x] **Networking:** an e1000 driver, an own TCP/IP stack, DHCP, sockets,
       and `ifconfig`, `ping`, `host`, `wget` and `nc`
+- [x] **Users:** accounts, permissions, setuid programs, `login`, `su`,
+      `sudo`, `passwd`, `adduser`, with Linux's file formats and password
+      hashes
 - [ ] **Next:** a graphical desktop, USB hubs, mice and storage, Unix
       domain sockets, and TLS for HTTPS

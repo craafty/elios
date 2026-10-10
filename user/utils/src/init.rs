@@ -1,13 +1,19 @@
-//! init: the first user process. It greets the user, runs /etc/rc if there
-//! is one, and keeps a shell running on the console. As process 1 it also
-//! collects orphaned processes when they exit.
+//! init: the first user process. It runs /etc/rc if there is one, then
+//! keeps a login session going on the console: `login` asks who you are
+//! and starts your shell, and when you log out, it asks again. As process 1
+//! it also collects orphaned processes when they exit.
+//!
+//! On the live system, /etc/autologin names an account (root) to log in
+//! automatically the first time, so the system starts at a prompt.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use eli::process::{self, SIGINT, SIGQUIT, SIGTERM};
-use eli::{env, eprintln, fs, println, time};
+use eli::{env, eprintln, fs, time};
 
 const SHELL: &str = "/bin/sh";
+const LOGIN: &str = "/bin/login";
 
 pub fn main() -> i32 {
     if process::id() != 1 {
@@ -19,42 +25,40 @@ pub fn main() -> i32 {
         process::ignore_signal(signal);
     }
 
-    if let Ok(motd) = fs::read_to_string("/etc/motd") {
-        eli::print!("{motd}");
-    }
     if fs::exists("/etc/rc")
-        && let Ok(pid) = spawn(&[SHELL.into(), "/etc/rc".into()])
+        && let Ok(pid) = spawn(SHELL, &[SHELL.into(), "/etc/rc".into()])
     {
         wait_for(pid);
     }
 
+    let mut autologin = crate::accounts::autologin_user();
     loop {
         let started = time::monotonic_nanos();
-        match spawn(&["-sh".into()]) {
-            Ok(shell) => wait_for(shell),
-            Err(error) => eprintln!("init: can't start {SHELL}: {error}"),
+        let arguments: Vec<String> = match autologin.take() {
+            Some(user) => alloc::vec!["login".into(), "-f".into(), user],
+            None => alloc::vec!["login".into()],
+        };
+        match spawn(LOGIN, &arguments) {
+            Ok(session) => wait_for(session),
+            Err(error) => eprintln!("init: can't start {LOGIN}: {error}"),
         }
-        // A shell that exits immediately would otherwise respawn in a busy
-        // loop.
+        // A session that ends immediately would otherwise respawn in a
+        // busy loop.
         if time::monotonic_nanos() - started < 1_000_000_000 {
             time::sleep_ms(1000);
         }
-        println!("\n[init] starting a new shell");
     }
 }
 
-/// Starts the shell (or a script) in a child process.
-fn spawn(arguments: &[String]) -> eli::Result<u32> {
+/// Starts a program in a child process.
+fn spawn(program: &str, arguments: &[String]) -> eli::Result<u32> {
     let pid = process::fork()?;
     if pid == 0 {
         for signal in [SIGINT, SIGQUIT, SIGTERM] {
             process::default_signal(signal);
         }
-        if let Some(home) = env::var("HOME") {
-            let _ = fs::set_current_dir(&home);
-        }
-        let error = process::exec(SHELL, arguments, &env::vars());
-        eprintln!("init: can't run {SHELL}: {error}");
+        let error = process::exec(program, arguments, &env::vars());
+        eprintln!("init: can't run {program}: {error}");
         process::exit(127);
     }
     Ok(pid)

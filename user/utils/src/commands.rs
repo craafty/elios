@@ -16,11 +16,16 @@ type Command = fn(&[String]) -> i32;
 
 pub fn find(name: &str) -> Option<Command> {
     Some(match name {
+        "adduser" => crate::accounts::adduser,
         "basename" => basename,
         "cat" => cat,
+        "chgrp" => crate::accounts::chgrp,
+        "chmod" => crate::accounts::chmod,
+        "chown" => crate::accounts::chown,
         "clear" => clear,
         "cp" => cp,
         "date" => date,
+        "deluser" => crate::accounts::deluser,
         "dmesg" => dmesg,
         "echo" => echo,
         "env" => env_command,
@@ -28,13 +33,16 @@ pub fn find(name: &str) -> Option<Command> {
         "fetch" => fetch,
         "free" => free,
         "grep" => grep,
+        "groups" => crate::accounts::groups,
         "head" => |args| head_or_tail(args, true),
         "hello" => hello,
         "help" => help,
         "host" => crate::network::host,
+        "id" => crate::accounts::id,
         "ifconfig" => crate::network::ifconfig,
         "kill" => kill,
         "ln" => ln,
+        "login" => crate::accounts::login,
         "ls" => ls,
         "mkdir" => mkdir,
         "mv" => mv,
@@ -65,6 +73,7 @@ pub fn find(name: &str) -> Option<Command> {
         "uptime" => uptime,
         "wc" => wc,
         "wget" => crate::network::wget,
+        "whoami" => crate::accounts::whoami,
         "yes" => yes,
         _ => return None,
     })
@@ -173,6 +182,8 @@ fn ls(arguments: &[String]) -> i32 {
     let long = flags.contains('l');
     let all = flags.contains('a');
     let paths = if paths.is_empty() { alloc::vec!["."] } else { paths };
+    let owners = long.then(crate::accounts::Names::load);
+    let owners = owners.as_ref();
     let mut status = 0;
     let show_headers = paths.len() > 1;
     for (index, &path) in paths.iter().enumerate() {
@@ -184,7 +195,7 @@ fn ls(arguments: &[String]) -> i32 {
             }
         };
         if metadata.kind != FileType::Directory {
-            print_entry(path, path, long);
+            print_entry(path, path, owners);
             continue;
         }
         if show_headers {
@@ -207,7 +218,7 @@ fn ls(arguments: &[String]) -> i32 {
             .collect();
         if long {
             for (name, full) in &names {
-                print_entry(name, full, true);
+                print_entry(name, full, owners);
             }
         } else {
             print_columns(&names);
@@ -216,18 +227,22 @@ fn ls(arguments: &[String]) -> i32 {
     status
 }
 
-fn print_entry(name: &str, full: &str, long: bool) {
+/// One `ls` line; with `names` (for `-l`), the long form with permissions,
+/// owner, group, size and date.
+fn print_entry(name: &str, full: &str, names: Option<&crate::accounts::Names>) {
     let Ok(metadata) = fs::symlink_metadata(full) else { return };
     let color = type_color(metadata.kind, full);
-    if !long {
+    let Some(names) = names else {
         println!("{color}{name}\x1b[0m");
         return;
-    }
+    };
     let kind = match metadata.kind {
         FileType::Directory => 'd',
         FileType::Symlink => 'l',
         FileType::CharDevice => 'c',
+        FileType::BlockDevice => 'b',
         FileType::Pipe => 'p',
+        FileType::Socket => 's',
         _ => '-',
     };
     let date = DateTime::from_unix(metadata.modified.max(0) as u64);
@@ -237,8 +252,10 @@ fn print_entry(name: &str, full: &str, long: bool) {
         String::new()
     };
     println!(
-        "{kind}{} {:>6} {:04}-{:02}-{:02} {:02}:{:02} {color}{name}\x1b[0m{target}",
+        "{kind}{} {:<8} {:<8} {:>6} {:04}-{:02}-{:02} {:02}:{:02} {color}{name}\x1b[0m{target}",
         permissions(metadata.mode),
+        names.user(metadata.uid),
+        names.group(metadata.gid),
         human_size(metadata.size),
         date.year,
         date.month,
@@ -248,11 +265,26 @@ fn print_entry(name: &str, full: &str, long: bool) {
     );
 }
 
+/// `rwxr-xr-x`, with `s`/`S` for setuid and setgid and `t`/`T` for sticky
+/// in the execute places (lowercase when execute is set too).
 fn permissions(mode: u32) -> String {
     (0..9)
         .map(|bit| {
             let set = mode & (1 << (8 - bit)) != 0;
-            if !set { '-' } else { ['r', 'w', 'x'][bit % 3] }
+            let special = match bit {
+                2 => mode & 0o4000 != 0,
+                5 => mode & 0o2000 != 0,
+                8 => mode & 0o1000 != 0,
+                _ => false,
+            };
+            match (special, set) {
+                (true, _) => {
+                    let letter = if bit == 8 { 't' } else { 's' };
+                    if set { letter } else { letter.to_ascii_uppercase() }
+                }
+                (false, false) => '-',
+                (false, true) => ['r', 'w', 'x'][bit % 3],
+            }
         })
         .collect()
 }
@@ -313,7 +345,7 @@ fn rmdir(arguments: &[String]) -> i32 {
     status
 }
 
-fn remove_tree(path: &str) -> eli::Result<()> {
+pub fn remove_tree(path: &str) -> eli::Result<()> {
     if fs::symlink_metadata(path)?.kind == FileType::Directory {
         for entry in fs::read_dir(path)? {
             remove_tree(&format!("{path}/{}", entry.name))?;
@@ -343,9 +375,8 @@ fn rm(arguments: &[String]) -> i32 {
 fn touch(arguments: &[String]) -> i32 {
     let mut status = 0;
     for path in &arguments[1..] {
-        if !fs::exists(path)
-            && let Err(error) = fs::File::append(path)
-        {
+        let result = if fs::exists(path) { fs::set_modified(path, None) } else { fs::File::append(path).map(|_| ()) };
+        if let Err(error) = result {
             status = report("touch", path, error);
         }
     }
@@ -423,7 +454,15 @@ fn stat(arguments: &[String]) -> i32 {
                 println!("  Type: {:?}", metadata.kind);
                 println!("  Size: {} bytes", metadata.size);
                 println!(" Inode: {}", metadata.inode);
-                println!("  Mode: {:o}", metadata.mode);
+                println!("  Mode: {:o} ({})", metadata.permissions(), permissions(metadata.mode));
+                println!(
+                    " Owner: {} ({})   Group: {} ({})   Links: {}",
+                    eli::users::user_name(metadata.uid),
+                    metadata.uid,
+                    eli::users::group_name(metadata.gid),
+                    metadata.gid,
+                    metadata.links
+                );
                 println!(
                     "Modify: {:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
                     date.year, date.month, date.day, date.hour, date.minute, date.second
@@ -721,11 +760,13 @@ fn kill(arguments: &[String]) -> i32 {
 fn ps(_: &[String]) -> i32 {
     match process::list() {
         Ok(processes) => {
-            println!("\x1b[1m  PID  PPID S     TIME    MEM COMMAND\x1b[0m");
+            let names = crate::accounts::Names::load();
+            println!("\x1b[1mUSER       PID  PPID S     TIME    MEM COMMAND\x1b[0m");
             for p in processes {
                 let seconds = p.cpu_ms / 1000;
                 println!(
-                    "{:>5} {:>5} {} {:>4}:{:02}.{} {:>6} {}",
+                    "{:<8} {:>5} {:>5} {} {:>4}:{:02}.{} {:>6} {}",
+                    names.user(p.uid),
                     p.pid,
                     p.parent,
                     p.state,
@@ -796,10 +837,11 @@ fn hello(_: &[String]) -> i32 {
 
 fn help(_: &[String]) -> i32 {
     println!("\x1b[1meliOS commands\x1b[0m (each is a program in /bin):\n");
-    for (name, description) in APPLETS.iter().filter(|(name, _)| *name != "init") {
+    let auth = crate::applets::AUTH_APPLETS.iter();
+    for (name, description) in APPLETS.iter().chain(auth).filter(|(name, _)| *name != "init") {
         println!("  \x1b[1;32m{name:<10}\x1b[0m {description}");
     }
-    println!("\nShell built-ins: cd, exit, export, unset, history, source, jobs, wait");
+    println!("\nShell built-ins: cd, exit, logout, export, unset, history, source, jobs, wait");
     println!("The shell supports pipes (|), redirection (< > >> 2>), && || ; and &,");
     println!("$VARIABLES, 'quotes', and * wildcards. Tab completes; arrows walk history.");
     0

@@ -5,3 +5,13 @@ edition.workspace = true
 
 [dependencies]
 eli = { path = "../eli" }
+
+# The commands that need root's privileges when ordinary users run them, as
+# a separate small program installed setuid root.
+[[bin]]
+name = "eliauth"
+path = "src/auth.rs"
+
+[[bin]]
+name = "eliutils"
+path = "src/main.rs"

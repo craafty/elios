@@ -9,9 +9,11 @@
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::errno::{Errno, Result};
 use crate::fs::{self, FileKind, Inode, Metadata, POLLIN, POLLOUT, ramfs};
+use crate::process::credentials::{Gid, Uid};
 use crate::process::{self, user};
 use crate::sync::{Once, SpinLock};
 use crate::task::WaitQueue;
@@ -104,6 +106,11 @@ pub struct Tty {
     inode: u64,
     state: SpinLock<State>,
     readable: WaitQueue,
+    /// Who the terminal belongs to: `login` gives it to the user who logs
+    /// in, so their programs can reopen it.
+    uid: AtomicU32,
+    gid: AtomicU32,
+    permissions: AtomicU32,
 }
 
 static CONSOLE: Once<Arc<Tty>> = Once::new();
@@ -123,6 +130,9 @@ pub fn console() -> Arc<Tty> {
             foreground: 0,
         }),
         readable: WaitQueue::new(),
+        uid: AtomicU32::new(0),
+        gid: AtomicU32::new(0),
+        permissions: AtomicU32::new(0o620),
     });
     match CONSOLE.set(tty) {
         Ok(tty) => tty.clone(),
@@ -255,7 +265,22 @@ fn window_size() -> (u16, u16) {
 
 impl Inode for Tty {
     fn metadata(&self) -> Metadata {
-        Metadata { kind: FileKind::CharDevice, inode: self.inode, size: 0, permissions: 0o620, modified: 0 }
+        Metadata {
+            uid: self.uid.load(Ordering::Relaxed),
+            gid: self.gid.load(Ordering::Relaxed),
+            ..Metadata::virtual_file(FileKind::CharDevice, self.inode, self.permissions.load(Ordering::Relaxed))
+        }
+    }
+
+    fn set_permissions(&self, permissions: u32) -> Result<()> {
+        self.permissions.store(permissions & 0o7777, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn set_owner(&self, uid: Uid, gid: Gid) -> Result<()> {
+        self.uid.store(uid, Ordering::Relaxed);
+        self.gid.store(gid, Ordering::Relaxed);
+        Ok(())
     }
 
     fn seekable(&self) -> bool {

@@ -7,6 +7,7 @@
 //! signal mask and the like. The process ends when its last thread does.
 
 mod address_space;
+pub mod credentials;
 pub mod elf;
 pub mod futex;
 pub mod signal;
@@ -20,6 +21,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub use self::address_space::{AddressSpace, PROT_EXEC, PROT_READ, PROT_WRITE, USER_END};
+use self::credentials::Credentials;
 #[cfg(test)]
 use self::signal::SIGTERM;
 use self::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
@@ -67,6 +69,10 @@ pub struct Process {
     /// The signal the parent gets when this process ends (normally SIGCHLD;
     /// 0 for none).
     exit_signal: AtomicU32,
+    /// Who the process acts as (see [`credentials`]).
+    pub credentials: SpinLock<Arc<Credentials>>,
+    /// Permission bits taken away from the files it creates.
+    umask: AtomicU32,
 }
 
 /// Why a process's threads are ending.
@@ -116,6 +122,15 @@ impl Process {
     pub fn set_group(&self, group: Pid) {
         self.group.store(group, Ordering::Relaxed);
     }
+
+    pub fn umask(&self) -> u32 {
+        self.umask.load(Ordering::Relaxed)
+    }
+
+    /// Sets the umask, returning the old one.
+    pub fn set_umask(&self, umask: u32) -> u32 {
+        self.umask.swap(umask & 0o777, Ordering::Relaxed)
+    }
 }
 
 static PROCESSES: SpinLock<BTreeMap<Pid, Arc<Process>>> = SpinLock::new(BTreeMap::new());
@@ -125,7 +140,15 @@ static CHILD_EVENTS: WaitQueue = WaitQueue::new();
 /// Whether process 1 is init (it isn't when tests start processes).
 static INIT_RUNNING: AtomicBool = AtomicBool::new(false);
 
-fn create(parent: Pid, group: Option<Pid>, name: &str, cwd: String, files: FileTable) -> Arc<Process> {
+/// What a new process starts with.
+struct Inherited {
+    cwd: String,
+    files: FileTable,
+    credentials: Arc<Credentials>,
+    umask: u32,
+}
+
+fn create(parent: Pid, group: Option<Pid>, name: &str, inherited: Inherited) -> Arc<Process> {
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let process = Arc::new(Process {
         pid,
@@ -135,8 +158,8 @@ fn create(parent: Pid, group: Option<Pid>, name: &str, cwd: String, files: FileT
         executable: SpinLock::new(String::new()),
         arguments: SpinLock::new(Vec::new()),
         space: SpinLock::new(None),
-        files: SpinLock::new(files),
-        cwd: SpinLock::new(cwd),
+        files: SpinLock::new(inherited.files),
+        cwd: SpinLock::new(inherited.cwd),
         status: SpinLock::new(None),
         signals: SpinLock::new(Signals::new()),
         threads: SpinLock::new(Vec::new()),
@@ -144,6 +167,8 @@ fn create(parent: Pid, group: Option<Pid>, name: &str, cwd: String, files: FileT
         ending: SpinLock::new(None),
         trace: AtomicBool::new(false),
         exit_signal: AtomicU32::new(signal::SIGCHLD),
+        credentials: SpinLock::new(inherited.credentials),
+        umask: AtomicU32::new(inherited.umask),
     });
     PROCESSES.lock().insert(pid, process.clone());
     process
@@ -209,16 +234,29 @@ struct Image {
     /// interpreter).
     path: String,
     arguments: Vec<String>,
+    /// Who the program runs as: changed if it's setuid or setgid.
+    credentials: Credentials,
 }
 
 /// Loads the program at `path` (resolved from `cwd`) into a new address
-/// space. Scripts starting with `#!` run their interpreter instead.
-fn load_image(cwd: &str, path: &str, arguments: Vec<String>, environment: &[String]) -> Result<Image> {
-    let inode = fs::lookup(cwd, path, true)?;
-    if inode.metadata().kind != FileKind::Regular {
+/// space, for a process with `credentials`. Scripts starting with `#!` run
+/// their interpreter instead. The program must be executable by them. A
+/// setuid or setgid program changes the credentials, if `setuid_allowed`.
+fn load_image(
+    credentials: &Credentials,
+    setuid_allowed: bool,
+    cwd: &str,
+    path: &str,
+    arguments: Vec<String>,
+    environment: &[String],
+) -> Result<Image> {
+    let inode = fs::lookup_as(credentials, cwd, path, true)?;
+    let metadata = inode.metadata();
+    if metadata.kind != FileKind::Regular {
         return Err(Errno::EACCES);
     }
-    let size = inode.metadata().size as usize;
+    fs::check_access(credentials, &metadata, fs::MAY_EXEC)?;
+    let size = metadata.size as usize;
     let mut data = vec![0; size];
     inode.read_at(0, &mut data)?;
 
@@ -236,20 +274,27 @@ fn load_image(cwd: &str, path: &str, arguments: Vec<String>, environment: &[Stri
         if interpreter == path {
             return Err(Errno::ELOOP);
         }
-        return load_image(cwd, interpreter, script_arguments, environment);
+        // As on Linux, a script's own setuid bit is ignored (the
+        // interpreter's counts).
+        return load_image(credentials, setuid_allowed, cwd, interpreter, script_arguments, environment);
     }
 
+    let credentials = if setuid_allowed {
+        credentials.after_exec(metadata.permissions, metadata.uid, metadata.gid)
+    } else {
+        credentials.after_exec(0, 0, 0)
+    };
     let mut space = AddressSpace::new()?;
     let mut program = elf::load(&mut space, &data)?;
     if let Some(interpreter) = &program.interpreter {
-        let inode = fs::lookup(cwd, interpreter, true)?;
+        let inode = fs::lookup_as(&credentials, cwd, interpreter, true)?;
         let mut interpreter_data = vec![0; inode.metadata().size as usize];
         inode.read_at(0, &mut interpreter_data)?;
         elf::load_interpreter(&mut space, &mut program, &interpreter_data)?;
     }
-    let stack_pointer = elf::build_stack(&mut space, &program, &arguments, environment, path)?;
+    let stack_pointer = elf::build_stack(&mut space, &program, &arguments, environment, path, &credentials)?;
     let path = fs::normalize(cwd, path);
-    Ok(Image { space, entry: program.start(), stack_pointer, path, arguments })
+    Ok(Image { space, entry: program.start(), stack_pointer, path, arguments, credentials })
 }
 
 fn base_name(path: &str) -> &str {
@@ -268,14 +313,16 @@ pub fn start_init(path: &str) -> Result<Pid> {
 /// Starts a program on the console, as a child of no one (the kernel).
 pub fn start(path: &str, arguments: Vec<String>) -> Result<Pid> {
     let environment = default_environment();
-    let image = load_image("/", path, arguments, &environment)?;
+    let root = credentials::kernel();
+    let image = load_image(&root, true, "/", path, arguments, &environment)?;
     let console = fs::lookup("/", "/dev/console", true)?;
     let mut files = FileTable::default();
     let terminal = OpenFile::new(console, "/dev/console".into(), fs::O_RDWR);
     for _ in 0..3 {
         files.insert(terminal.clone(), false, 0)?;
     }
-    let process = create(0, None, base_name(path), "/".into(), files);
+    let inherited = Inherited { cwd: "/".into(), files, credentials: Arc::new(image.credentials), umask: 0o022 };
+    let process = create(0, None, base_name(path), inherited);
     *process.executable.lock() = image.path;
     *process.arguments.lock() = image.arguments;
     *process.space.lock() = Some(image.space);
@@ -289,7 +336,9 @@ pub fn start(path: &str, arguments: Vec<String>) -> Result<Pid> {
 }
 
 fn default_environment() -> Vec<String> {
-    ["PATH=/bin:/usr/bin", "HOME=/home", "TERM=linux", "SHELL=/bin/sh", "USER=root"].map(String::from).to_vec()
+    ["PATH=/bin:/usr/bin:/sbin:/usr/sbin", "HOME=/root", "TERM=linux", "SHELL=/bin/sh", "USER=root", "LOGNAME=root"]
+        .map(String::from)
+        .to_vec()
 }
 
 // `clone` flags (Linux values).
@@ -369,9 +418,13 @@ pub fn clone(frame: &InterruptFrame, args: &CloneArgs) -> Result<Pid> {
     let parent = &me.process;
     let mut space = parent.space.lock().as_ref().ok_or(Errno::EFAULT)?.duplicate()?;
     let name = parent.name.lock().clone();
-    let cwd = parent.cwd.lock().clone();
-    let files = parent.files.lock().clone();
-    let child = create(parent.pid, Some(parent.group()), &name, cwd, files);
+    let inherited = Inherited {
+        cwd: parent.cwd.lock().clone(),
+        files: parent.files.lock().clone(),
+        credentials: parent.credentials.lock().clone(),
+        umask: parent.umask(),
+    };
+    let child = create(parent.pid, Some(parent.group()), &name, inherited);
     *child.signals.lock() = parent.signals.lock().for_child();
     *child.executable.lock() = parent.executable.lock().clone();
     *child.arguments.lock() = parent.arguments.lock().clone();
@@ -395,7 +448,11 @@ pub fn exec(frame: &mut InterruptFrame, path: &str, arguments: Vec<String>, envi
     let thread = current_thread();
     let process = &thread.process;
     let cwd = process.cwd.lock().clone();
-    let image = load_image(&cwd, path, arguments, &environment)?;
+    let credentials = process.credentials.lock().clone();
+    // A traced program can't gain privileges: tracing shows (and could
+    // be used to steer) what it does. Linux does the same under ptrace.
+    let setuid_allowed = !process.trace.load(Ordering::Relaxed);
+    let image = load_image(&credentials, setuid_allowed, &cwd, path, arguments, &environment)?;
     end_other_threads(&thread)?;
 
     // From here on, nothing can fail: the old program is gone.
@@ -404,6 +461,9 @@ pub fn exec(frame: &mut InterruptFrame, path: &str, arguments: Vec<String>, envi
     drop(old);
     // The survivor becomes the main thread, if it wasn't.
     thread.tid.store(process.pid, Ordering::Relaxed);
+    if image.credentials != *credentials {
+        *process.credentials.lock() = Arc::new(image.credentials);
+    }
     process.files.lock().exec();
     process.signals.lock().exec();
     thread.signals.lock().exec();
@@ -610,7 +670,13 @@ pub fn kill_thread(process: Option<Pid>, tid: Pid, signal: u32) -> Result<()> {
         .filter(|candidate| process.is_none_or(|pid| candidate.pid == pid))
         .find_map(|candidate| candidate.threads.lock().iter().find(|thread| thread.tid() == tid).cloned())
         .ok_or(Errno::ESRCH)?;
-    signal::send_to_thread(&thread, signal);
+    let credentials = current().credentials.lock().clone();
+    if !credentials.may_signal(&thread.process.credentials.lock()) {
+        return Err(Errno::EPERM);
+    }
+    if signal != 0 {
+        signal::send_to_thread(&thread, signal);
+    }
     Ok(())
 }
 
@@ -629,6 +695,7 @@ pub fn kill(pid: i64, signal: u32) -> Result<()> {
         return Err(Errno::EINVAL);
     }
     let me = current();
+    let credentials = me.credentials.lock().clone();
     let targets: Vec<Arc<Process>> = PROCESSES
         .lock()
         .values()
@@ -644,8 +711,18 @@ pub fn kill(pid: i64, signal: u32) -> Result<()> {
     if targets.is_empty() {
         return Err(Errno::ESRCH);
     }
-    for process in targets {
-        send_signal(&process, signal);
+    // Only processes of the same user (or anyone, for root) can be
+    // signalled; sending to a group succeeds if any of them could be.
+    let permitted: Vec<&Arc<Process>> =
+        targets.iter().filter(|target| credentials.may_signal(&target.credentials.lock())).collect();
+    if permitted.is_empty() {
+        return Err(Errno::EPERM);
+    }
+    // Signal 0 only checks that the process exists and may be signalled.
+    if signal != 0 {
+        for process in permitted {
+            send_signal(process, signal);
+        }
     }
     Ok(())
 }
@@ -712,6 +789,7 @@ pub struct ProcessInfo {
     pub cpu_ms: u64,
     pub memory: u64,
     pub threads: usize,
+    pub credentials: Credentials,
 }
 
 pub fn list() -> Vec<ProcessInfo> {
@@ -737,6 +815,7 @@ pub fn list() -> Vec<ProcessInfo> {
                 cpu_ms: mine().map(|thread| thread.cpu_ticks).sum(),
                 memory: process.space.lock().as_ref().map_or(0, AddressSpace::resident_bytes),
                 threads: ids.len(),
+                credentials: (**process.credentials.lock()).clone(),
             }
         })
         .collect()
@@ -796,7 +875,7 @@ mod tests {
 
         fn linux_c_programs_pass_their_self_tests() {
             // Built by the host's C compiler, if there was one.
-            for program in ["ctest", "sigtest", "threadtest", "nettest", "hello-c", "hello-dynamic"] {
+            for program in ["ctest", "sigtest", "threadtest", "nettest", "permtest", "hello-c", "hello-dynamic"] {
                 let path = alloc::format!("/usr/bin/{program}");
                 if fs::lookup("/", &path, true).is_err() {
                     continue;

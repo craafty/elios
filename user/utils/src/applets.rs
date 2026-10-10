@@ -51,4 +51,21 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("uptime", "show how long the system has been up"),
     ("wc", "count lines, words and bytes"),
     ("yes", "print a line forever"),
+    ("login", "log in as a user (init runs it on the console)"),
+    ("adduser", "add a user account"),
+    ("deluser", "remove a user account"),
+    ("id", "show user and group ids"),
+    ("whoami", "show which user you are"),
+    ("groups", "show the groups you're in"),
+    ("chmod", "change permissions"),
+    ("chown", "change owner (and group)"),
+    ("chgrp", "change group"),
+];
+
+/// The commands of eliauth, the separate setuid-root program: links to
+/// /bin/eliauth.
+pub const AUTH_APPLETS: &[(&str, &str)] = &[
+    ("su", "become another user (root by default)"),
+    ("sudo", "run a command as root"),
+    ("passwd", "change a password"),
 ];

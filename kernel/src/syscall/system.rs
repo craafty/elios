@@ -113,6 +113,9 @@ const REBOOT_CMD_HALT: u64 = 0xCDEF_0123;
 const REBOOT_CMD_POWER_OFF: u64 = 0x4321_FEDC;
 
 pub fn reboot(magic: u64, command: u64) -> Result<u64> {
+    if !crate::process::credentials::current().is_root() {
+        return Err(Errno::EPERM);
+    }
     if magic as u32 as u64 != REBOOT_MAGIC1 {
         return Err(Errno::EINVAL);
     }
@@ -132,7 +135,9 @@ pub fn process_list(buffer: u64, capacity: u64) -> Result<u64> {
         output.extend_from_slice(&info.pid.to_le_bytes());
         output.extend_from_slice(&info.parent.to_le_bytes());
         output.push(info.state as u8);
-        output.extend_from_slice(&[0; 7]);
+        output.extend_from_slice(&[0; 3]);
+        // Who it runs as (its effective user).
+        output.extend_from_slice(&info.credentials.euid.to_le_bytes());
         output.extend_from_slice(&info.cpu_ms.to_le_bytes());
         output.extend_from_slice(&info.memory.to_le_bytes());
         let mut name = [0u8; 32];
@@ -154,4 +159,18 @@ pub fn kernel_log(buffer: u64, len: u64) -> Result<u64> {
     let start = bytes.len().saturating_sub(len as usize);
     user::write_bytes(buffer, &bytes[start..])?;
     Ok((bytes.len() - start) as u64)
+}
+
+/// `sethostname(name, len)`: root only.
+pub fn sethostname(name: u64, len: u64) -> Result<u64> {
+    if !crate::process::credentials::current().is_root() {
+        return Err(Errno::EPERM);
+    }
+    if len > 64 {
+        return Err(Errno::EINVAL);
+    }
+    let bytes = user::buffer(name, len as usize)?;
+    let name = core::str::from_utf8(bytes).map_err(|_| Errno::EINVAL)?;
+    *HOSTNAME.lock() = String::from(name);
+    Ok(0)
 }

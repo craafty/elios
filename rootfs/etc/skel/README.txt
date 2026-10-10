@@ -25,6 +25,17 @@ Things to try
   nproc; cat /proc/cpuinfo every CPU is used
   threadtest               a C program with many threads (pthreads)
 
+Users
+-----
+
+  id; whoami               who you are (the live system logs in as root)
+  adduser --admin alice    a new account (--admin: may use sudo)
+  su - alice               become alice (or: logout, and log in as her)
+  sudo whoami              as alice: run something as root
+  passwd                   change your password
+  ls -l /home              files have owners and permissions
+  chmod 600 note.txt       ...which chmod and chown change
+
 The network
 -----------
 
@@ -42,7 +53,7 @@ Keys
   Up / Down                walk the command history
   Ctrl+C                   interrupt the running program
   Ctrl+L                   clear the screen
-  Ctrl+D                   end of input (at the prompt: leave the shell;
-                           init starts a fresh one)
+  Ctrl+D                   end of input (at the prompt: log out, and
+                           get a login prompt)
 
 When you're done: poweroff (or reboot).

@@ -244,7 +244,9 @@ fn write_resolv_conf(servers: &[Ipv4]) {
         text.push_str(&format!("nameserver {server}\n"));
     }
     let Ok(etc) = crate::fs::lookup("/", "/etc", true) else { return };
-    let file = etc.lookup("resolv.conf").or_else(|_| etc.create("resolv.conf", crate::fs::FileKind::Regular));
+    let file = etc
+        .lookup("resolv.conf")
+        .or_else(|_| etc.create("resolv.conf", crate::fs::FileKind::Regular, crate::fs::Attributes::root(0o644)));
     if let Ok(file) = file {
         let _ = file.truncate(0);
         let _ = file.write_at(0, text.as_bytes());

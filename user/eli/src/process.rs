@@ -180,6 +180,8 @@ pub fn signal_description(signal: i32) -> String {
 pub struct ProcessInfo {
     pub pid: u32,
     pub parent: u32,
+    /// The user it runs as.
+    pub uid: u32,
     pub state: char,
     pub cpu_ms: u64,
     pub memory: u64,
@@ -203,6 +205,7 @@ pub fn list() -> Result<Vec<ProcessInfo>> {
             ProcessInfo {
                 pid: u32_at(0),
                 parent: u32_at(4),
+                uid: u32_at(12),
                 state: entry[8] as char,
                 cpu_ms: u64_at(16),
                 memory: u64_at(24),

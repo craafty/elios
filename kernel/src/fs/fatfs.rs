@@ -12,11 +12,16 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{FileKind, Inode, Metadata, ramfs};
+use super::{Attributes, FileKind, Inode, Metadata, ramfs};
 use crate::drivers::block::Partition;
 use crate::errno::{Errno, Result};
+use crate::process::credentials::{Gid, Uid};
 use crate::sync::{Mutex, SpinLock};
 use crate::time;
+
+/// Everything on a FAT volume belongs to root and is readable and runnable
+/// by everyone, like Linux's default for vfat.
+const PERMISSIONS: u32 = 0o755;
 
 pub struct Volume {
     fs: Mutex<fat::FileSystem<Partition>>,
@@ -98,9 +103,22 @@ impl Inode for Node {
             kind: if entry.directory { FileKind::Directory } else { FileKind::Regular },
             inode: self.inode,
             size: u64::from(entry.size),
-            permissions: if entry.directory { 0o755 } else { 0o644 },
+            permissions: PERMISSIONS,
+            uid: 0,
+            gid: 0,
+            links: 1,
             modified: entry.modified_unix(),
         }
+    }
+
+    /// FAT stores no owners or permissions: only changes to what's already
+    /// reported succeed (as with Linux's vfat).
+    fn set_permissions(&self, permissions: u32) -> Result<()> {
+        if permissions & 0o7777 == PERMISSIONS { Ok(()) } else { Err(Errno::EPERM) }
+    }
+
+    fn set_owner(&self, uid: Uid, gid: Gid) -> Result<()> {
+        if (uid, gid) == (0, 0) { Ok(()) } else { Err(Errno::EPERM) }
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
@@ -129,7 +147,7 @@ impl Inode for Node {
         Ok(self.volume.node(found))
     }
 
-    fn create(&self, name: &str, kind: FileKind) -> Result<Arc<dyn Inode>> {
+    fn create(&self, name: &str, kind: FileKind, _attributes: Attributes) -> Result<Arc<dyn Inode>> {
         let directory = match kind {
             FileKind::Regular => false,
             FileKind::Directory => true,
@@ -204,7 +222,7 @@ impl Inode for Node {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{FileKind, lookup, lookup_parent};
+    use super::super::{Attributes, FileKind, lookup, lookup_parent};
     use crate::errno::Errno;
 
     crate::ktest! {
@@ -214,8 +232,8 @@ mod tests {
             };
             assert!(lookup("/", "/disk/EFI/eliOS/kernel.elf", true).is_ok());
 
-            let directory = disk.create("Test Folder With Spaces", FileKind::Directory).unwrap();
-            let file = directory.create("a rather long file name.txt", FileKind::Regular).unwrap();
+            let directory = disk.create("Test Folder With Spaces", FileKind::Directory, Attributes::root(0o755)).unwrap();
+            let file = directory.create("a rather long file name.txt", FileKind::Regular, Attributes::root(0o644)).unwrap();
             let data: alloc::vec::Vec<u8> = (0..20_000u32).map(|i| i as u8).collect();
             file.write_at(0, &data).unwrap();
             let again = lookup("/", "/disk/test folder with spaces/A RATHER LONG FILE NAME.TXT", true).unwrap();

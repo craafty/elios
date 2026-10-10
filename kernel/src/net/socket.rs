@@ -149,7 +149,7 @@ pub struct SocketFile {
 
 impl Inode for SocketFile {
     fn metadata(&self) -> Metadata {
-        Metadata { kind: FileKind::Socket, inode: self.inode, size: 0, permissions: 0o777, modified: 0 }
+        Metadata::virtual_file(FileKind::Socket, self.inode, 0o777)
     }
 
     fn seekable(&self) -> bool {

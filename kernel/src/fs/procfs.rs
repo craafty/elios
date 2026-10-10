@@ -14,6 +14,7 @@ use alloc::vec::Vec;
 use super::{FileKind, Inode, Metadata, ramfs};
 use crate::errno::{Errno, Result};
 use crate::memory::{frames, heap};
+use crate::process::credentials::{Gid, Uid};
 use crate::process::{self, Pid};
 use crate::sync::SpinLock;
 use crate::{net, task, time};
@@ -41,13 +42,7 @@ fn generated(generate: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn I
 impl Inode for Generated {
     fn metadata(&self) -> Metadata {
         // Like Linux, report size 0: the contents aren't known until read.
-        Metadata {
-            kind: FileKind::Regular,
-            inode: self.inode,
-            size: 0,
-            permissions: 0o444,
-            modified: time::unix_time(),
-        }
+        Metadata { modified: time::unix_time(), ..Metadata::virtual_file(FileKind::Regular, self.inode, 0o444) }
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
@@ -77,13 +72,7 @@ fn link(target: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn Inode> {
 
 impl Inode for Link {
     fn metadata(&self) -> Metadata {
-        Metadata {
-            kind: FileKind::Symlink,
-            inode: self.inode,
-            size: 0,
-            permissions: 0o777,
-            modified: time::unix_time(),
-        }
+        Metadata { modified: time::unix_time(), ..Metadata::virtual_file(FileKind::Symlink, self.inode, 0o777) }
     }
 
     fn read_link(&self) -> Result<String> {
@@ -95,20 +84,23 @@ impl Inode for Link {
 struct Directory {
     inode: u64,
     list: Box<dyn Fn() -> Listing + Send + Sync>,
+    /// The owner and group: a process's directory belongs to its user (which
+    /// is how `ps` finds out who runs it).
+    owner: (Uid, Gid),
 }
 
 fn directory(list: impl Fn() -> Listing + Send + Sync + 'static) -> Arc<dyn Inode> {
-    Arc::new(Directory { inode: ramfs::next_inode_number(), list: Box::new(list) })
+    Arc::new(Directory { inode: ramfs::next_inode_number(), list: Box::new(list), owner: (0, 0) })
 }
 
 impl Inode for Directory {
     fn metadata(&self) -> Metadata {
         Metadata {
-            kind: FileKind::Directory,
-            inode: self.inode,
-            size: 0,
-            permissions: 0o555,
+            uid: self.owner.0,
+            gid: self.owner.1,
+            links: 2,
             modified: time::unix_time(),
+            ..Metadata::virtual_file(FileKind::Directory, self.inode, 0o555)
         }
     }
 
@@ -246,7 +238,11 @@ fn net_sockets(protocol: u8) -> String {
 }
 
 fn process_directory(pid: Pid) -> Arc<dyn Inode> {
-    directory(move || {
+    let owner = process::find(pid).map_or((0, 0), |process| {
+        let credentials = process.credentials.lock();
+        (credentials.euid, credentials.egid)
+    });
+    let list = Box::new(move || {
         let Some(process) = process::find(pid) else { return Vec::new() };
         let mut entries: Listing = Vec::new();
         let target = process.clone();
@@ -278,7 +274,8 @@ fn process_directory(pid: Pid) -> Arc<dyn Inode> {
             }),
         ));
         entries
-    })
+    });
+    Arc::new(Directory { inode: ramfs::next_inode_number(), list, owner })
 }
 
 fn info(pid: Pid) -> Option<process::ProcessInfo> {
@@ -292,10 +289,22 @@ fn status(pid: Pid) -> String {
         'Z' => "Z (zombie)",
         _ => "S (sleeping)",
     };
+    let ids = &info.credentials;
+    let groups: Vec<String> = ids.groups.iter().map(ToString::to_string).collect();
     format!(
-        "Name:\t{}\nState:\t{state}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{}\nThreads:\t{}\nVmRSS:\t{} kB\n",
+        "Name:\t{}\nState:\t{state}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{}\n\
+         Uid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nGroups:\t{}\nThreads:\t{}\nVmRSS:\t{} kB\n",
         info.name,
         info.parent,
+        ids.uid,
+        ids.euid,
+        ids.suid,
+        ids.euid,
+        ids.gid,
+        ids.egid,
+        ids.sgid,
+        ids.egid,
+        groups.join(" "),
         info.threads,
         info.memory / 1024
     )

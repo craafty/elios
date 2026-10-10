@@ -6,6 +6,8 @@
 //!
 //! - `text`: typed as a line at the shell; waits for the next prompt
 //! - `@raw TEXT`: typed as is, with `\n`, `\r`, `\t`, `\e` and `\xNN` escapes
+//! - `@wait TEXT`: waits until TEXT appears (say, a password prompt) in
+//!   what was printed since the previous step started
 //! - `@sleep SECONDS`
 //! - `@key NAME`: a key on the PS/2 keyboard (QEMU names: `ret`, `f12`, `ctrl-c`...)
 //! - `@screenshot PATH`: saves the screen as a PNG
@@ -19,8 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// The end of the shell's prompt: `#`, then the color reset, then a space.
-const PROMPT_END: &[u8] = b"#\x1b[0m ";
+/// The end of the shell's prompt: `#` (root) or `$`, then the color reset,
+/// then a space.
+const PROMPT_ENDS: [&[u8]; 2] = [b"#\x1b[0m ", b"$\x1b[0m "];
 const BOOT_TIMEOUT: Duration = Duration::from_secs(120);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -52,7 +55,7 @@ pub fn run(mut qemu: Command, steps: &[String], monitor: &Path) -> Result<(), St
         let data = output.lock().unwrap();
         let typed = &data[start.min(data.len())..];
         let Some(enter) = typed.iter().position(|&byte| byte == b'\n') else { return false };
-        typed[enter..].windows(PROMPT_END.len()).any(|window| window == PROMPT_END)
+        PROMPT_ENDS.iter().any(|end| typed[enter..].windows(end.len()).any(|window| window == *end))
     };
     let wait_for_prompt = |start: usize, timeout: Duration| {
         let deadline = Instant::now() + timeout;
@@ -65,8 +68,24 @@ pub fn run(mut qemu: Command, steps: &[String], monitor: &Path) -> Result<(), St
     if !prompt_since(0) {
         eprintln!("xtask: no shell prompt within {}s", BOOT_TIMEOUT.as_secs());
     }
+    let mut previous_start = length();
     for step in steps {
-        let result = if let Some(seconds) = step.strip_prefix("@sleep ") {
+        let start = length();
+        let result = if let Some(text) = step.strip_prefix("@wait ") {
+            let deadline = Instant::now() + COMMAND_TIMEOUT;
+            let appeared = || {
+                let data = output.lock().unwrap();
+                let since = &data[previous_start.min(data.len())..];
+                since.windows(text.len()).any(|window| window == text.as_bytes())
+            };
+            while Instant::now() < deadline && !appeared() {
+                thread::sleep(Duration::from_millis(50));
+            }
+            if !appeared() {
+                eprintln!("xtask: `{text}` didn't appear within {}s", COMMAND_TIMEOUT.as_secs());
+            }
+            Ok(())
+        } else if let Some(seconds) = step.strip_prefix("@sleep ") {
             let seconds: f64 = seconds.trim().parse().map_err(|_| format!("bad step `{step}`"))?;
             thread::sleep(Duration::from_secs_f64(seconds));
             Ok(())
@@ -81,12 +100,14 @@ pub fn run(mut qemu: Command, steps: &[String], monitor: &Path) -> Result<(), St
                 thread::sleep(Duration::from_millis(500));
             })
         } else {
-            let start = length();
             input.write_all(format!("{step}\r").as_bytes()).and_then(|_| input.flush()).map_err(|e| e.to_string())?;
             wait_for_prompt(start, COMMAND_TIMEOUT);
             Ok(())
         };
         result?;
+        if !step.starts_with("@wait ") {
+            previous_start = start;
+        }
     }
     thread::sleep(Duration::from_millis(300));
     let _ = child.kill();

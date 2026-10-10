@@ -6,7 +6,7 @@ use crate::errno::{Errno, Result};
 use crate::fs::{self, FileKind};
 use crate::memory::PAGE_SIZE;
 use crate::process::{self, CloneArgs, PROT_EXEC, PROT_READ, PROT_WRITE, Pid, SIGKILL, SigAction, USER_END};
-use crate::process::{futex, signal, user};
+use crate::process::{credentials, futex, signal, user};
 use crate::{task, time};
 
 pub fn fork(frame: &InterruptFrame) -> Result<u64> {
@@ -429,4 +429,102 @@ fn sleep_until(deadline: u64) -> Result<u64> {
         return Err(Errno::EINTR);
     }
     Ok(0)
+}
+
+/// A user or group id argument: -1 (as a 32-bit value) means "leave it".
+fn id_argument(value: u64) -> Option<u32> {
+    let id = value as u32;
+    (id != u32::MAX).then_some(id)
+}
+
+/// `getuid`, `geteuid`, `getgid`, `getegid`.
+pub fn get_id(number: u64) -> Result<u64> {
+    let credentials = credentials::current();
+    Ok(u64::from(match number {
+        102 => credentials.uid,
+        104 => credentials.gid,
+        107 => credentials.euid,
+        _ => credentials.egid,
+    }))
+}
+
+pub fn setuid(uid: u64) -> Result<u64> {
+    credentials::update(|current| current.set_uid(uid as u32)).map(|_| 0)
+}
+
+pub fn setgid(gid: u64) -> Result<u64> {
+    credentials::update(|current| current.set_gid(gid as u32)).map(|_| 0)
+}
+
+pub fn setreuid(real: u64, effective: u64) -> Result<u64> {
+    credentials::update(|current| current.set_real_effective_uid(id_argument(real), id_argument(effective))).map(|_| 0)
+}
+
+pub fn setregid(real: u64, effective: u64) -> Result<u64> {
+    credentials::update(|current| current.set_real_effective_gid(id_argument(real), id_argument(effective))).map(|_| 0)
+}
+
+pub fn setresuid(real: u64, effective: u64, saved: u64) -> Result<u64> {
+    credentials::update(|current| current.set_user_ids(id_argument(real), id_argument(effective), id_argument(saved)))
+        .map(|_| 0)
+}
+
+pub fn setresgid(real: u64, effective: u64, saved: u64) -> Result<u64> {
+    credentials::update(|current| current.set_group_ids(id_argument(real), id_argument(effective), id_argument(saved)))
+        .map(|_| 0)
+}
+
+/// `getresuid` (`groups` false) or `getresgid`: three ids, written to three
+/// addresses.
+pub fn get_three_ids(real: u64, effective: u64, saved: u64, groups: bool) -> Result<u64> {
+    let credentials = credentials::current();
+    let ids = if groups {
+        [credentials.gid, credentials.egid, credentials.sgid]
+    } else {
+        [credentials.uid, credentials.euid, credentials.suid]
+    };
+    for (address, id) in [real, effective, saved].into_iter().zip(ids) {
+        user::write_value(address, &id)?;
+    }
+    Ok(0)
+}
+
+/// `setfsuid` and `setfsgid`: eliOS checks file access with the effective
+/// ids, so these just report them (which is all most callers want).
+pub fn fs_id(groups: bool) -> Result<u64> {
+    let credentials = credentials::current();
+    Ok(u64::from(if groups { credentials.egid } else { credentials.euid }))
+}
+
+/// `getgroups(size, list)`: with size 0, just the count.
+pub fn getgroups(size: u64, list: u64) -> Result<u64> {
+    let credentials = credentials::current();
+    let count = credentials.groups.len();
+    let size = size as u32 as usize;
+    if size == 0 {
+        return Ok(count as u64);
+    }
+    if size < count {
+        return Err(Errno::EINVAL);
+    }
+    let bytes: alloc::vec::Vec<u8> = credentials.groups.iter().flat_map(|group| group.to_le_bytes()).collect();
+    user::write_bytes(list, &bytes)?;
+    Ok(count as u64)
+}
+
+pub fn setgroups(size: u64, list: u64) -> Result<u64> {
+    let size = size as u32 as usize;
+    if size > credentials::MAX_GROUPS {
+        return Err(Errno::EINVAL);
+    }
+    let mut groups = alloc::vec::Vec::with_capacity(size);
+    for index in 0..size {
+        groups.push(user::read_value::<u32>(list + index as u64 * 4)?);
+    }
+    credentials::update(|current| current.set_groups(groups)).map(|_| 0)
+}
+
+/// `umask`: sets the mask, returning the old one.
+pub fn umask(mask: u64) -> Result<u64> {
+    Ok(u64::from(process::current().set_umask(mask as u32)))
 }

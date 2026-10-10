@@ -36,3 +36,22 @@ pub fn uname() -> Uname {
     };
     Uname { system: field(0), hostname: field(1), release: field(2), version: field(3), machine: field(4) }
 }
+
+/// Fills `buffer` with random bytes from the kernel.
+pub fn random_bytes(buffer: &mut [u8]) {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let rest = &mut buffer[filled..];
+        // SAFETY: the buffer is valid for its length.
+        match unsafe { sys::call(sys::GETRANDOM, [rest.as_mut_ptr() as usize, rest.len(), 0, 0, 0, 0]) } {
+            Ok(count) => filled += count,
+            Err(_) => return,
+        }
+    }
+}
+
+/// Changes the machine's name (root only).
+pub fn set_hostname(name: &str) -> crate::Result<()> {
+    // SAFETY: the pointer and length describe the name.
+    unsafe { sys::call(sys::SETHOSTNAME, [name.as_ptr() as usize, name.len(), 0, 0, 0, 0]) }.map(|_| ())
+}

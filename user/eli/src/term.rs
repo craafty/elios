@@ -1,6 +1,8 @@
 //! Terminal control: raw mode, window size, and the foreground process
 //! group.
 
+use alloc::string::String;
+
 use crate::sys::{self, Result};
 
 const TCGETS: usize = 0x5401;
@@ -69,4 +71,33 @@ pub fn size(fd: i32) -> (u16, u16) {
 /// Ctrl+C.
 pub fn set_foreground_group(fd: i32, group: u32) -> Result<()> {
     ioctl(fd, TIOCSPGRP, &raw const group as usize).map(|_| ())
+}
+
+/// Asks for a password: shows `prompt`, then reads a line without echoing
+/// it. Returns `None` at end of input. When input isn't a terminal (a
+/// script), the line is just read.
+pub fn read_password(prompt: &str) -> Option<String> {
+    use crate::io::{self, STDIN};
+    let original = settings(STDIN).ok();
+    // The prompt goes to the terminal even if output is redirected.
+    let _ = io::write_all(io::STDERR, prompt.as_bytes());
+    if let Some(original) = original {
+        let mut quiet = original;
+        quiet.local_flags &= !ECHO;
+        let _ = set_settings(STDIN, &quiet);
+    }
+    let mut line = alloc::vec::Vec::new();
+    let mut byte = [0u8];
+    let complete = loop {
+        match io::read(STDIN, &mut byte) {
+            Ok(1) if byte[0] == b'\n' => break true,
+            Ok(1) => line.push(byte[0]),
+            _ => break !line.is_empty(),
+        }
+    };
+    if let Some(original) = original {
+        let _ = set_settings(STDIN, &original);
+        let _ = io::write_all(io::STDERR, b"\n");
+    }
+    complete.then(|| String::from_utf8_lossy(&line).trim_end_matches('\r').into())
 }

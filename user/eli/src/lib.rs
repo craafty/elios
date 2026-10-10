@@ -21,6 +21,7 @@
 
 extern crate alloc;
 
+pub mod crypt;
 pub mod env;
 pub mod fs;
 mod heap;
@@ -31,6 +32,7 @@ pub mod sys;
 pub mod system;
 pub mod term;
 pub mod time;
+pub mod users;
 
 use core::arch::naked_asm;
 use core::panic::PanicInfo;

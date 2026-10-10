@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+mod accounts;
 mod applets;
 mod commands;
 mod edit;

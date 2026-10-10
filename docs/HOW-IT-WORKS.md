@@ -19,17 +19,18 @@ Contents:
 11. [Entering and leaving user mode](#11-entering-and-leaving-user-mode)
 12. [Processes](#12-processes)
 13. [Signals](#13-signals)
-14. [System calls and Linux compatibility](#14-system-calls-and-linux-compatibility)
-15. [Files](#15-files)
-16. [The terminal](#16-the-terminal)
-17. [Devices and drivers](#17-devices-and-drivers)
-18. [Networking](#18-networking)
-19. [ACPI: tables and power](#19-acpi-tables-and-power)
-20. [Userland](#20-userland)
-21. [Disk images and the build tool](#21-disk-images-and-the-build-tool)
-22. [Testing](#22-testing)
-23. [Limits and what's next](#23-limits-and-whats-next)
-24. [Reference tables](#24-reference-tables)
+14. [Users and permissions](#14-users-and-permissions)
+15. [System calls and Linux compatibility](#15-system-calls-and-linux-compatibility)
+16. [Files](#16-files)
+17. [The terminal](#17-the-terminal)
+18. [Devices and drivers](#18-devices-and-drivers)
+19. [Networking](#19-networking)
+20. [ACPI: tables and power](#20-acpi-tables-and-power)
+21. [Userland](#21-userland)
+22. [Disk images and the build tool](#22-disk-images-and-the-build-tool)
+23. [Testing](#23-testing)
+24. [Limits and what's next](#24-limits-and-whats-next)
+25. [Reference tables](#25-reference-tables)
 
 ---
 
@@ -1042,7 +1043,152 @@ zero SIGFPE. If the program handles the signal, the handler runs (that's how
 `sigtest` recovers from a null pointer write with `siglongjmp`); otherwise
 the process ends and the kernel logs why.
 
-## 14. System calls and Linux compatibility
+## 14. Users and permissions
+
+`process/credentials.rs`, `fs/mod.rs` (the checks), `user/eli/src/users.rs`,
+`user/eli/src/crypt.rs`, `user/utils/src/accounts.rs`, `user/utils/src/auth.rs`.
+
+eliOS follows the classic Unix model, the same one Linux uses, because
+every program that cares about users (and every user who has used Linux)
+expects it: numeric user and group ids, an owner, a group and nine
+permission bits on every file, root (user 0) as the one all-powerful
+account, and setuid programs for the few things ordinary users need
+privileges for. Linux's finer-grained "capabilities" were left out: they
+solve problems a single-user desktop doesn't have.
+
+### Credentials
+
+Each process has a **real**, **effective** and **saved** user id, the same
+three group ids, and a list of supplementary groups. The effective ids are
+what permission checks use; the real ids say who started the program; the
+saved ids let a setuid program give up its privileges for a while and take
+them back. The rules for changing them (`setuid`, `setresuid`, `setreuid`,
+`setgroups` and the group versions) are Linux's: root may set anything,
+everyone else only shuffles among their current three ids. These rules are
+small pure functions on a `Credentials` value with their own kernel tests.
+
+A process's credentials are an `Arc<Credentials>` that's replaced, never
+changed in place. A permission check takes a snapshot (one reference count
+increment) and then needs no lock, and a thread in the middle of a system
+call sees one consistent set even if another thread changes them. Kernel
+threads act as root.
+
+Credentials are inherited by `fork` and kept by `exec`, except that a
+**setuid** (or setgid) program makes the effective id the file's owner (or
+group), and the saved id follows. Linux's details are kept: a script's own
+setuid bit is ignored (its interpreter's counts), setgid needs the group
+execute bit, and a traced program (`strace`) doesn't gain privileges. A
+program that gained privileges gets `AT_SECURE` in its auxiliary vector, so
+glibc's loader ignores variables like `LD_LIBRARY_PATH` that its caller
+controls.
+
+### Permission checks
+
+`fs::check_access` is the one place the rules live: the owner's three bits
+apply to the owner, the group's to anyone in the file's group (effective or
+supplementary), the rest to everyone else; root may read and write
+anything, and execute anything with at least one execute bit. The checks
+are made where Linux makes them:
+
+- **Path lookup** needs search (execute) permission on every directory it
+  passes through. Root skips the check entirely, so the kernel's own
+  lookups and root's cost nothing extra.
+- **open** checks read and/or write against the access mode; creating a
+  file needs write and search permission on the directory. A file the
+  caller just created can be opened however it asked, even with mode 0444,
+  as POSIX requires.
+- **exec** needs execute permission.
+- **Creating, deleting and renaming** need write and search permission on
+  the directories involved. In a directory with the **sticky bit** (like
+  `/tmp`, mode 1777), only an entry's owner, the directory's owner or root
+  may delete or rename it.
+- **chmod** is for the owner (or root); **chown** to another user is root's
+  alone; an owner may change the group to another group they're in.
+  Changing a regular file's owner clears its setuid and setgid bits, and so
+  does opening it for writing as anyone but root, so nobody can turn
+  someone else's privileged program into their own.
+- **access** checks with the *real* ids (so a setuid program can ask
+  whether its caller could do something), unless `AT_EACCESS` is given.
+- **Signals** can only be sent to processes of the same user (comparing the
+  sender's real or effective id with the target's real or saved one), or by
+  root. `reboot` and `sethostname` are root's.
+
+New files get the process's effective user and group, and the requested
+permissions minus the **umask** (inherited, 022 by default). A directory
+with the setgid bit hands its group to new entries, as on Linux.
+
+Where ownership is stored: the in-memory file system keeps owner, group and
+permissions per file; the initrd's cpio headers carry them, so xtask
+decides them at build time (everything belongs to root; `eliauth` is 4755,
+`/etc/shadow` 0600, `/root` 0700, `/tmp` 1777). FAT has nowhere to store
+them, so a FAT volume reports everything as root's with mode 0755 and
+refuses changes, as Linux's `vfat` does by default. `/proc/<pid>` belongs
+to the process's user (which is how `ps` tools find out who runs what), and
+`/proc/<pid>/status` has `Uid:` and `Gid:` lines.
+
+The terminal is a file like any other: `login` gives `/dev/console` to the
+user who logs in (mode 0620), and `/dev/tty` is a separate node, open to
+everyone, that reaches the same terminal.
+
+### Accounts
+
+Accounts are kept in `/etc/passwd`, `/etc/group` and `/etc/shadow`, in
+exactly Linux's formats, so the files (and tools like BusyBox's) are
+interchangeable. libeli's `users` module reads and writes them; an update
+writes a new file and renames it over the old, so a reader sees the old
+file or the new one, never half of each.
+
+**Passwords** are stored as SHA-512 crypt hashes (`$6$salt$hash`), the
+scheme glibc uses: the password and a random 16-character salt go through
+5000 rounds of SHA-512 in a fixed, deliberately convoluted pattern, so each
+guess costs an attacker real work and identical passwords hash
+differently. Both SHA-512 and the scheme are implemented in libeli
+(`crypt.rs`) from their specifications, and the output was checked to be
+identical to OpenSSL's (`openssl passwd -6`) and to accept the published
+test vector. Comparison of hashes takes the same time whether they differ
+early or late. An empty hash means no password; one starting with `!` or
+`*` is locked.
+
+### Logging in
+
+init no longer starts a shell itself: it runs **login** on the console, and
+again whenever the session ends. login asks for a name and password (with
+echo off, through the same termios flags as on Linux), pauses two seconds
+after a failure whether the name or the password was wrong (so names can't
+be probed), gives the user the terminal, sets their groups, group id and
+user id (in that order, since after the last step the others can't be
+changed), changes to their home and runs their shell as a login shell
+(`-sh`) with a fresh environment (`HOME`, `USER`, `LOGNAME`, `SHELL`,
+`PATH`, `TERM`). The shell's `logout` (or `exit`, or Ctrl+D) ends the
+session and login asks again.
+
+The live system has `/etc/autologin` naming root, so the first session
+starts without asking (the live image is for trying things, and root has no
+password there). Every later session asks.
+
+### su, sudo and passwd
+
+These need root's privileges when an ordinary user runs them: `passwd`
+writes `/etc/shadow`, and `su` and `sudo` switch users. They live in a
+separate program, **eliauth**, installed setuid root, rather than in
+eliutils (BusyBox's approach is one setuid binary that drops privileges for
+every other applet; a separate program means only these few hundred lines
+ever run with privileges someone else gave them). Its rules:
+
+- `su [-] [USER]` asks for the *target's* password (root needn't give one).
+- `sudo` lets members of the `wheel` group run commands as root after
+  giving *their own* password, remembered for five minutes by a
+  root-owned timestamp file in `/run/sudo`. Commands are found through a
+  fixed search path, never the caller's `PATH`.
+- `passwd` changes your own password after you give the current one; root
+  can change anyone's, remove one (`-d`) or lock an account (`-l`).
+
+`adduser` (root only) picks the first free id from 1000 up, creates a
+group of the same name and number ("user private groups", as Debian and
+Fedora do), copies `/etc/skel` into the new home directory (mode 0750),
+and with `--admin` adds the user to `wheel`.
+
+## 15. System calls and Linux compatibility
 
 `syscall/`.
 
@@ -1084,7 +1230,7 @@ inherited by children and kept across `exec`. Unimplemented calls are also
 logged by name at debug level. These two tools are how every compatibility
 gap above was found.
 
-## 15. Files
+## 16. Files
 
 `fs/`.
 
@@ -1095,7 +1241,9 @@ reading, writing, directory lookups, creating, linking, renaming, ioctl,
 poll readiness and more. Every method has a default that refuses the
 operation, so each kind of inode implements only what makes sense for it.
 Implementations: the in-memory file system, FAT files and directories,
-devices, pipes, the terminal, and `/proc`'s generated files.
+devices, pipes, the terminal, and `/proc`'s generated files. Every inode
+reports an owner, a group and permission bits; who may do what with them
+is section 14.
 
 There's no mount table: mounting means linking another file system's root
 into a directory (`/proc`, `/disk`). `..` is resolved lexically (by
@@ -1156,7 +1304,7 @@ woken whenever any terminal or pipe changes; `poll` rechecks every
 descriptor. That's simpler than per-file wait lists and cheap at eliOS's
 scale. `select` and `pselect6` are translated into the same mechanism.
 
-## 16. The terminal
+## 17. The terminal
 
 `tty.rs`.
 
@@ -1178,7 +1326,7 @@ bytes: the keyboard (decoded to the bytes a terminal would send, such as
 `ESC [ A` for the up arrow) and the serial port (so a terminal on the host,
 or a script, can drive eliOS). Output goes to both the screen and serial.
 
-## 17. Devices and drivers
+## 18. Devices and drivers
 
 ### PS/2 keyboard (`keyboard.rs`)
 
@@ -1319,7 +1467,7 @@ however it's reached. Deleting a file marks any open node for it as deleted,
 because its clusters may be reused. FAT has no permissions, symlinks or hard
 links.
 
-## 18. Networking
+## 19. Networking
 
 `net/`, `drivers/e1000.rs`, `syscall/net.rs`.
 
@@ -1469,7 +1617,7 @@ hand: downloads from a web server on the host (`wget` with an MD5 check)
 and from the internet, and connections from the host into eliOS through a
 forwarded port (`cargo xtask run --forward 8080:80`).
 
-## 19. ACPI: tables and power
+## 20. ACPI: tables and power
 
 `acpi.rs`, `power.rs`.
 
@@ -1491,7 +1639,7 @@ XSDT (or the older RSDT), with every checksum verified.
 `reboot` uses the FADT's reset register when present, then the keyboard
 controller's reset line, then a deliberate triple fault.
 
-## 20. Userland
+## 21. Userland
 
 ### libeli (`user/eli`)
 
@@ -1506,8 +1654,10 @@ The runtime for eliOS's own Rust programs, written against the Linux ABI.
   a clean panic.
 - **A small standard library:** I/O and print macros, files and directories,
   processes (fork, exec, wait, kill, process groups, signal dispositions),
-  terminals (raw mode, window size, foreground group), time, system
-  information, and the eliOS-specific calls.
+  terminals (raw mode, window size, foreground group, password prompts),
+  time, system information, users and groups (`users.rs`: ids and the
+  account files), password hashing (`crypt.rs`), and the eliOS-specific
+  calls.
 
 ### eliutils (`user/utils`)
 
@@ -1537,10 +1687,15 @@ history, Tab completion (commands for the first word, paths after) and the
 usual Ctrl shortcuts. It redraws the line on each key, which the console
 handles cheaply.
 
-**init** (`init.rs`) prints the welcome message, runs `/etc/rc` if present,
-and keeps a shell running: when the shell exits it starts a new one (with a
-pause if they're exiting immediately, to avoid a busy loop). It also
-collects orphaned processes.
+**init** (`init.rs`) runs `/etc/rc` if present, then keeps a login session
+going on the console: it runs `login`, and when the session ends, runs it
+again (with a pause if sessions end immediately, to avoid a busy loop). It
+also collects orphaned processes. `login` prints the welcome message.
+
+**Accounts** (`accounts.rs`): `login`, `adduser`, `deluser`, `id`,
+`whoami`, `groups`, `chmod` (octal or symbolic modes like `u+x,go-w`),
+`chown` and `chgrp`. `su`, `sudo` and `passwd` are a separate setuid
+program (`auth.rs`, installed as `/bin/eliauth`); see section 14.
 
 **edit** (`edit.rs`) is a small nano-style editor: the screen is redrawn
 from the buffer after each key.
@@ -1560,15 +1715,17 @@ output to a TCP connection, made or accepted; it waits on both with
 ### Linux programs
 
 - `user/c/` holds C programs compiled by the host's GCC and glibc: a hello
-  world, `ctest` (a self-test of the C library on eliOS) and `sigtest`
-  (signal handling). `*-dynamic.c` programs are dynamically linked, and
+  world, `ctest` (a self-test of the C library on eliOS), `sigtest`
+  (signal handling), `threadtest`, `nettest` and `permtest` (users,
+  permissions and setuid programs, checked the way a Linux program sees
+  them). `*-dynamic.c` programs are dynamically linked, and
   xtask copies the libraries `ldd` reports into the root file system.
 - If the host has a static BusyBox, it's included with links for the
   commands eliutils doesn't have (about 200: `vi`, `awk`, `sed`, `find`,
   `tar`, `gzip`, `top`, ...). Links go in `/usr/bin`, which comes after
   `/bin` in `PATH`, so eliOS's own commands take precedence.
 
-## 21. Disk images and the build tool
+## 22. Disk images and the build tool
 
 ### The disk image (`xtask/src/image.rs`)
 
@@ -1606,7 +1763,7 @@ the shell (waiting for each prompt), can press keys through the QEMU
 monitor and take screenshots, then prints a clean transcript. It's how
 end-to-end behavior is checked without a person typing.
 
-## 22. Testing
+## 23. Testing
 
 - **Kernel tests** (`ktest!`) register themselves in a dedicated linker
   section; the linker script brackets the section with symbols, so the
@@ -1626,7 +1783,7 @@ end-to-end behavior is checked without a person typing.
 Every phase was also tested in release builds, since optimizations can
 expose bugs that debug builds hide.
 
-## 23. Limits and what's next
+## 24. Limits and what's next
 
 Current limits, roughly in order of how much they'd matter to a user:
 
@@ -1648,7 +1805,7 @@ Current limits, roughly in order of how much they'd matter to a user:
 - **fork copies eagerly**; copy-on-write would make it cheaper.
 - **Disk I/O is polled** and holds the volume lock for whole operations.
 
-## 24. Reference tables
+## 25. Reference tables
 
 ### Physical memory at boot (QEMU, 256 MiB)
 

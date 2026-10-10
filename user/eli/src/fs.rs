@@ -92,7 +92,9 @@ pub enum FileType {
     Directory,
     Symlink,
     CharDevice,
+    BlockDevice,
     Pipe,
+    Socket,
     Other,
 }
 
@@ -103,7 +105,9 @@ impl FileType {
             0o040000 => FileType::Directory,
             0o120000 => FileType::Symlink,
             0o020000 => FileType::CharDevice,
+            0o060000 => FileType::BlockDevice,
             0o010000 => FileType::Pipe,
+            0o140000 => FileType::Socket,
             _ => FileType::Other,
         }
     }
@@ -114,7 +118,9 @@ impl FileType {
             4 => FileType::Directory,
             10 => FileType::Symlink,
             2 => FileType::CharDevice,
+            6 => FileType::BlockDevice,
             1 => FileType::Pipe,
+            12 => FileType::Socket,
             _ => FileType::Other,
         }
     }
@@ -124,10 +130,21 @@ impl FileType {
 pub struct Metadata {
     pub kind: FileType,
     pub size: u64,
+    /// The file type and permission bits (`st_mode`).
     pub mode: u32,
     pub inode: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub links: u64,
     /// Seconds since the Unix epoch.
     pub modified: i64,
+}
+
+impl Metadata {
+    /// The permission bits, including setuid, setgid and sticky.
+    pub fn permissions(&self) -> u32 {
+        self.mode & 0o7777
+    }
 }
 
 fn stat(path: &str, flags: usize) -> Result<Metadata> {
@@ -137,12 +154,16 @@ fn stat(path: &str, flags: usize) -> Result<Metadata> {
     unsafe {
         sys::call(sys::NEWFSTATAT, [AT_FDCWD, path.as_ptr() as usize, buffer.as_mut_ptr() as usize, flags, 0, 0])
     }?;
+    // struct stat: dev, ino, nlink, then mode, uid, gid as 32-bit values.
     let mode = buffer[3] as u32;
     Ok(Metadata {
         kind: FileType::from_mode(mode),
         size: buffer[6],
         mode,
         inode: buffer[1],
+        uid: (buffer[3] >> 32) as u32,
+        gid: buffer[4] as u32,
+        links: buffer[2],
         modified: buffer[11] as i64,
     })
 }
@@ -259,4 +280,93 @@ pub fn copy(from: &str, to: &str) -> Result<u64> {
     }
     write(to, &data)?;
     Ok(data.len() as u64)
+}
+
+/// Changes a file's permission bits (`chmod`).
+pub fn set_permissions(path: &str, permissions: u32) -> Result<()> {
+    let path = c_path(path);
+    // SAFETY: the path is NUL-terminated.
+    unsafe { sys::call(sys::FCHMODAT, [AT_FDCWD, path.as_ptr() as usize, permissions as usize, 0, 0, 0]) }.map(|_| ())
+}
+
+/// Changes a file's owner and group (`None` leaves one alone). Symbolic
+/// links themselves are changed, not what they point to (`lchown`).
+pub fn set_owner(path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+    let path = c_path(path);
+    let id = |value: Option<u32>| value.map_or(u32::MAX as usize, |id| id as usize);
+    // SAFETY: the path is NUL-terminated.
+    unsafe { sys::call(sys::FCHOWNAT, [AT_FDCWD, path.as_ptr() as usize, id(uid), id(gid), AT_SYMLINK_NOFOLLOW, 0]) }
+        .map(|_| ())
+}
+
+/// Sets a file's modification time (seconds since the Unix epoch), or to
+/// now with `None`.
+pub fn set_modified(path: &str, time: Option<u64>) -> Result<()> {
+    let path = c_path(path);
+    const UTIME_NOW: i64 = (1 << 30) - 1;
+    const UTIME_OMIT: i64 = (1 << 30) - 2;
+    let times: [i64; 4] = match time {
+        Some(time) => [0, UTIME_OMIT, time as i64, 0],
+        None => [0, UTIME_OMIT, 0, UTIME_NOW],
+    };
+    // SAFETY: the path is NUL-terminated and `times` is two timespecs.
+    unsafe { sys::call(sys::UTIMENSAT, [AT_FDCWD, path.as_ptr() as usize, times.as_ptr() as usize, 0, 0, 0]) }
+        .map(|_| ())
+}
+
+/// Makes `link` another name for the file at `target` (a hard link).
+pub fn hard_link(target: &str, link: &str) -> Result<()> {
+    let (target, link) = (c_path(target), c_path(link));
+    // SAFETY: both paths are NUL-terminated.
+    unsafe { sys::call(sys::LINKAT, [AT_FDCWD, target.as_ptr() as usize, AT_FDCWD, link.as_ptr() as usize, 0, 0]) }
+        .map(|_| ())
+}
+
+/// Creates a directory with the given permissions (less the umask).
+pub fn create_dir_with(path: &str, permissions: u32) -> Result<()> {
+    let path = c_path(path);
+    // SAFETY: the path is NUL-terminated.
+    unsafe { sys::call(sys::MKDIRAT, [AT_FDCWD, path.as_ptr() as usize, permissions as usize, 0, 0, 0]) }.map(|_| ())
+}
+
+/// Sets the umask (permission bits new files don't get), returning the old
+/// one.
+pub fn set_umask(mask: u32) -> u32 {
+    // SAFETY: takes no pointers.
+    unsafe { sys::syscall(sys::UMASK, [mask as usize, 0, 0, 0, 0, 0]) as u32 }
+}
+
+/// Whether the real user could access `path` the way `mode` asks (4 read,
+/// 2 write, 1 execute, 0 just exists).
+pub fn accessible(path: &str, mode: u32) -> bool {
+    let path = c_path(path);
+    // SAFETY: the path is NUL-terminated.
+    unsafe { sys::call(sys::FACCESSAT, [AT_FDCWD, path.as_ptr() as usize, mode as usize, 0, 0, 0]) }.is_ok()
+}
+
+/// Copies a directory tree, keeping permissions (and, for root, owners).
+pub fn copy_tree(from: &str, to: &str) -> Result<()> {
+    let metadata = symlink_metadata(from)?;
+    match metadata.kind {
+        FileType::Directory => {
+            match create_dir(to) {
+                Ok(()) | Err(Error::EXISTS) => {}
+                Err(error) => return Err(error),
+            }
+            for entry in read_dir(from)? {
+                copy_tree(&alloc::format!("{from}/{}", entry.name), &alloc::format!("{to}/{}", entry.name))?;
+            }
+        }
+        FileType::Symlink => symlink(&read_link(from)?, to)?,
+        _ => {
+            copy(from, to)?;
+        }
+    }
+    if crate::users::euid() == 0 {
+        set_owner(to, Some(metadata.uid), Some(metadata.gid))?;
+    }
+    if metadata.kind != FileType::Symlink {
+        set_permissions(to, metadata.permissions())?;
+    }
+    Ok(())
 }

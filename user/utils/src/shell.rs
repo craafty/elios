@@ -20,7 +20,7 @@ use eli::{env, eprintln, println, system, term};
 
 use crate::editor::{Editor, Line};
 
-const BUILTINS: &[&str] = &["cd", "exit", "export", "unset", "history", "source", ".", "jobs", "wait"];
+const BUILTINS: &[&str] = &["cd", "exit", "logout", "export", "unset", "history", "source", ".", "jobs", "wait"];
 
 pub fn main(arguments: &[String]) -> i32 {
     let mut shell = Shell::new();
@@ -152,8 +152,17 @@ impl Shell {
             Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => format!("~{rest}"),
             _ => cwd,
         };
-        let marker = if self.status == 0 { "\x1b[1;32m#" } else { "\x1b[1;31m#" };
-        format!("\x1b[1;36mroot@{}\x1b[0m:\x1b[1;34m{shown}\x1b[0m{marker}\x1b[0m ", system::uname().hostname)
+        // `#` for root, `$` for everyone else, as is traditional; red after
+        // a command fails.
+        let euid = eli::users::euid();
+        let symbol = if euid == 0 { '#' } else { '$' };
+        let color = if self.status == 0 { "1;32" } else { "1;31" };
+        let user =
+            env::var("USER").filter(|_| euid == eli::users::uid()).unwrap_or_else(|| eli::users::user_name(euid));
+        format!(
+            "\x1b[1;36m{user}@{}\x1b[0m:\x1b[1;34m{shown}\x1b[0m\x1b[{color}m{symbol}\x1b[0m ",
+            system::uname().hostname
+        )
     }
 
     fn run_script(&mut self, path: &str, arguments: &[String]) -> i32 {
@@ -380,6 +389,14 @@ impl Shell {
                 let code = argument.and_then(|a| a.parse().ok()).unwrap_or(self.status);
                 self.exit_code = Some(code);
                 code
+            }
+            "logout" if crate::accounts::is_login_shell() => {
+                self.exit_code = Some(0);
+                0
+            }
+            "logout" => {
+                eprintln!("logout: not a login shell (use exit)");
+                1
             }
             "export" => {
                 if words.len() == 1 {
