@@ -51,6 +51,9 @@ hello-dynamic                 # a dynamically linked Linux program
 strace hello-c                # watch a program's system calls
 vi poem.txt                   # BusyBox vi (if busybox-static was installed)
 cp notes.txt /disk/           # /disk is the boot disk: files there persist
+ifconfig; ping -c 3 10.0.2.2  # the network (QEMU's virtual router)
+wget -O - http://example.com/ # the internet, if the host has it
+nettest                       # sockets through glibc: TCP, UDP, poll...
 poweroff                      # shut down (QEMU exits)
 ```
 
@@ -63,6 +66,7 @@ cargo xtask run --release     # optimized build
 cargo xtask run --gdb         # wait for a debugger on localhost:1234
 cargo xtask run --trace       # log interrupts and CPU resets to target/qemu.log
 cargo xtask run --cpus 8      # more (or fewer) CPUs; the default is 4
+cargo xtask run --forward 8080:80  # reach port 80 in eliOS at localhost:8080
 cargo xtask test              # boot a test kernel and run its 75 tests
 cargo xtask image             # a fresh bootable disk image, target/eliOS.img
 ```
@@ -80,8 +84,10 @@ sudo dd if=target/eliOS.img of=/dev/sdX bs=4M conv=fsync   # sdX = the stick
 Real machines vary far more than QEMU. Keyboards work over PS/2 or USB
 (plugged into the computer itself; not yet through a hub). It reads and writes
 SATA (AHCI) and NVMe disks; without a supported disk it still runs from
-memory. `poweroff` and `reboot` use ACPI. Other virtual machines with EFI
-enabled may work too, but QEMU is the one eliOS is tested on.
+memory. Networking needs an Intel e1000-family card (common in older PCs,
+and what VirtualBox and VMware emulate); it configures itself with DHCP.
+`poweroff` and `reboot` use ACPI. Other virtual machines with EFI enabled
+may work too, but QEMU is the one eliOS is tested on.
 
 ## How it works
 
@@ -112,7 +118,10 @@ enabled may work too, but QEMU is the one eliOS is tested on.
 - **Devices:** framebuffer console (with ANSI escape codes and its own 8x16
   font), PS/2 and USB keyboards (an xHCI driver), serial port, Local and
   I/O APICs, PIT/TSC/APIC timers, CMOS clock, PCI with MSI/MSI-X, AHCI and
-  NVMe, ACPI power management.
+  NVMe, Intel e1000 network cards, ACPI power management.
+- **Networking:** eliOS's own TCP/IP stack (Ethernet, ARP, IPv4, ICMP, UDP,
+  TCP), DHCP, loopback, and the Linux socket API, so programs like
+  BusyBox's `wget` and `netstat` work unmodified.
 - **The Linux ABI:** about 100 system calls, with Linux's numbers,
   structures and error codes, plus a few of eliOS's own (process list, kernel
   log, tracing).
@@ -193,5 +202,7 @@ glyph and rebuild.
       data, a scheduler shared by all CPUs, TLB shootdowns
 - [x] **USB:** an xHCI host controller driver, HID keyboards, plugging and
       unplugging
-- [ ] **Next:** networking with an own TCP/IP stack, USB hubs and storage,
-      and a graphical desktop
+- [x] **Networking:** an e1000 driver, an own TCP/IP stack, DHCP, sockets,
+      and `ifconfig`, `ping`, `host`, `wget` and `nc`
+- [ ] **Next:** a graphical desktop, USB hubs, mice and storage, Unix
+      domain sockets, and TLS for HTTPS

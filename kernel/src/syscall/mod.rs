@@ -9,10 +9,12 @@
 //! from 0x1000 up, far from Linux's.
 
 mod files;
+mod net;
 mod poll;
 mod processes;
 mod system;
 
+pub use self::net::net_ioctl;
 pub use self::system::HOSTNAME;
 
 use crate::arch::interrupts::InterruptFrame;
@@ -61,6 +63,21 @@ fn name(number: u64) -> Option<&'static str> {
         35 => "nanosleep",
         39 => "getpid",
         40 => "sendfile",
+        41 => "socket",
+        42 => "connect",
+        43 => "accept",
+        44 => "sendto",
+        45 => "recvfrom",
+        46 => "sendmsg",
+        47 => "recvmsg",
+        48 => "shutdown",
+        49 => "bind",
+        50 => "listen",
+        51 => "getsockname",
+        52 => "getpeername",
+        53 => "socketpair",
+        54 => "setsockopt",
+        55 => "getsockopt",
         56 => "clone",
         57 => "fork",
         58 => "vfork",
@@ -106,6 +123,7 @@ fn name(number: u64) -> Option<&'static str> {
         270 => "pselect6",
         271 => "ppoll",
         273 => "set_robust_list",
+        288 => "accept4",
         293 => "pipe2",
         302 => "prlimit64",
         318 => "getrandom",
@@ -204,6 +222,21 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         35 => processes::nanosleep(a[0]),
         39 => processes::getpid(),
         40 => files::sendfile(a[0], a[1], a[2], a[3]),
+        41 => net::socket(a[0], a[1], a[2]),
+        42 => net::connect(a[0], a[1], a[2]),
+        43 => net::accept(a[0], a[1], a[2], 0),
+        44 => net::send_to(a[0], a[1], a[2], a[3], a[4], a[5]),
+        45 => net::receive_from(a[0], a[1], a[2], a[3], a[4], a[5]),
+        46 => net::send_message(a[0], a[1], a[2]),
+        47 => net::receive_message(a[0], a[1], a[2]),
+        48 => net::shutdown(a[0], a[1]),
+        49 => net::bind(a[0], a[1], a[2]),
+        50 => net::listen(a[0], a[1]),
+        51 => net::get_socket_name(a[0], a[1], a[2]),
+        52 => net::get_peer_name(a[0], a[1], a[2]),
+        53 => Err(Errno::EAFNOSUPPORT),
+        54 => net::set_option(a[0], a[1], a[2], a[3], a[4]),
+        55 => net::get_option(a[0], a[1], a[2], a[3], a[4]),
         56 => processes::clone(frame, a[0], a[1], a[2], a[3], a[4]),
         57 | 58 => processes::fork(frame),
         59 => processes::exec(frame, a[0], a[1], a[2]),
@@ -273,6 +306,7 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         271 => poll::ppoll(a[0], a[1], a[2]),
         // set_robust_list, utimensat: nothing to do.
         273 | 280 => Ok(0),
+        288 => net::accept(a[0], a[1], a[2], a[3]),
         292 => files::dup3(a[0], a[1], a[2]),
         293 => files::pipe(a[0], a[1]),
         302 => system::prlimit(a[1], a[3]),

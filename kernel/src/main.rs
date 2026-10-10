@@ -23,6 +23,7 @@ mod fs;
 mod keyboard;
 mod logo;
 mod memory;
+mod net;
 mod power;
 mod process;
 mod random;
@@ -157,7 +158,9 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
             *syscall::HOSTNAME.lock() = alloc::string::String::from(text.trim());
         }
     }
+    net::init();
     mount_disk(drivers::init());
+    net::wait_until_configured(3000);
     if let Err(error) = serial::enable_input() {
         warn!("serial: no input: {error}");
     }

@@ -51,6 +51,14 @@ impl Inode for Pipe {
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize> {
+        self.read_stream(buf, false)
+    }
+
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize> {
+        self.write_stream(buf, false)
+    }
+
+    fn read_stream(&self, buf: &mut [u8], nonblocking: bool) -> Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -61,7 +69,10 @@ impl Inode for Pipe {
             let mut state = self.state.lock();
             if state.buffer.is_empty() {
                 // No writers left means end of file.
-                return (state.writers == 0).then_some(Ok(0));
+                if state.writers == 0 {
+                    return Some(Ok(0));
+                }
+                return nonblocking.then_some(Err(Errno::EAGAIN));
             }
             let count = buf.len().min(state.buffer.len());
             for (slot, byte) in buf.iter_mut().zip(state.buffer.drain(..count)) {
@@ -74,7 +85,7 @@ impl Inode for Pipe {
         Ok(count)
     }
 
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize> {
+    fn write_stream(&self, buf: &[u8], nonblocking: bool) -> Result<usize> {
         let mut written = 0;
         while written < buf.len() {
             let count = self.changed.wait_until(|| {
@@ -87,7 +98,7 @@ impl Inode for Pipe {
                 }
                 let space = CAPACITY - state.buffer.len();
                 if space == 0 {
-                    return None;
+                    return nonblocking.then_some(Err(Errno::EAGAIN));
                 }
                 let count = space.min(buf.len() - written);
                 state.buffer.extend(&buf[written..written + count]);

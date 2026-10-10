@@ -12,9 +12,20 @@ pub const MMAP: usize = 9;
 pub const MUNMAP: usize = 11;
 pub const RT_SIGACTION: usize = 13;
 pub const IOCTL: usize = 16;
+pub const POLL: usize = 7;
 pub const PIPE2: usize = 293;
 pub const DUP2: usize = 33;
 pub const NANOSLEEP: usize = 35;
+pub const SOCKET: usize = 41;
+pub const CONNECT: usize = 42;
+pub const SENDTO: usize = 44;
+pub const RECVFROM: usize = 45;
+pub const SHUTDOWN: usize = 48;
+pub const BIND: usize = 49;
+pub const LISTEN: usize = 50;
+pub const GETSOCKNAME: usize = 51;
+pub const SETSOCKOPT: usize = 54;
+pub const ACCEPT4: usize = 288;
 pub const GETPID: usize = 39;
 pub const FORK: usize = 57;
 pub const EXECVE: usize = 59;
@@ -99,6 +110,8 @@ impl Error {
     pub const NOT_DIRECTORY: Error = Error(20);
     pub const IS_DIRECTORY: Error = Error(21);
     pub const INVALID: Error = Error(22);
+    pub const AGAIN: Error = Error(11);
+    pub const TIMED_OUT: Error = Error(110);
 
     pub fn description(self) -> &'static str {
         match self.0 {
@@ -133,6 +146,18 @@ impl Error {
             38 => "function not implemented",
             39 => "directory not empty",
             40 => "too many symbolic links",
+            88 => "not a socket",
+            97 => "address family not supported",
+            98 => "address already in use",
+            99 => "address not available",
+            101 => "network unreachable",
+            103 => "connection aborted",
+            104 => "connection reset by peer",
+            107 => "not connected",
+            110 => "timed out",
+            111 => "connection refused",
+            113 => "no route to host",
+            115 => "operation in progress",
             _ => "unknown error",
         }
     }

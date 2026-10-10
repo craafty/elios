@@ -22,6 +22,18 @@ Things to try
   sleep 10 &               a background job (then: jobs, wait)
   yes | head -n 3          programs in a pipeline stop when they're done
   sh demo.sh               run a shell script
+  nproc; cat /proc/cpuinfo every CPU is used
+  threadtest               a C program with many threads (pthreads)
+
+The network
+-----------
+
+  ifconfig                 the network card, and its DHCP address
+  ping -c 3 10.0.2.2       QEMU's virtual router answers
+  host example.com         look up a name (if the host has internet)
+  wget -O - http://example.com/
+  nc -l 7777 &             a TCP server... then: echo hi | nc 127.0.0.1 7777
+  busybox netstat -tn      connections
 
 Keys
 ----

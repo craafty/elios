@@ -136,8 +136,26 @@ pub fn seek(fd: u64, offset: u64, whence: u64) -> Result<u64> {
     file(fd)?.seek(offset as i64, whence as u32)
 }
 
+const FIONBIO: u64 = 0x5421;
+const FIONCLEX: u64 = 0x5450;
+const FIOCLEX: u64 = 0x5451;
+
+/// `ioctl`: a few requests apply to any open file; the rest go to the inode.
 pub fn ioctl(fd: u64, request: u64, argument: u64) -> Result<u64> {
-    file(fd)?.inode.ioctl(request, argument)
+    let file = file(fd)?;
+    match request {
+        FIONBIO => {
+            let on: i32 = user::read_value(argument)?;
+            let flags = file.flags() & !fs::O_NONBLOCK;
+            file.set_status_flags(if on != 0 { flags | fs::O_NONBLOCK } else { flags });
+            Ok(0)
+        }
+        FIOCLEX | FIONCLEX => {
+            process::current().files.lock().set_close_on_exec(fd as i32 as usize, request == FIOCLEX)?;
+            Ok(0)
+        }
+        _ => file.inode.ioctl(request, argument),
+    }
 }
 
 /// Linux's `struct stat` on x86_64.

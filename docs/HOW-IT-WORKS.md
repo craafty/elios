@@ -23,12 +23,13 @@ Contents:
 15. [Files](#15-files)
 16. [The terminal](#16-the-terminal)
 17. [Devices and drivers](#17-devices-and-drivers)
-18. [ACPI: tables and power](#18-acpi-tables-and-power)
-19. [Userland](#19-userland)
-20. [Disk images and the build tool](#20-disk-images-and-the-build-tool)
-21. [Testing](#21-testing)
-22. [Limits and what's next](#22-limits-and-whats-next)
-23. [Reference tables](#23-reference-tables)
+18. [Networking](#18-networking)
+19. [ACPI: tables and power](#19-acpi-tables-and-power)
+20. [Userland](#20-userland)
+21. [Disk images and the build tool](#21-disk-images-and-the-build-tool)
+22. [Testing](#22-testing)
+23. [Limits and what's next](#23-limits-and-whats-next)
+24. [Reference tables](#24-reference-tables)
 
 ---
 
@@ -271,7 +272,10 @@ precisely; it's the one place both sides agree on.
     **timers**, then the **keyboard**.
 12. **File systems:** unpack the initrd, set up `/dev` and `/proc`, free the
     initrd's memory.
-13. **Drivers:** PCI scan, AHCI and NVMe, mount the boot disk at `/disk`.
+13. **Drivers:** start the network stack's thread; PCI scan; AHCI and NVMe
+    disks, the network card, USB controllers (waiting briefly for devices
+    present at boot); mount the boot disk at `/disk`; wait up to three
+    seconds for DHCP.
 14. **Serial input and the keyboard thread**, then enable interrupts.
 15. **Start `/sbin/init`** and let the boot thread exit.
 
@@ -1315,7 +1319,157 @@ however it's reached. Deleting a file marks any open node for it as deleted,
 because its clusters may be reused. FAT has no permissions, symlinks or hard
 links.
 
-## 18. ACPI: tables and power
+## 18. Networking
+
+`net/`, `drivers/e1000.rs`, `syscall/net.rs`.
+
+eliOS has its own TCP/IP stack, written for it, and implements the Linux
+socket API on top, so networking programs (BusyBox's `wget`, `ping`,
+`netstat`, glibc programs using sockets) run unmodified.
+
+### The network card (`drivers/e1000.rs`)
+
+Intel's e1000 family: QEMU, VirtualBox and VMware all emulate one (QEMU's
+q35 machine an 82574L, "e1000e"; the others an 82540EM or 82545EM), and
+the design lives on in Intel's later chips. Packets move through two rings
+of 16-byte descriptors, one to receive and one to transmit, each pointing
+at a 2 KiB buffer. The driver gives the card receive descriptors by moving
+the ring's tail register; the card fills them and sets their "done" bit.
+To transmit, the driver fills the next descriptor and moves the transmit
+tail. The MAC address is in the receive address registers, where the card
+loads it from its EEPROM at reset (the EEPROM is read directly if not;
+the 8254x and 82574 put the EEPROM read fields in different places, so
+both layouts are tried).
+
+A kernel thread waits for the card's interrupt (MSI, where the card has
+it; the 82540EM doesn't, so then it polls every 2 ms) and hands each
+received frame to the stack.
+
+### The stack (`net/mod.rs`)
+
+One kernel thread runs the stack: it processes received frames, delivers
+loopback packets, and runs timers (TCP retransmissions, ARP retries,
+DHCP). Programs' system calls work on the stack directly. All its state
+is under one lock, held briefly. Programs that block (waiting for data,
+a connection, a timeout) wait on one wait queue that's woken whenever any
+socket changes; they recheck their own socket. That's simpler than a
+queue per socket and fine at this scale.
+
+The layers, bottom up:
+
+- **Ethernet**: a 14-byte header (destination, source, type), then the
+  packet. Frames are padded to the 60-byte minimum.
+- **ARP** (`arp.rs`): to send to a machine on the local network, its
+  Ethernet address is needed. ARP broadcasts "who has 10.0.2.2?", caches
+  answers for five minutes, and holds packets for an address being looked
+  up (up to 16, for three tries a second apart). Requests for our own
+  address are answered.
+- **IPv4**: headers are checked (version, lengths, checksum) and packets
+  for other machines are dropped. Packets go to the local network directly
+  or through the gateway, chosen by the netmask. Outgoing packets set
+  "don't fragment" and fragments that arrive are dropped: reassembly is
+  rarely needed, since TCP sizes segments to fit.
+- **ICMP** (`icmp.rs`): echo requests are answered (so eliOS answers
+  pings), and "port unreachable" goes back for UDP datagrams nobody is
+  listening for, as on Linux.
+- **UDP** (`udp.rs`): datagrams go to the socket bound to their port.
+- **TCP** (`tcp.rs`): below.
+- **Loopback**: packets to 127.0.0.0/8 or the machine's own address are
+  handed back to the stack thread instead of to a card, so the whole stack
+  (TCP included) works locally, without any network card.
+
+Checksums (IP, ICMP, UDP and TCP all use the same ones' complement sum)
+are computed in software.
+
+### DHCP (`net/dhcp.rs`)
+
+The interface configures itself at boot: broadcast DISCOVER, receive an
+OFFER, REQUEST it, receive the ACK with the address, netmask, router and
+DNS servers. Retries back off from one second to eight. The DNS servers
+are written to `/etc/resolv.conf`, where C libraries look. Boot waits up
+to three seconds for it, so programs started at boot find the network
+ready.
+
+### TCP (`net/tcp.rs`)
+
+TCP turns unreliable packets into reliable, ordered byte streams. Every
+byte has a 32-bit sequence number. The sender keeps what it sent until the
+receiver acknowledges it, and sends it again if no acknowledgment comes in
+time; the receiver delivers bytes in order and advertises how much more it
+can take (its window), which the sender respects. Connections open with a
+three-way handshake (SYN, SYN-ACK, ACK) and close with a FIN from each
+side, through the standard states (SYN-SENT, ESTABLISHED, FIN-WAIT-1,
+CLOSE-WAIT, TIME-WAIT, and so on).
+
+The implementation follows RFC 9293's segment processing, with deliberate
+simplifications:
+
+- **Out-of-order segments are dropped.** The sender's retransmission fills
+  the gap. Buffering them would cut retransmissions on lossy networks, but
+  loss is rare on a LAN.
+- **Retransmission is "go back N"**: on a timeout, everything
+  unacknowledged is sent again. The timeout starts at one second and
+  doubles on each retry (up to 30 s, and 8 tries before the connection is
+  declared dead). There's no round-trip time measurement or congestion
+  control; those matter on congested internet paths, much less locally.
+- **Acknowledgments are immediate**, not delayed.
+- **No window scaling**, so windows top out at 64 KiB, which limits
+  throughput on long, fast links.
+- **TIME-WAIT lasts 2 seconds** instead of the standard two minutes, so
+  ports are reusable quickly.
+
+A zero window is probed: if the other side's window is closed while data
+waits, a single byte goes out when the timer fires, which forces a
+window update. When a program reads from a nearly full receive buffer, a
+window update goes out so the sender can continue.
+
+Listening sockets create a connection for each SYN (up to the backlog);
+once its handshake completes, it joins the listener's accept queue. A
+connection whose program closes it becomes an "orphan" that finishes
+closing by itself and is then removed.
+
+### Sockets (`net/socket.rs`, `syscall/net.rs`)
+
+A socket is an entry in the stack's socket table plus a file (a
+`SocketFile` inode) referring to it, so `read`, `write`, `poll`, `select`
+and `close` work on sockets as on any file, and `dup`/`fork` share them as
+they should. The socket table holds TCP connections and datagram sockets:
+UDP, ICMP "ping" sockets (the unprivileged kind Linux has, where the kernel
+fills in the echo identifier) and raw ICMP sockets (which see every ICMP
+packet, IP header included, as BusyBox's `ping` expects).
+
+The system calls are Linux's: `socket`, `bind`, `listen`, `accept(4)`,
+`connect`, `send(to/msg)`, `recv(from/msg)`, `shutdown`,
+`get/setsockopt`, `getsockname`, `getpeername`. Linux's semantics matter in
+the details programs rely on: nonblocking connect returns `EINPROGRESS`
+and reports its outcome through `SO_ERROR`; `MSG_PEEK`, `MSG_WAITALL`,
+`MSG_DONTWAIT` and `MSG_NOSIGNAL` work; `SO_RCVTIMEO`/`SO_SNDTIMEO` time
+out with `EAGAIN`; writing to a closed connection raises SIGPIPE; and
+`O_NONBLOCK` (now honored by pipes too) makes waits fail with `EAGAIN`.
+
+Interface information comes the way Linux tools ask for it: the `SIOCGIF*`
+ioctls on any socket (address, netmask, flags, MAC, MTU...), and
+`/proc/net/dev`, `route`, `arp`, `tcp` and `udp` in Linux's formats. That's
+all BusyBox's `ifconfig`, `route` and `netstat` need.
+
+### Name lookup
+
+`libeli`'s resolver (`user/eli/src/net.rs`) tries a dotted address, then
+`/etc/hosts`, then a DNS query (an A record, over UDP, with retries) to the
+servers in `/etc/resolv.conf`. glibc programs use glibc's own resolver,
+which reads the same files.
+
+### Testing
+
+`nettest` (a glibc program) checks TCP and UDP over loopback: 200 KiB
+through an echo server in both directions at once, nonblocking connect,
+`poll` and `select`, `MSG_PEEK`, `shutdown`, timeouts, refused
+connections. A kernel test pings loopback and QEMU's virtual router. By
+hand: downloads from a web server on the host (`wget` with an MD5 check)
+and from the internet, and connections from the host into eliOS through a
+forwarded port (`cargo xtask run --forward 8080:80`).
+
+## 19. ACPI: tables and power
 
 `acpi.rs`, `power.rs`.
 
@@ -1337,7 +1491,7 @@ XSDT (or the older RSDT), with every checksum verified.
 `reboot` uses the FADT's reset register when present, then the keyboard
 controller's reset line, then a deliberate triple fault.
 
-## 19. Userland
+## 20. Userland
 
 ### libeli (`user/eli`)
 
@@ -1395,6 +1549,14 @@ from the buffer after each key.
 subtle requirement are noted in the code (`head` streams its input so
 `yes | head` terminates; `mv` falls back to copying across file systems).
 
+**Network commands** (`network.rs`): `ifconfig` (through the same ioctls
+as Linux's), `ping` (an ICMP ping socket, one request a second, with
+round-trip times), `host` (a name lookup), `wget` (HTTP/1.0 downloads,
+following redirects; HTTP/1.0 so the server closes the connection when
+done and never uses chunked encoding) and `nc` (connects standard input and
+output to a TCP connection, made or accepted; it waits on both with
+`poll`).
+
 ### Linux programs
 
 - `user/c/` holds C programs compiled by the host's GCC and glibc: a hello
@@ -1406,7 +1568,7 @@ subtle requirement are noted in the code (`head` streams its input so
   `tar`, `gzip`, `top`, ...). Links go in `/usr/bin`, which comes after
   `/bin` in `PATH`, so eliOS's own commands take precedence.
 
-## 20. Disk images and the build tool
+## 21. Disk images and the build tool
 
 ### The disk image (`xtask/src/image.rs`)
 
@@ -1444,7 +1606,7 @@ the shell (waiting for each prompt), can press keys through the QEMU
 monitor and take screenshots, then prints a clean transcript. It's how
 end-to-end behavior is checked without a person typing.
 
-## 21. Testing
+## 22. Testing
 
 - **Kernel tests** (`ktest!`) register themselves in a dedicated linker
   section; the linker script brackets the section with symbols, so the
@@ -1464,7 +1626,7 @@ end-to-end behavior is checked without a person typing.
 Every phase was also tested in release builds, since optimizations can
 expose bugs that debug builds hide.
 
-## 22. Limits and what's next
+## 23. Limits and what's next
 
 Current limits, roughly in order of how much they'd matter to a user:
 
@@ -1479,12 +1641,14 @@ Current limits, roughly in order of how much they'd matter to a user:
   faults into errors; eliOS will need the same.
 - **USB:** keyboards only, and only on the controller's own ports (no hub
   support yet); no USB storage or mice.
-- **No networking.**
+- **Networking is IPv4 only**, with one network card (Intel e1000
+  family), no TLS (so `https` doesn't work), no Unix domain sockets, and
+  TCP without congestion control or out-of-order buffering.
 - **No graphical desktop** (planned, deliberately postponed).
 - **fork copies eagerly**; copy-on-write would make it cheaper.
 - **Disk I/O is polled** and holds the volume lock for whole operations.
 
-## 23. Reference tables
+## 24. Reference tables
 
 ### Physical memory at boot (QEMU, 256 MiB)
 

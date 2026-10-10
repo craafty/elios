@@ -31,11 +31,15 @@ pub fn find(name: &str) -> Option<Command> {
         "head" => |args| head_or_tail(args, true),
         "hello" => hello,
         "help" => help,
+        "host" => crate::network::host,
+        "ifconfig" => crate::network::ifconfig,
         "kill" => kill,
         "ln" => ln,
         "ls" => ls,
         "mkdir" => mkdir,
         "mv" => mv,
+        "nc" => crate::network::nc,
+        "ping" => crate::network::ping,
         "poweroff" => |_| {
             eprintln!("poweroff: {}", process::power_off());
             1
@@ -60,6 +64,7 @@ pub fn find(name: &str) -> Option<Command> {
         "nproc" => nproc,
         "uptime" => uptime,
         "wc" => wc,
+        "wget" => crate::network::wget,
         "yes" => yes,
         _ => return None,
     })

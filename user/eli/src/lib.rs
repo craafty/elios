@@ -25,6 +25,7 @@ pub mod env;
 pub mod fs;
 mod heap;
 pub mod io;
+pub mod net;
 pub mod process;
 pub mod sys;
 pub mod system;

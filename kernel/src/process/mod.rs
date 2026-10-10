@@ -796,12 +796,22 @@ mod tests {
 
         fn linux_c_programs_pass_their_self_tests() {
             // Built by the host's C compiler, if there was one.
-            for program in ["ctest", "sigtest", "threadtest", "hello-c", "hello-dynamic"] {
+            for program in ["ctest", "sigtest", "threadtest", "nettest", "hello-c", "hello-dynamic"] {
                 let path = alloc::format!("/usr/bin/{program}");
                 if fs::lookup("/", &path, true).is_err() {
                     continue;
                 }
                 assert_eq!(shell(&alloc::format!("{program} > /dev/null")), exit_status(0), "{program} failed");
+            }
+        }
+
+        fn ping_reaches_loopback_and_the_gateway() {
+            assert_eq!(shell("ping -c 1 127.0.0.1 > /dev/null"), exit_status(0));
+            // With QEMU's user networking (see xtask), DHCP has run by now
+            // and its virtual router answers pings.
+            let configured = crate::net::interfaces().iter().any(|i| i.name == "eth0" && i.config.is_some());
+            if configured {
+                assert_eq!(shell("ping -c 1 10.0.2.2 > /dev/null"), exit_status(0));
             }
         }
 

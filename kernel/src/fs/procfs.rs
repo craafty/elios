@@ -16,7 +16,7 @@ use crate::errno::{Errno, Result};
 use crate::memory::{frames, heap};
 use crate::process::{self, Pid};
 use crate::sync::SpinLock;
-use crate::{task, time};
+use crate::{net, task, time};
 
 type Generator = Box<dyn Fn() -> String + Send + Sync>;
 /// A directory's entries.
@@ -134,12 +134,115 @@ pub fn create() -> Arc<dyn Inode> {
             ("loadavg".into(), generated(|| format!("0.00 0.00 0.00 1/{} {}\n", process::count(), process::count()))),
             ("filesystems".into(), generated(|| "nodev\tramfs\nnodev\tproc\n".into())),
             ("mounts".into(), generated(mounts)),
+            ("net".into(), net_directory()),
         ];
         for info in process::list() {
             entries.push((info.pid.to_string(), process_directory(info.pid)));
         }
         entries
     })
+}
+
+/// /proc/net, in Linux's formats, which `netstat`, `route` and `arp` read.
+fn net_directory() -> Arc<dyn Inode> {
+    directory(|| {
+        alloc::vec![
+            ("dev".into(), generated(net_devices)),
+            ("route".into(), generated(net_routes)),
+            ("arp".into(), generated(net_neighbors)),
+            ("tcp".into(), generated(|| net_sockets(net::PROTOCOL_TCP))),
+            ("udp".into(), generated(|| net_sockets(net::PROTOCOL_UDP))),
+            // No IPv6, raw sockets in this list, or Unix sockets: just the
+            // headers, for tools that read these too.
+            ("tcp6".into(), generated(|| String::from(SOCKET_HEADER))),
+            ("udp6".into(), generated(|| String::from(SOCKET_HEADER))),
+            ("raw".into(), generated(|| String::from(SOCKET_HEADER))),
+            ("raw6".into(), generated(|| String::from(SOCKET_HEADER))),
+            ("unix".into(), generated(|| String::from("Num       RefCount Protocol Flags    Type St Inode Path\n"))),
+        ]
+    })
+}
+
+fn net_devices() -> String {
+    let mut text = String::from(
+        "Inter-|   Receive                                                |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n",
+    );
+    for interface in net::interfaces() {
+        let c = interface.counters;
+        text.push_str(&format!(
+            "{:>6}: {:>8} {:>7}    0    0    0     0          0         0 {:>8} {:>7}    0    0    0     0       0          0\n",
+            interface.name, c.received_bytes, c.received_packets, c.sent_bytes, c.sent_packets
+        ));
+    }
+    text
+}
+
+/// An address as /proc/net prints it: the 32-bit value in the machine's
+/// (little-endian) byte order, in hex.
+fn hex_address(address: net::Ipv4) -> String {
+    format!("{:08X}", u32::from_le_bytes(address.0))
+}
+
+fn net_routes() -> String {
+    let mut text =
+        String::from("Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n");
+    for interface in net::interfaces().iter().filter(|i| i.name != "lo") {
+        let Some(config) = &interface.config else { continue };
+        let any = net::Ipv4::ANY;
+        if let Some(gateway) = config.gateway {
+            // Flags: up (1) and gateway (2).
+            text.push_str(&format!(
+                "{}\t{}\t{}\t0003\t0\t0\t0\t{}\t0\t0\t0\n",
+                interface.name,
+                hex_address(any),
+                hex_address(gateway),
+                hex_address(any)
+            ));
+        }
+        let network = net::Ipv4::from_u32(config.address.to_u32() & config.netmask().to_u32());
+        text.push_str(&format!(
+            "{}\t{}\t{}\t0001\t0\t0\t0\t{}\t0\t0\t0\n",
+            interface.name,
+            hex_address(network),
+            hex_address(any),
+            hex_address(config.netmask())
+        ));
+    }
+    text
+}
+
+fn net_neighbors() -> String {
+    let mut text = String::from("IP address       HW type     Flags       HW address            Mask     Device\n");
+    for (address, mac) in net::neighbors() {
+        text.push_str(&format!(
+            "{:<16} 0x1         0x2         {}     *        eth0\n",
+            address.to_string(),
+            net::format_mac(&mac)
+        ));
+    }
+    text
+}
+
+const SOCKET_HEADER: &str =
+    "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+
+fn net_sockets(protocol: u8) -> String {
+    let mut text = String::from(SOCKET_HEADER);
+    let sockets = net::socket::table();
+    for (index, socket) in sockets.iter().filter(|s| s.protocol == protocol).enumerate() {
+        // UDP sockets report "closed" (7), as on Linux.
+        let state = socket.state.map_or(7, net::tcp_state_code);
+        text.push_str(&format!(
+            "{index:>4}: {}:{:04X} {}:{:04X} {state:02X} {:08X}:{:08X} 00:00000000 00000000     0        0 0\n",
+            hex_address(socket.local.address),
+            socket.local.port,
+            hex_address(socket.remote.address),
+            socket.remote.port,
+            socket.queued.0,
+            socket.queued.1,
+        ));
+    }
+    text
 }
 
 fn process_directory(pid: Pid) -> Arc<dyn Inode> {

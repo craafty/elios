@@ -13,6 +13,7 @@ mod commands;
 mod edit;
 mod editor;
 mod init;
+mod network;
 mod shell;
 
 use alloc::string::String;

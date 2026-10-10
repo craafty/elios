@@ -45,6 +45,7 @@ pub enum FileKind {
     Symlink,
     CharDevice,
     Fifo,
+    Socket,
 }
 
 impl FileKind {
@@ -56,6 +57,7 @@ impl FileKind {
             FileKind::Symlink => 0o120000,
             FileKind::CharDevice => 0o020000,
             FileKind::Fifo => 0o010000,
+            FileKind::Socket => 0o140000,
         }
     }
 
@@ -67,6 +69,7 @@ impl FileKind {
             FileKind::Directory => 4,
             FileKind::Regular => 8,
             FileKind::Symlink => 10,
+            FileKind::Socket => 12,
         }
     }
 }
@@ -97,6 +100,17 @@ pub trait Inode: Send + Sync {
 
     fn truncate(&self, _len: u64) -> Result<()> {
         Err(self.not_a_file())
+    }
+
+    /// Reads from a stream (an inode that isn't `seekable`). With
+    /// `nonblocking` (`O_NONBLOCK`), fails with `EAGAIN` instead of waiting.
+    fn read_stream(&self, buf: &mut [u8], _nonblocking: bool) -> Result<usize> {
+        self.read_at(0, buf)
+    }
+
+    /// Writes to a stream, like [`read_stream`](Self::read_stream).
+    fn write_stream(&self, buf: &[u8], _nonblocking: bool) -> Result<usize> {
+        self.write_at(0, buf)
     }
 
     /// Whether reads and writes use the file position (pipes and terminals
@@ -347,7 +361,7 @@ impl OpenFile {
             return Err(Errno::EBADF);
         }
         if !self.inode.seekable() {
-            return self.inode.read_at(0, buf);
+            return self.inode.read_stream(buf, self.flags() & O_NONBLOCK != 0);
         }
         // The position lock isn't held across the read: reads may block,
         // and a spinlock must never be held while sleeping.
@@ -362,7 +376,7 @@ impl OpenFile {
             return Err(Errno::EBADF);
         }
         if !self.inode.seekable() {
-            return self.inode.write_at(0, buf);
+            return self.inode.write_stream(buf, self.flags() & O_NONBLOCK != 0);
         }
         let position = if self.flags() & O_APPEND != 0 { self.inode.metadata().size } else { *self.position.lock() };
         let count = self.inode.write_at(position, buf)?;

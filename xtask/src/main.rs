@@ -31,6 +31,7 @@ options:
   --fresh      start from an empty disk image instead of updating it (run)
   --no-kvm     emulate the CPU even if hardware virtualization is available
   --cpus N     give the machine N CPUs (default 4)
+  --forward H:G  forward TCP port H on this machine to port G in eliOS
 ";
 
 const DEFAULT_CPUS: usize = 4;
@@ -70,6 +71,8 @@ struct Options {
     no_kvm: bool,
     /// None for the default.
     cpus: Option<usize>,
+    /// TCP ports to forward from the host into eliOS: (host, guest).
+    forwards: Vec<(u16, u16)>,
     qemu_args: Vec<String>,
 }
 
@@ -121,6 +124,13 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options, Stri
             "--trace" => options.trace = true,
             "--fresh" => options.fresh = true,
             "--no-kvm" => options.no_kvm = true,
+            "--forward" => {
+                let forward = args.next().and_then(|text| {
+                    let (host, guest) = text.split_once(':')?;
+                    Some((host.parse().ok()?, guest.parse().ok()?))
+                });
+                options.forwards.push(forward.ok_or("--forward needs HOST_PORT:GUEST_PORT")?);
+            }
             "--cpus" => {
                 let count = args.next().and_then(|count| count.parse().ok()).filter(|&count| (1..=64).contains(&count));
                 options.cpus = Some(count.ok_or("--cpus needs a number from 1 to 64")?);
@@ -483,12 +493,26 @@ fn run(disk: &Path, options: &Options) -> Result<(), String> {
     Ok(())
 }
 
+/// The network card and QEMU's NAT network, with any port forwards.
+fn network(forwards: &[(u16, u16)]) -> String {
+    let mut nic = String::from("user,model=e1000e");
+    for (host, guest) in forwards {
+        nic.push_str(&format!(",hostfwd=tcp:127.0.0.1:{host}-:{guest}"));
+    }
+    nic
+}
+
 /// The QEMU invocation shared by `run` and `test`.
 fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
     let firmware = find_ovmf()?;
     let mut qemu = Command::new("qemu-system-x86_64");
     let cpus = options.cpus.unwrap_or(DEFAULT_CPUS).to_string();
-    qemu.args(["-machine", "q35", "-m", "256M", "-smp", &cpus, "-nic", "none"])
+    qemu.args(["-machine", "q35", "-m", "256M", "-smp", &cpus])
+        // An Intel network card on QEMU's built-in NAT network ("user"
+        // networking: the guest is 10.0.2.15, the host 10.0.2.2, DNS
+        // 10.0.2.3), so eliOS can reach the host and the internet.
+        .arg("-nic")
+        .arg(network(&options.forwards))
         .arg("-bios")
         .arg(&firmware)
         // On the q35 machine the disk is attached to an AHCI (SATA)

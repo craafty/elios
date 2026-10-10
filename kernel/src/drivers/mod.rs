@@ -2,6 +2,7 @@
 
 pub mod ahci;
 pub mod block;
+pub mod e1000;
 pub mod nvme;
 pub mod pci;
 pub mod usb;
@@ -32,6 +33,7 @@ pub fn init() -> Vec<Arc<dyn Disk>> {
     let mut disks: Vec<Arc<dyn Disk>> = Vec::new();
     disks.extend(ahci::probe(&devices).into_iter().map(|disk| disk as Arc<dyn Disk>));
     disks.extend(nvme::probe(&devices).into_iter().map(|disk| disk as Arc<dyn Disk>));
+    e1000::probe(&devices);
     usb::probe(&devices);
     disks
 }
