@@ -220,6 +220,25 @@ pub fn kernel_log() -> Result<String> {
     Ok(String::from_utf8_lossy(&buffer[..len]).into_owned())
 }
 
+/// Turns system call tracing on or off for this process (an eliOS system
+/// call). It carries over to children and across `exec`.
+pub fn trace(on: bool) -> Result<()> {
+    // SAFETY: takes no pointers.
+    unsafe { sys::call(sys::ELI_TRACE, [usize::from(on), 0, 0, 0, 0, 0]) }.map(|_| ())
+}
+
+/// Finds a program by name: as given if it contains a slash, otherwise in
+/// the directories of $PATH.
+pub fn find_program(name: &str) -> Option<String> {
+    if name.contains('/') {
+        return crate::fs::exists(name).then(|| name.into());
+    }
+    let path = crate::env::var("PATH").unwrap_or_else(|| "/bin:/usr/bin".into());
+    path.split(':')
+        .map(|directory| alloc::format!("{directory}/{name}"))
+        .find(|candidate| crate::fs::metadata(candidate).is_ok_and(|m| m.kind == crate::fs::FileType::File))
+}
+
 const REBOOT_MAGIC1: usize = 0xFEE1_DEAD;
 const REBOOT_MAGIC2: usize = 0x2812_1969;
 

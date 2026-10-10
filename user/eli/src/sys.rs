@@ -41,6 +41,7 @@ pub const GETRANDOM: usize = 318;
 /// eliOS's own calls.
 pub const ELI_PROCESS_LIST: usize = 0x1000;
 pub const ELI_KERNEL_LOG: usize = 0x1001;
+pub const ELI_TRACE: usize = 0x1002;
 
 pub const AT_FDCWD: usize = -100isize as usize;
 

@@ -1,5 +1,10 @@
 //! Loading programs: ELF executables and the initial stack Linux programs
 //! expect.
+//!
+//! A dynamically linked program names an interpreter (its dynamic linker,
+//! such as glibc's `ld-linux-x86-64.so.2`). Then both are loaded and the
+//! interpreter starts first; it finds the program through the auxiliary
+//! vector, loads its libraries and jumps to it.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -19,13 +24,29 @@ const PROGRAM_HEADER_SIZE: usize = 56;
 
 /// Where position-independent executables are loaded.
 const PIE_BASE: u64 = 0x5555_5560_0000;
+/// Where an interpreter (dynamic linker) is loaded: above where `mmap`
+/// places things, below the stack.
+pub const INTERPRETER_BASE: u64 = 0x7F00_0000_0000;
 
 /// What the loader learned about a program.
 pub struct Program {
+    /// The program's own entry point.
     pub entry: u64,
     /// Where the program headers are in memory (for the AT_PHDR aux entry).
     program_headers: u64,
     program_header_count: u64,
+    /// The interpreter the program asks for, if it's dynamically linked.
+    pub interpreter: Option<alloc::string::String>,
+    /// Where the interpreter was loaded and where it starts, once loaded.
+    pub interpreter_base: u64,
+    pub interpreter_entry: Option<u64>,
+}
+
+impl Program {
+    /// Where execution starts: the interpreter if there is one.
+    pub fn start(&self) -> u64 {
+        self.interpreter_entry.unwrap_or(self.entry)
+    }
 }
 
 struct Segment {
@@ -53,9 +74,29 @@ fn u64_at(data: &[u8], offset: usize) -> Result<u64> {
     read(data, offset).map(u64::from_le_bytes)
 }
 
-/// Loads an executable's segments into `space`. Static executables only:
-/// there's no dynamic linker yet.
+/// Loads an executable's segments into `space`, and sets up its `brk` heap.
 pub fn load(space: &mut AddressSpace, data: &[u8]) -> Result<Program> {
+    let (program, end_of_image) = load_object(space, data, None)?;
+    space.brk_start = end_of_image;
+    space.brk = end_of_image;
+    Ok(program)
+}
+
+/// Loads a program's interpreter (a position-independent shared object).
+pub fn load_interpreter(space: &mut AddressSpace, program: &mut Program, data: &[u8]) -> Result<()> {
+    let (interpreter, _) = load_object(space, data, Some(INTERPRETER_BASE))?;
+    if interpreter.interpreter.is_some() {
+        return Err(Errno::ENOEXEC);
+    }
+    program.interpreter_base = INTERPRETER_BASE;
+    program.interpreter_entry = Some(interpreter.entry);
+    Ok(())
+}
+
+/// Loads an ELF file's segments. Position-independent ones go at `base`
+/// (or the default place for executables). Returns what was learned and the
+/// end of the loaded image.
+fn load_object(space: &mut AddressSpace, data: &[u8], base: Option<u64>) -> Result<(Program, u64)> {
     if data.get(..4) != Some(b"\x7FELF") || data.get(4) != Some(&2) || data.get(5) != Some(&1) {
         return Err(Errno::ENOEXEC);
     }
@@ -63,7 +104,7 @@ pub fn load(space: &mut AddressSpace, data: &[u8]) -> Result<Program> {
     if u16_at(data, 18)? != EM_X86_64 || (kind != ET_EXEC && kind != ET_DYN) {
         return Err(Errno::ENOEXEC);
     }
-    let base = if kind == ET_DYN { PIE_BASE } else { 0 };
+    let base = if kind == ET_DYN { base.unwrap_or(PIE_BASE) } else { 0 };
     let entry = base + u64_at(data, 24)?;
     let header_offset = u64_at(data, 32)? as usize;
     let header_size = usize::from(u16_at(data, 54)?);
@@ -84,10 +125,15 @@ pub fn load(space: &mut AddressSpace, data: &[u8]) -> Result<Program> {
             mem_size: u64_at(data, at + 40)?,
         });
     }
-    if segments.iter().any(|s| s.kind == PT_INTERP) {
-        // Needs a dynamic linker, which eliOS doesn't have yet.
-        return Err(Errno::ENOEXEC);
-    }
+    let interpreter = match segments.iter().find(|s| s.kind == PT_INTERP) {
+        Some(segment) => {
+            let start = segment.offset as usize;
+            let bytes = data.get(start..start + segment.file_size as usize).ok_or(Errno::ENOEXEC)?;
+            let path = bytes.split(|&b| b == 0).next().unwrap_or_default();
+            Some(alloc::string::String::from_utf8(path.to_vec()).map_err(|_| Errno::ENOEXEC)?)
+        }
+        None => None,
+    };
 
     let mut end_of_image = 0;
     for segment in segments.iter().filter(|s| s.kind == PT_LOAD && s.mem_size > 0) {
@@ -128,8 +174,6 @@ pub fn load(space: &mut AddressSpace, data: &[u8]) -> Result<Program> {
     if end_of_image == 0 {
         return Err(Errno::ENOEXEC);
     }
-    space.brk_start = end_of_image;
-    space.brk = end_of_image;
 
     let program_headers = match segments.iter().find(|s| s.kind == PT_PHDR) {
         Some(phdr) => base + phdr.vaddr,
@@ -139,7 +183,15 @@ pub fn load(space: &mut AddressSpace, data: &[u8]) -> Result<Program> {
             .map(|s| base + s.vaddr + header_offset as u64)
             .unwrap_or(0),
     };
-    Ok(Program { entry, program_headers, program_header_count: header_count as u64 })
+    let program = Program {
+        entry,
+        program_headers,
+        program_header_count: header_count as u64,
+        interpreter,
+        interpreter_base: 0,
+        interpreter_entry: None,
+    };
+    Ok((program, end_of_image))
 }
 
 // Auxiliary vector keys.
@@ -196,7 +248,7 @@ pub fn build_stack(
         (AT_PHENT, PROGRAM_HEADER_SIZE as u64),
         (AT_PHNUM, program.program_header_count),
         (AT_PAGESZ, PAGE_SIZE),
-        (AT_BASE, 0),
+        (AT_BASE, program.interpreter_base),
         (AT_FLAGS, 0),
         (AT_ENTRY, program.entry),
         (AT_UID, 0),

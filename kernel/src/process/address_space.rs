@@ -64,6 +64,11 @@ impl AddressSpace {
         self.table.root()
     }
 
+    /// The areas as (start, end, protection), in address order.
+    pub fn areas(&self) -> alloc::vec::Vec<(u64, u64, u32)> {
+        self.areas.iter().map(|(&start, area)| (start, area.end, area.protection)).collect()
+    }
+
     pub fn resident_bytes(&self) -> u64 {
         self.resident_pages * PAGE_SIZE
     }

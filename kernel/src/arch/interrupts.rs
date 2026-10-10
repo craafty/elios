@@ -229,7 +229,7 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut InterruptFrame) {
     if vector < 32 {
         if from_user {
             crate::process::handle_user_exception(frame);
-            crate::process::before_return_to_user();
+            crate::process::before_return_to_user(frame, None);
         } else {
             handle_exception(frame);
         }
@@ -245,7 +245,7 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut InterruptFrame) {
     } else if (PIC_BASE..IRQ_BASE).contains(&vector) || vector == SPURIOUS {
         // Spurious interrupts need no acknowledgment.
         if from_user {
-            crate::process::before_return_to_user();
+            crate::process::before_return_to_user(frame, None);
         }
         return;
     } else {
@@ -259,7 +259,7 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut InterruptFrame) {
         crate::task::preempt_point();
     }
     if from_user {
-        crate::process::before_return_to_user();
+        crate::process::before_return_to_user(frame, None);
     }
 }
 

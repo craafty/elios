@@ -16,13 +16,19 @@ const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_REMOVEDIR: u64 = 0x200;
 const AT_EMPTY_PATH: u64 = 0x1000;
 
+/// File descriptors are C `int`s: only the low 32 bits of the register
+/// count (as on Linux).
+fn descriptor(fd: u64) -> Result<usize> {
+    usize::try_from(fd as i32).map_err(|_| Errno::EBADF)
+}
+
 fn file(fd: u64) -> Result<Arc<OpenFile>> {
-    process::current().files.lock().get(fd as usize)
+    process::current().files.lock().get(descriptor(fd)?)
 }
 
 /// The directory a `*at` call's relative paths start from.
 fn base_directory(dirfd: u64) -> Result<String> {
-    if dirfd as i64 == AT_FDCWD {
+    if i64::from(dirfd as i32) == AT_FDCWD {
         return Ok(process::current().cwd.lock().clone());
     }
     let directory = file(dirfd)?;
@@ -118,8 +124,8 @@ pub fn close(fd: u64) -> Result<u64> {
     let process = process::current();
     let file = {
         let mut files = process.files.lock();
-        let file = files.get(fd as usize)?;
-        files.close(fd as usize)?;
+        let file = files.get(descriptor(fd)?)?;
+        files.close(descriptor(fd)?)?;
         file
     };
     drop(file);
@@ -215,22 +221,23 @@ pub fn pipe(fds: u64, flags: u64) -> Result<u64> {
 pub fn dup(fd: u64) -> Result<u64> {
     let process = process::current();
     let mut files = process.files.lock();
-    let file = files.get(fd as usize)?;
+    let file = files.get(descriptor(fd)?)?;
     files.insert(file, false, 0).map(|fd| fd as u64)
 }
 
 pub fn dup3(old: u64, new: u64, flags: u64) -> Result<u64> {
-    if new as usize >= fs::MAX_FILES {
+    let new_fd = descriptor(new)?;
+    if new_fd >= fs::MAX_FILES {
         return Err(Errno::EBADF);
     }
     let process = process::current();
     let mut files = process.files.lock();
-    let file = files.get(old as usize)?;
+    let file = files.get(descriptor(old)?)?;
     if old == new {
         return Ok(new);
     }
-    let replaced = files.get(new as usize).ok();
-    files.place(new as usize, file, flags as u32 & O_CLOEXEC != 0);
+    let replaced = files.get(new_fd).ok();
+    files.place(new_fd, file, flags as u32 & O_CLOEXEC != 0);
     drop(files);
     drop(replaced);
     Ok(new)
@@ -256,14 +263,14 @@ pub fn fcntl(fd: u64, command: u64, argument: u64) -> Result<u64> {
     let mut files = process.files.lock();
     match command {
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            let file = files.get(fd as usize)?;
+            let file = files.get(descriptor(fd)?)?;
             files.insert(file, command == F_DUPFD_CLOEXEC, argument as usize).map(|fd| fd as u64)
         }
-        F_GETFD => files.close_on_exec(fd as usize).map(u64::from),
-        F_SETFD => files.set_close_on_exec(fd as usize, argument & FD_CLOEXEC != 0).map(|_| 0),
-        F_GETFL => files.get(fd as usize).map(|file| u64::from(file.flags())),
+        F_GETFD => files.close_on_exec(descriptor(fd)?).map(u64::from),
+        F_SETFD => files.set_close_on_exec(descriptor(fd)?, argument & FD_CLOEXEC != 0).map(|_| 0),
+        F_GETFL => files.get(descriptor(fd)?).map(|file| u64::from(file.flags())),
         F_SETFL => {
-            files.get(fd as usize)?.set_status_flags(argument as u32);
+            files.get(descriptor(fd)?)?.set_status_flags(argument as u32);
             Ok(0)
         }
         _ => Err(Errno::EINVAL),

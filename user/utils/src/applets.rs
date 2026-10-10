@@ -35,6 +35,7 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("seq", "print a sequence of numbers"),
     ("sleep", "wait for some seconds"),
     ("stat", "show file details"),
+    ("strace", "run a program, showing its system calls"),
     ("tail", "print the last lines of files"),
     ("tee", "copy input to files and output"),
     ("touch", "create empty files"),

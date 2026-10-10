@@ -344,7 +344,7 @@ impl Shell {
         if BUILTINS.contains(&name.as_str()) {
             process::exit(self.builtin(&command.words));
         }
-        let Some(path) = find_program(name) else {
+        let Some(path) = process::find_program(name) else {
             eprintln!("sh: {name}: command not found");
             process::exit(127);
         };
@@ -697,18 +697,6 @@ fn build(tokens: Vec<Token>) -> Result<Vec<(Connector, Pipeline)>, String> {
         return Err("syntax error: a command must follow && or ||".into());
     }
     Ok(list)
-}
-
-/// Finds a program by name: as given if it contains a slash, otherwise in
-/// the directories of $PATH.
-fn find_program(name: &str) -> Option<String> {
-    if name.contains('/') {
-        return fs::exists(name).then(|| name.to_string());
-    }
-    let path = env::var("PATH").unwrap_or_else(|| "/bin".into());
-    path.split(':')
-        .map(|directory| format!("{directory}/{name}"))
-        .find(|candidate| fs::metadata(candidate).is_ok_and(|m| m.kind == FileType::File))
 }
 
 /// Whether `name` matches a pattern with `*` (any run of characters) and

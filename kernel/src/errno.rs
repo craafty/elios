@@ -44,3 +44,51 @@ pub enum Errno {
 }
 
 pub type Result<T> = core::result::Result<T, Errno>;
+
+/// The symbolic name of an error number, for tracing.
+pub fn name(errno: i64) -> &'static str {
+    const NAMES: [&str; 41] = [
+        "0",
+        "EPERM",
+        "ENOENT",
+        "ESRCH",
+        "EINTR",
+        "EIO",
+        "ENXIO",
+        "E2BIG",
+        "ENOEXEC",
+        "EBADF",
+        "ECHILD",
+        "EAGAIN",
+        "ENOMEM",
+        "EACCES",
+        "EFAULT",
+        "ENOTBLK",
+        "EBUSY",
+        "EEXIST",
+        "EXDEV",
+        "ENODEV",
+        "ENOTDIR",
+        "EISDIR",
+        "EINVAL",
+        "ENFILE",
+        "EMFILE",
+        "ENOTTY",
+        "ETXTBSY",
+        "EFBIG",
+        "ENOSPC",
+        "ESPIPE",
+        "EROFS",
+        "EMLINK",
+        "EPIPE",
+        "EDOM",
+        "ERANGE",
+        "EDEADLK",
+        "ENAMETOOLONG",
+        "ENOLCK",
+        "ENOSYS",
+        "ENOTEMPTY",
+        "ELOOP",
+    ];
+    NAMES.get(errno as usize).copied().unwrap_or("E?")
+}

@@ -47,6 +47,22 @@ impl FpuState {
     pub fn initial() -> Self {
         INITIAL_STATE.get().expect("FPU not initialized").clone()
     }
+
+    /// Takes a state saved in user memory (by a signal handler, say).
+    /// MXCSR's reserved bits are cleared: fxrstor faults on them.
+    pub fn load(&mut self, bytes: &[u8]) {
+        self.0.copy_from_slice(&bytes[..512]);
+        let mxcsr = u32::from_le_bytes(self.0[24..28].try_into().unwrap()) & 0xFFFF;
+        self.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+    }
+}
+
+/// Saves the FPU registers to arbitrary (user) memory.
+///
+/// # Safety
+/// `address` must be 16-byte aligned and valid for 512 bytes of writes.
+pub unsafe fn save_to(address: *mut u8) {
+    unsafe { asm!("fxsave64 [{}]", in(reg) address, options(nostack, preserves_flags)) };
 }
 
 pub fn save(state: &mut FpuState) {

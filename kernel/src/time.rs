@@ -65,6 +65,11 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// The timestamp counter's frequency, as measured at boot.
+pub fn tsc_hz() -> u64 {
+    TSC_HZ.load(Ordering::Relaxed)
+}
+
 /// Nanoseconds since boot, or 0 before the TSC has been measured.
 pub fn uptime_nanos() -> u64 {
     let hz = TSC_HZ.load(Ordering::Relaxed);

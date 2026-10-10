@@ -12,6 +12,7 @@
 pub mod cpio;
 pub mod devfs;
 pub mod pipe;
+pub mod procfs;
 pub mod ramfs;
 
 use alloc::string::{String, ToString};
@@ -20,6 +21,21 @@ use alloc::vec::Vec;
 
 use crate::errno::{Errno, Result};
 use crate::sync::{Once, SpinLock};
+use crate::task::WaitQueue;
+
+// Readiness bits for `poll` (Linux values).
+pub const POLLIN: u16 = 0x1;
+pub const POLLOUT: u16 = 0x4;
+pub const POLLERR: u16 = 0x8;
+pub const POLLHUP: u16 = 0x10;
+
+/// Woken whenever any file might have become ready, so `poll` can recheck.
+pub static POLL_EVENTS: WaitQueue = WaitQueue::new();
+
+/// Tells waiting `poll` calls that something changed.
+pub fn notify_poll() {
+    POLL_EVENTS.wake_all();
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
@@ -119,6 +135,12 @@ pub trait Inode: Send + Sync {
         Err(Errno::ENOTTY)
     }
 
+    /// Which of `POLLIN`, `POLLOUT`, `POLLERR` and `POLLHUP` apply now, for
+    /// an open file with these flags. Most things are always ready.
+    fn poll(&self, _flags: u32) -> u16 {
+        POLLIN | POLLOUT
+    }
+
     /// Called when the last open file referring to this inode is closed.
     fn on_close(&self, _flags: u32) {}
 
@@ -145,6 +167,7 @@ pub fn init(initrd: Option<&[u8]>) {
         Err(_) => root.create("dev", FileKind::Directory).expect("can't create /dev"),
     };
     devfs::populate(&dev);
+    let _ = root.link("proc", procfs::create());
     for directory in ["tmp", "home"] {
         if root.lookup(directory).is_err() {
             let _ = root.create(directory, FileKind::Directory);

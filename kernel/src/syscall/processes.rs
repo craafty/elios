@@ -5,7 +5,7 @@ use crate::arch::syscall;
 use crate::errno::{Errno, Result};
 use crate::fs::{self, FileKind};
 use crate::memory::PAGE_SIZE;
-use crate::process::{self, PROT_EXEC, PROT_READ, PROT_WRITE, Pid, SIGKILL, USER_END, user};
+use crate::process::{self, PROT_EXEC, PROT_READ, PROT_WRITE, Pid, SIGKILL, SigAction, USER_END, signal, user};
 use crate::task;
 
 pub fn fork(frame: &InterruptFrame) -> Result<u64> {
@@ -95,28 +95,52 @@ pub fn setsid() -> Result<u64> {
     Ok(u64::from(me.pid))
 }
 
-/// `rt_sigaction`: records how a signal should be handled. Handlers aren't
-/// run yet: a signal with one installed ends the process, as by default.
+/// `rt_sigaction`: how a signal is handled (ignored, default, or a
+/// handler), as a Linux `struct sigaction`.
 pub fn sigaction(signal: u64, action: u64, old_action: u64) -> Result<u64> {
     let signal = signal as usize;
-    if signal == 0 || signal >= process::SIGNAL_COUNT || signal == SIGKILL as usize {
+    if signal == 0 || signal >= process::SIGNAL_COUNT {
+        return Err(Errno::EINVAL);
+    }
+    let new: Option<SigAction> = if action == 0 { None } else { Some(user::read_value(action)?) };
+    if new.is_some() && (signal == SIGKILL as usize || signal == 19) {
         return Err(Errno::EINVAL);
     }
     let process = process::current();
-    let previous = process.actions.lock()[signal];
+    let previous = process.signals.lock().actions[signal];
     if old_action != 0 {
-        user::write_value(old_action, &[previous, 0, 0, 0])?;
+        user::write_value(old_action, &previous)?;
     }
-    if action != 0 {
-        let handler: u64 = user::read_value(action)?;
-        process.actions.lock()[signal] = handler;
+    if let Some(new) = new {
+        process.signals.lock().actions[signal] = new;
     }
     Ok(0)
 }
 
-pub fn sigprocmask(old_set: u64) -> Result<u64> {
+pub fn sigprocmask(how: u64, set: u64, old_set: u64) -> Result<u64> {
+    let set = if set == 0 { None } else { Some(user::read_value::<u64>(set)?) };
+    let old = signal::set_mask(&process::current(), how, set)?;
     if old_set != 0 {
-        user::write_value(old_set, &0u64)?;
+        user::write_value(old_set, &old)?;
+    }
+    Ok(0)
+}
+
+pub fn sigreturn(frame: &mut InterruptFrame) -> Result<u64> {
+    signal::sigreturn(&process::current(), frame)
+}
+
+/// `sigaltstack`, with `stack_t` as (sp, flags, size).
+pub fn sigaltstack(new: u64, old: u64) -> Result<u64> {
+    let new = if new == 0 {
+        None
+    } else {
+        let [base, flags, size]: [u64; 3] = user::read_value(new)?;
+        Some((base, flags & 0xFFFF_FFFF, size))
+    };
+    let (base, flags, size) = signal::set_alternate_stack(&process::current(), new)?;
+    if old != 0 {
+        user::write_value(old, &[base, flags, size])?;
     }
     Ok(0)
 }

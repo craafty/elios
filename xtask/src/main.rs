@@ -257,6 +257,7 @@ fn build_initrd() -> Result<PathBuf, String> {
         symlink("eliutils", &bin.join(name))?;
     }
     symlink("/bin/eliutils", &sbin.join("init"))?;
+    build_c_programs(&root.join("user/c"), &rootfs)?;
 
     let mut archive = Vec::new();
     let mut inode = 1;
@@ -265,6 +266,72 @@ fn build_initrd() -> Result<PathBuf, String> {
     let path = root.join("target/initrd.cpio");
     fs::write(&path, archive).map_err(|e| format!("writing {}: {e}", path.display()))?;
     Ok(path)
+}
+
+/// Compiles the C programs in `user/c` with the host's C compiler, as
+/// ordinary Linux executables: they show eliOS running software it wasn't
+/// written for. Most are static; `*-dynamic.c` ones are dynamically linked,
+/// and the host's dynamic linker and libraries they need are copied into
+/// the root file system too. Skipped (with a note) if there's no compiler.
+fn build_c_programs(source: &Path, rootfs: &Path) -> Result<(), String> {
+    let compiler = env::var("CC").unwrap_or_else(|_| "cc".into());
+    if Command::new(&compiler).arg("--version").output().is_err() {
+        eprintln!("xtask: no C compiler ({compiler}); skipping the C programs");
+        return Ok(());
+    }
+    let destination = rootfs.join("usr/bin");
+    fs::create_dir_all(&destination).map_err(|e| format!("creating {}: {e}", destination.display()))?;
+    let mut sources: Vec<PathBuf> = fs::read_dir(source)
+        .map_err(|e| format!("reading {}: {e}", source.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|extension| extension == "c"))
+        .collect();
+    sources.sort();
+    for file in sources {
+        let name = file.file_stem().unwrap().to_string_lossy().into_owned();
+        let output = destination.join(&name);
+        let dynamic = name.ends_with("-dynamic");
+        let mut command = Command::new(&compiler);
+        if !dynamic {
+            command.arg("-static");
+        }
+        let status = command
+            .args(["-O2", "-s", "-o"])
+            .arg(&output)
+            .arg(&file)
+            .status()
+            .map_err(|e| format!("running {compiler}: {e}"))?;
+        if !status.success() {
+            return Err(format!("compiling {} failed", file.display()));
+        }
+        if dynamic {
+            copy_shared_libraries(&output, rootfs)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copies the shared libraries (and dynamic linker) a host program uses into
+/// the root file system, at the same paths, as reported by `ldd`.
+fn copy_shared_libraries(program: &Path, rootfs: &Path) -> Result<(), String> {
+    let output = Command::new("ldd").arg(program).output().map_err(|e| format!("running ldd: {e}"))?;
+    let listing = String::from_utf8_lossy(&output.stdout);
+    for line in listing.lines() {
+        // "libc.so.6 => /lib/.../libc.so.6 (0x...)" or "/lib64/ld-linux... (0x...)"
+        let path = match line.split_once("=>") {
+            Some((_, rest)) => rest.split_whitespace().next(),
+            None => line.split_whitespace().next(),
+        };
+        let Some(path) = path.filter(|path| path.starts_with('/')) else { continue };
+        let target = rootfs.join(path.trim_start_matches('/'));
+        if target.exists() {
+            continue;
+        }
+        fs::create_dir_all(target.parent().unwrap()).map_err(|e| format!("creating {}: {e}", target.display()))?;
+        // fs::copy follows symbolic links, so this copies the real file.
+        fs::copy(path, &target).map_err(|e| format!("copying {path}: {e}"))?;
+    }
+    Ok(())
 }
 
 fn symlink(target: &str, link: &Path) -> Result<(), String> {
@@ -306,7 +373,8 @@ fn add_to_cpio(archive: &mut Vec<u8>, directory: &Path, prefix: &str, inode: &mu
             add_to_cpio(archive, &entry.path(), &format!("{name}/"), inode)?;
         } else {
             let data = fs::read(entry.path()).map_err(|e| format!("reading {}: {e}", entry.path().display()))?;
-            let mode = if name.starts_with("bin/") { 0o100755 } else { 0o100644 };
+            let executable = name.starts_with("bin/") || name.starts_with("usr/bin/") || name.contains(".so");
+            let mode = if executable { 0o100755 } else { 0o100644 };
             cpio_entry(archive, *inode, &name, mode, &data);
         }
     }

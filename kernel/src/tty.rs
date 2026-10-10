@@ -11,7 +11,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::errno::{Errno, Result};
-use crate::fs::{FileKind, Inode, Metadata, ramfs};
+use crate::fs::{self, FileKind, Inode, Metadata, POLLIN, POLLOUT, ramfs};
 use crate::process::{self, user};
 use crate::sync::{Once, SpinLock};
 use crate::task::WaitQueue;
@@ -45,6 +45,13 @@ const TIOCSPGRP: u64 = 0x5410;
 const TIOCGWINSZ: u64 = 0x5413;
 const TIOCSWINSZ: u64 = 0x5414;
 const FIONREAD: u64 = 0x541B;
+// The termios2 variants, which add explicit baud rates (newer C libraries
+// use these).
+const TCGETS2: u64 = 0x802C_542A;
+const TCSETS2: u64 = 0x402C_542B;
+const TCSETSW2: u64 = 0x402C_542C;
+const TCSETSF2: u64 = 0x402C_542D;
+const BAUD_38400: u32 = 38_400;
 
 /// The kernel's `struct termios`, as the ioctls exchange it.
 #[repr(C)]
@@ -233,6 +240,7 @@ pub fn input(bytes: &[u8]) {
     }
     if wake {
         tty.readable.wake_all();
+        fs::notify_poll();
     }
     if let Some(group) = interrupt_group {
         process::signal_group(group, process::SIGINT);
@@ -289,16 +297,26 @@ impl Inode for Tty {
         Ok(buf.len())
     }
 
+    fn poll(&self, _flags: u32) -> u16 {
+        let state = self.state.lock();
+        if state.ready.is_empty() && !state.end_of_file { POLLOUT } else { POLLIN | POLLOUT }
+    }
+
     fn ioctl(&self, request: u64, argument: u64) -> Result<u64> {
         match request {
             TCGETS => {
                 let termios = self.state.lock().termios;
                 user::write_value(argument, &termios)?;
             }
-            TCSETS | TCSETSW | TCSETSF => {
+            TCGETS2 => {
+                let termios = self.state.lock().termios;
+                user::write_value(argument, &(termios, BAUD_38400, BAUD_38400))?;
+            }
+            TCSETS | TCSETSW | TCSETSF | TCSETS2 | TCSETSW2 | TCSETSF2 => {
+                // termios2 starts with a termios, so the same read works.
                 let termios: Termios = user::read_value(argument)?;
                 let mut state = self.state.lock();
-                if request == TCSETSF {
+                if request == TCSETSF || request == TCSETSF2 {
                     state.ready.clear();
                 }
                 // Leaving canonical mode hands over the partial line.
@@ -320,7 +338,7 @@ impl Inode for Tty {
                 let available = self.state.lock().ready.len() as u32;
                 user::write_value(argument, &available)?;
             }
-            _ => return Err(Errno::EINVAL),
+            _ => return Err(Errno::ENOTTY),
         }
         Ok(0)
     }

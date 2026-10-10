@@ -367,12 +367,18 @@ pub fn list() -> Vec<ThreadInfo> {
     })
 }
 
-/// Blocks the current thread until [`wake`]. Interrupts must be disabled,
-/// so that a wakeup can't slip in before the thread is marked blocked.
-fn block_current() {
+/// Blocks the current thread until [`wake`], or until timer tick
+/// `deadline` if one is given. Interrupts must be disabled, so that a wakeup
+/// can't slip in before the thread is marked blocked.
+fn block_current(deadline: Option<u64>) {
     with(|s| {
         let current = s.current;
-        s.threads.get_mut(&current).unwrap().state = State::Blocked;
+        let thread = s.threads.get_mut(&current).unwrap();
+        thread.state = State::Blocked;
+        if let Some(deadline) = deadline {
+            thread.wake_at = deadline;
+            s.sleeping.push(current);
+        }
     });
     schedule();
 }
@@ -401,7 +407,11 @@ pub fn on_tick(now: u64) {
     let mut woke = false;
     let Scheduler { threads, sleeping, ready, .. } = &mut *s;
     sleeping.retain(|id| {
-        let thread = threads.get_mut(id).unwrap();
+        let Some(thread) = threads.get_mut(id) else { return false };
+        // Woken early (a blocked thread with a deadline, say): forget it.
+        if !matches!(thread.state, State::Sleeping | State::Blocked) {
+            return false;
+        }
         if thread.wake_at > now {
             return true;
         }

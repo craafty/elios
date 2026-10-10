@@ -51,6 +51,7 @@ pub fn find(name: &str) -> Option<Command> {
         "seq" => seq,
         "sleep" => sleep,
         "stat" => stat,
+        "strace" => strace,
         "tail" => |args| head_or_tail(args, false),
         "tee" => tee,
         "touch" => touch,
@@ -417,6 +418,33 @@ fn stat(arguments: &[String]) -> i32 {
         }
     }
     status
+}
+
+fn strace(arguments: &[String]) -> i32 {
+    let Some(name) = arguments.get(1) else {
+        eprintln!("usage: strace PROGRAM [ARGUMENTS...]");
+        return 2;
+    };
+    let Some(path) = process::find_program(name) else {
+        eprintln!("strace: {name}: command not found");
+        return 127;
+    };
+    match process::fork() {
+        Ok(0) => {
+            let _ = process::trace(true);
+            let error = process::exec(&path, &arguments[1..], &env::vars());
+            eprintln!("strace: {name}: {error}");
+            process::exit(126)
+        }
+        Ok(pid) => match process::wait(pid as i32, false) {
+            Ok(Some((_, status))) => {
+                eprintln!("strace: {name} ended: {status}");
+                status.shell_code()
+            }
+            _ => 1,
+        },
+        Err(error) => report("strace", name, error),
+    }
 }
 
 fn basename(arguments: &[String]) -> i32 {

@@ -7,7 +7,7 @@
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 
-use super::{FileKind, Inode, Metadata, O_ACCMODE, O_RDONLY, OpenFile, ramfs};
+use super::{FileKind, Inode, Metadata, O_ACCMODE, O_RDONLY, OpenFile, POLLERR, POLLHUP, POLLIN, POLLOUT, ramfs};
 use crate::errno::{Errno, Result};
 use crate::process;
 use crate::sync::SpinLock;
@@ -70,6 +70,7 @@ impl Inode for Pipe {
             Some(Ok(count))
         })?;
         self.changed.wake_all();
+        super::notify_poll();
         Ok(count)
     }
 
@@ -104,8 +105,24 @@ impl Inode for Pipe {
                 }
             }
             self.changed.wake_all();
+            super::notify_poll();
         }
         Ok(written)
+    }
+
+    fn poll(&self, flags: u32) -> u16 {
+        let state = self.state.lock();
+        if flags & O_ACCMODE == O_RDONLY {
+            let data = if state.buffer.is_empty() { 0 } else { POLLIN };
+            let hangup = if state.writers == 0 { POLLHUP } else { 0 };
+            data | hangup
+        } else if state.readers == 0 {
+            POLLERR
+        } else if state.buffer.len() < CAPACITY {
+            POLLOUT
+        } else {
+            0
+        }
     }
 
     /// Each end is one open file, shared (not copied) by `dup` and `fork`,
@@ -119,5 +136,23 @@ impl Inode for Pipe {
         }
         drop(state);
         self.changed.wake_all();
+        super::notify_poll();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    crate::ktest! {
+        fn pipe_readiness_follows_its_contents() {
+            let (reader, writer) = create();
+            assert_eq!(reader.inode.poll(reader.flags()), 0);
+            assert_eq!(writer.inode.poll(writer.flags()), POLLOUT);
+            writer.write(b"x").unwrap();
+            assert_eq!(reader.inode.poll(reader.flags()), POLLIN);
+            drop(writer);
+            assert_eq!(reader.inode.poll(reader.flags()), POLLIN | POLLHUP);
+        }
     }
 }

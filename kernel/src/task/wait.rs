@@ -21,7 +21,13 @@ impl WaitQueue {
     /// Blocks until `ready` returns a value, and returns it. `ready` runs
     /// with interrupts disabled, so a wakeup from an interrupt handler can't
     /// be lost between checking and going to sleep.
-    pub fn wait_until<T>(&self, mut ready: impl FnMut() -> Option<T>) -> T {
+    pub fn wait_until<T>(&self, ready: impl FnMut() -> Option<T>) -> T {
+        self.wait_until_deadline(None, ready).expect("waits without a deadline don't time out")
+    }
+
+    /// Like [`wait_until`](Self::wait_until), but gives up (returning
+    /// `None`) at timer tick `deadline`.
+    pub fn wait_until_deadline<T>(&self, deadline: Option<u64>, mut ready: impl FnMut() -> Option<T>) -> Option<T> {
         let enabled = arch::interrupts_enabled();
         loop {
             arch::disable_interrupts();
@@ -29,10 +35,16 @@ impl WaitQueue {
                 if enabled {
                     arch::enable_interrupts();
                 }
-                return value;
+                return Some(value);
+            }
+            if deadline.is_some_and(|deadline| crate::time::ticks() >= deadline) {
+                if enabled {
+                    arch::enable_interrupts();
+                }
+                return None;
             }
             self.waiters.lock().push_back(super::current());
-            super::block_current();
+            super::block_current(deadline);
             if enabled {
                 arch::enable_interrupts();
             }

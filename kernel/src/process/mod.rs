@@ -7,6 +7,7 @@
 
 mod address_space;
 pub mod elf;
+pub mod signal;
 pub mod user;
 
 use alloc::collections::BTreeMap;
@@ -14,9 +15,13 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub use self::address_space::{AddressSpace, PROT_EXEC, PROT_READ, PROT_WRITE, USER_END};
+#[cfg(test)]
+use self::signal::SIGTERM;
+use self::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
+pub use self::signal::{SIGINT, SIGKILL, SIGNAL_COUNT, SIGPIPE, SigAction, Signals, pending as signal_pending};
 use crate::arch::fpu::FpuState;
 use crate::arch::interrupts::{self, InterruptFrame};
 use crate::arch::syscall;
@@ -31,46 +36,24 @@ pub type Pid = u32;
 /// The first process; orphans are adopted by it.
 pub const INIT: Pid = 1;
 
-// Signal numbers (Linux values).
-pub const SIGINT: u32 = 2;
-pub const SIGILL: u32 = 4;
-pub const SIGTRAP: u32 = 5;
-pub const SIGBUS: u32 = 7;
-pub const SIGFPE: u32 = 8;
-pub const SIGKILL: u32 = 9;
-pub const SIGSEGV: u32 = 11;
-pub const SIGPIPE: u32 = 13;
-#[cfg_attr(not(test), allow(dead_code, reason = "used by tests"))]
-pub const SIGTERM: u32 = 15;
-pub const SIGCHLD: u32 = 17;
-pub const SIGCONT: u32 = 18;
-pub const SIGSTOP: u32 = 19;
-pub const SIGTSTP: u32 = 20;
-pub const SIGTTIN: u32 = 21;
-pub const SIGTTOU: u32 = 22;
-pub const SIGURG: u32 = 23;
-pub const SIGWINCH: u32 = 28;
-pub const SIGNAL_COUNT: usize = 65;
-
-/// Signal disposition values (`sa_handler`).
-pub const SIG_DFL: u64 = 0;
-pub const SIG_IGN: u64 = 1;
-
 pub struct Process {
     pub pid: Pid,
     parent: AtomicU32,
     group: AtomicU32,
     pub name: SpinLock<String>,
+    /// The program file and the arguments it was started with.
+    pub executable: SpinLock<String>,
+    pub arguments: SpinLock<Vec<String>>,
     pub space: SpinLock<Option<AddressSpace>>,
     pub files: SpinLock<FileTable>,
     pub cwd: SpinLock<String>,
     /// Set (as a wait status) once the process has exited.
     status: SpinLock<Option<i32>>,
-    /// Signals sent but not yet acted on, one bit each.
-    pending: AtomicU64,
-    /// How each signal is handled (`SIG_DFL`, `SIG_IGN` or a handler).
-    pub actions: SpinLock<[u64; SIGNAL_COUNT]>,
+    pub signals: SpinLock<Signals>,
     thread: SpinLock<Option<ThreadId>>,
+    /// Whether to print every system call (see `strace`). Inherited by
+    /// children and kept across `exec`.
+    pub trace: AtomicBool,
 }
 
 impl Process {
@@ -101,13 +84,15 @@ fn create(parent: Pid, group: Option<Pid>, name: &str, cwd: String, files: FileT
         parent: AtomicU32::new(parent),
         group: AtomicU32::new(group.unwrap_or(pid)),
         name: SpinLock::new(name.to_string()),
+        executable: SpinLock::new(String::new()),
+        arguments: SpinLock::new(Vec::new()),
         space: SpinLock::new(None),
         files: SpinLock::new(files),
         cwd: SpinLock::new(cwd),
         status: SpinLock::new(None),
-        pending: AtomicU64::new(0),
-        actions: SpinLock::new([SIG_DFL; SIGNAL_COUNT]),
+        signals: SpinLock::new(Signals::new()),
         thread: SpinLock::new(None),
+        trace: AtomicBool::new(false),
     });
     PROCESSES.lock().insert(pid, process.clone());
     process
@@ -140,8 +125,10 @@ struct Image {
     space: AddressSpace,
     entry: u64,
     stack_pointer: u64,
-    /// The arguments actually used (scripts gain their interpreter).
+    /// The program actually run, and its arguments (scripts gain their
+    /// interpreter).
     path: String,
+    arguments: Vec<String>,
 }
 
 /// Loads the program at `path` (resolved from `cwd`) into a new address
@@ -173,9 +160,16 @@ fn load_image(cwd: &str, path: &str, arguments: Vec<String>, environment: &[Stri
     }
 
     let mut space = AddressSpace::new()?;
-    let program = elf::load(&mut space, &data)?;
+    let mut program = elf::load(&mut space, &data)?;
+    if let Some(interpreter) = &program.interpreter {
+        let inode = fs::lookup(cwd, interpreter, true)?;
+        let mut interpreter_data = vec![0; inode.metadata().size as usize];
+        inode.read_at(0, &mut interpreter_data)?;
+        elf::load_interpreter(&mut space, &mut program, &interpreter_data)?;
+    }
     let stack_pointer = elf::build_stack(&mut space, &program, &arguments, environment, path)?;
-    Ok(Image { space, entry: program.entry, stack_pointer, path: path.to_string() })
+    let path = fs::normalize(cwd, path);
+    Ok(Image { space, entry: program.start(), stack_pointer, path, arguments })
 }
 
 fn base_name(path: &str) -> &str {
@@ -202,13 +196,15 @@ pub fn start(path: &str, arguments: Vec<String>) -> Result<Pid> {
         files.insert(terminal.clone(), false, 0)?;
     }
     let process = create(0, None, base_name(path), "/".into(), files);
+    *process.executable.lock() = image.path;
+    *process.arguments.lock() = image.arguments;
     *process.space.lock() = Some(image.space);
     start_thread(&process, syscall::user_frame(image.entry, image.stack_pointer), FpuState::initial(), 0);
     Ok(process.pid)
 }
 
 fn default_environment() -> Vec<String> {
-    ["PATH=/bin", "HOME=/home", "TERM=linux", "SHELL=/bin/sh", "USER=root"].map(String::from).to_vec()
+    ["PATH=/bin:/usr/bin", "HOME=/home", "TERM=linux", "SHELL=/bin/sh", "USER=root"].map(String::from).to_vec()
 }
 
 /// `fork`: a copy of the running process, continuing from the same system
@@ -220,7 +216,10 @@ pub fn fork(frame: &InterruptFrame) -> Result<Pid> {
     let cwd = parent.cwd.lock().clone();
     let files = parent.files.lock().clone();
     let child = create(parent.pid, Some(parent.group()), &name, cwd, files);
-    *child.actions.lock() = *parent.actions.lock();
+    *child.signals.lock() = parent.signals.lock().for_child();
+    *child.executable.lock() = parent.executable.lock().clone();
+    *child.arguments.lock() = parent.arguments.lock().clone();
+    child.trace.store(parent.trace.load(Ordering::Relaxed), Ordering::Relaxed);
     *child.space.lock() = Some(space);
 
     let mut child_frame = *frame;
@@ -243,15 +242,12 @@ pub fn exec(frame: &mut InterruptFrame, path: &str, arguments: Vec<String>, envi
     let old = process.space.lock().replace(image.space);
     drop(old);
     process.files.lock().exec();
-    // Handlers point into the old program; ignored signals stay ignored.
-    for action in process.actions.lock().iter_mut() {
-        if *action != SIG_IGN {
-            *action = SIG_DFL;
-        }
-    }
+    process.signals.lock().exec();
     let name = base_name(&image.path).to_string();
     task::set_name(&name);
     *process.name.lock() = name;
+    *process.executable.lock() = image.path;
+    *process.arguments.lock() = image.arguments;
     task::reset_fpu();
     syscall::set_fs_base(0);
     *frame = syscall::user_frame(image.entry, image.stack_pointer);
@@ -336,15 +332,8 @@ pub fn wait_for_exit(pid: Pid) -> i32 {
     })
 }
 
-/// Marks a signal pending and wakes the process so it notices.
 pub fn send_signal(process: &Process, signal: u32) {
-    if signal == 0 || signal as usize >= SIGNAL_COUNT || process.status.lock().is_some() {
-        return;
-    }
-    process.pending.fetch_or(signal_bit(signal), Ordering::Relaxed);
-    if let Some(thread) = *process.thread.lock() {
-        task::interrupt(thread);
-    }
+    signal::send(process, signal);
 }
 
 pub fn send_signal_to_self(signal: u32) {
@@ -389,66 +378,23 @@ pub fn kill(pid: i64, signal: u32) -> Result<()> {
     Ok(())
 }
 
-/// A signal's bit in a signal set: as in Linux, signal n is bit n - 1.
-fn signal_bit(signal: u32) -> u64 {
-    1 << (signal - 1)
-}
-
-/// Signals whose default action is to do nothing.
-fn ignored_by_default(signal: u32) -> bool {
-    // Stopping isn't supported, so the stop signals are ignored too.
-    matches!(signal, SIGCHLD | SIGCONT | SIGURG | SIGWINCH | SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
-}
-
-/// The pending signals that will actually do something.
-fn effective_signals(process: &Process) -> u64 {
-    let pending = process.pending.load(Ordering::Relaxed);
-    if pending == 0 {
-        return 0;
-    }
-    let actions = process.actions.lock();
-    (1..SIGNAL_COUNT as u32)
-        .filter(|&signal| pending & signal_bit(signal) != 0)
-        .filter(|&signal| {
-            signal == SIGKILL
-                || match actions[signal as usize] {
-                    SIG_IGN => false,
-                    SIG_DFL => !ignored_by_default(signal),
-                    _ => true,
-                }
-        })
-        .fold(0, |mask, signal| mask | signal_bit(signal))
-}
-
-/// Whether the running process has a signal that should interrupt a
-/// blocking system call.
-pub fn signal_pending() -> bool {
-    task::current_process().is_some_and(|process| effective_signals(&process) != 0)
-}
-
 /// Called with interrupts disabled whenever the kernel is about to return to
 /// user mode: acts on pending signals and switches threads if one is due.
-pub fn before_return_to_user() {
+/// `syscall` is the number of the system call returning, if any.
+pub fn before_return_to_user(frame: &mut InterruptFrame, syscall: Option<u64>) {
     if let Some(process) = task::current_process() {
-        let effective = effective_signals(&process);
-        // Signals that do nothing are simply dropped.
-        process.pending.fetch_and(effective, Ordering::Relaxed);
-        if effective != 0 {
-            let signal = effective.trailing_zeros() + 1;
-            crate::arch::enable_interrupts();
-            exit(signal_status(signal));
-        }
+        signal::deliver(&process, frame, syscall);
     }
     task::preempt_point();
 }
 
 /// Handles a CPU exception raised by user code: page faults inside the
-/// program's areas are resolved; anything else ends the process with the
-/// matching signal, as Linux would.
+/// program's areas are resolved; anything else raises the matching signal,
+/// as on Linux, which ends the process unless it handles it.
 pub fn handle_user_exception(frame: &mut InterruptFrame) {
     let process = current();
     let vector = frame.vector as u8;
-    if vector == interrupts::PAGE_FAULT {
+    let (signal, description, address) = if vector == interrupts::PAGE_FAULT {
         let address = crate::arch::read_cr2();
         let write = frame.error_code & 2 != 0;
         let execute = frame.error_code & 0x10 != 0;
@@ -456,35 +402,30 @@ pub fn handle_user_exception(frame: &mut InterruptFrame) {
         if resolved {
             return;
         }
-        warn!(
-            "{} (pid {}): segmentation fault: {} {address:#x} at {:#x}",
-            process.name.lock(),
-            process.pid,
-            if execute {
-                "executing"
-            } else if write {
-                "writing"
-            } else {
-                "reading"
-            },
-            frame.rip,
-        );
-        crate::arch::enable_interrupts();
-        exit(signal_status(SIGSEGV));
-    }
-
-    let (signal, description) = match vector {
-        0 => (SIGFPE, "division by zero"),
-        3 => (SIGTRAP, "breakpoint"),
-        6 => (SIGILL, "invalid instruction"),
-        13 => (SIGSEGV, "general protection fault"),
-        16 | 19 => (SIGFPE, "floating point exception"),
-        17 => (SIGBUS, "misaligned access"),
-        _ => (SIGSEGV, "CPU exception"),
+        let access = if execute {
+            "executing"
+        } else if write {
+            "writing"
+        } else {
+            "reading"
+        };
+        (SIGSEGV, alloc::format!("segmentation fault: {access} {address:#x}"), address)
+    } else {
+        let (signal, description) = match vector {
+            0 => (SIGFPE, "division by zero"),
+            3 => (SIGTRAP, "breakpoint"),
+            6 => (SIGILL, "invalid instruction"),
+            13 => (SIGSEGV, "general protection fault"),
+            16 | 19 => (SIGFPE, "floating point exception"),
+            17 => (SIGBUS, "misaligned access"),
+            _ => (SIGSEGV, "CPU exception"),
+        };
+        (signal, description.into(), frame.rip)
     };
-    warn!("{} (pid {}): {description} at {:#x}", process.name.lock(), process.pid, frame.rip);
-    crate::arch::enable_interrupts();
-    exit(signal_status(signal));
+    if !signal::raise_fault(&process, signal, address) {
+        warn!("{} (pid {}): {description} at {:#x}", process.name.lock(), process.pid, frame.rip);
+    }
+    signal::fault(&process, frame, signal, address);
 }
 
 /// A snapshot of a process, for `ps`.
@@ -541,11 +482,18 @@ mod tests {
         wait_for_exit(pid)
     }
 
+    /// Reads a whole file, until end of file (/proc files report size 0).
     fn read_file(path: &str) -> String {
         let inode = fs::lookup("/", path, true).unwrap();
-        let mut data = vec![0; inode.metadata().size as usize];
-        inode.read_at(0, &mut data).unwrap();
-        String::from_utf8(data).unwrap()
+        let mut data = Vec::new();
+        let mut chunk = [0; 512];
+        loop {
+            let count = inode.read_at(data.len() as u64, &mut chunk).unwrap();
+            if count == 0 {
+                return String::from_utf8(data).unwrap();
+            }
+            data.extend_from_slice(&chunk[..count]);
+        }
     }
 
     crate::ktest! {
@@ -569,6 +517,24 @@ mod tests {
             // Three processes, two pipes, and a redirection.
             assert_eq!(shell("seq 50 | grep 5 | wc -l > /tmp/pipeline-test"), exit_status(0));
             assert_eq!(read_file("/tmp/pipeline-test").trim(), "6");
+        }
+
+        fn linux_c_programs_pass_their_self_tests() {
+            // Built by the host's C compiler, if there was one.
+            for program in ["ctest", "sigtest", "hello-c", "hello-dynamic"] {
+                let path = alloc::format!("/usr/bin/{program}");
+                if fs::lookup("/", &path, true).is_err() {
+                    continue;
+                }
+                assert_eq!(shell(&alloc::format!("{program} > /dev/null")), exit_status(0), "{program} failed");
+            }
+        }
+
+        fn proc_describes_processes() {
+            assert_eq!(shell("cat /proc/self/status > /tmp/proc-test"), exit_status(0));
+            let status = read_file("/tmp/proc-test");
+            assert!(status.starts_with("Name:\tcat\n"), "{status}");
+            assert!(read_file("/proc/meminfo").starts_with("MemTotal:"));
         }
 
         fn a_finished_program_gives_its_memory_back() {

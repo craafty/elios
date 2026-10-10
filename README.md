@@ -52,6 +52,16 @@ too).
   with the programs into a cpio initrd, which eliboot loads and the kernel
   unpacks into an in-memory file system.
 
+### Running Linux programs
+
+`user/c/` holds C programs built by the host's ordinary C compiler and C
+library (glibc): `hello-c`, `ctest` (a self-test of the C library: memory,
+files, directories, time, processes, pipes) and `sigtest` (signal handlers).
+They're plain Linux executables, unmodified, and run on eliOS. So does
+`hello-dynamic`, which is dynamically linked: eliOS loads glibc's own dynamic
+linker, which loads `libc.so.6` (copied from the host into the initrd). Run
+`strace <program>` to watch any program's system calls.
+
 The shell (`sh`) has pipes, redirection (`<`, `>`, `>>`, `2>&1`), `;` `&&`
 `||`, background jobs, quoting, `$VARIABLES`, `~`, `*` wildcards, scripts,
 history (arrow keys) and Tab completion. Ctrl+C interrupts the foreground
@@ -128,9 +138,11 @@ The exact machine state at kernel entry is documented in `bootinfo/src/lib.rs`.
       ABI (~90 calls), VFS with an in-memory file system, cpio initrd, pipes,
       a TTY with line editing and job control, libeli, and eliutils (shell,
       init and ~40 commands)
-- [ ] **Phase 6: Storage.** ACPI parsing, PCI, a disk driver (AHCI/NVMe/virtio),
-      VFS, a native eliOS file system plus FAT32/ext2 for interop
-- [ ] **Phase 7: Linux compatibility.** Linux syscall ABI: static binaries
-      (e.g. BusyBox), then the dynamic linker and glibc/musl programs
+- [x] **Phase 6: Linux compatibility.** Unmodified glibc programs, static
+      and dynamically linked (via glibc's own ld.so); signal handlers with
+      Linux's signal frame, masks, SA_RESTART and alternate stacks; poll and
+      select; /proc; strace
+- [ ] **Phase 7: Storage.** PCI, a disk driver (AHCI/NVMe/virtio), a native
+      eliOS file system plus FAT32 for interop
 - [ ] **Phase 8+:** SMP, networking (own TCP/IP stack), GUI and compositor,
       real-hardware support (custom GPT/FAT image builder for USB boot)
