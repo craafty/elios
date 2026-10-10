@@ -6,6 +6,7 @@ use core::ptr;
 
 use crate::collections::ArrayVec;
 use crate::memory;
+use crate::sync::Once;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IoApicInfo {
@@ -45,8 +46,22 @@ pub struct Madt {
 
 const SDT_HEADER_SIZE: u64 = 36;
 
+static MADT: Once<Madt> = Once::new();
+
+/// Reads the ACPI tables the kernel needs. Must run while the bootloader's
+/// mappings are active: the tables can be anywhere in the low 4 GiB, which
+/// those cover.
+pub fn init(rsdp: u64) -> Result<&'static Madt, &'static str> {
+    MADT.set(find_madt(rsdp)?).map_err(|_| "ACPI initialized twice")
+}
+
+/// The MADT read by [`init`].
+pub fn madt() -> Option<&'static Madt> {
+    MADT.get()
+}
+
 /// Finds and parses the MADT, starting from the RSDP the bootloader found.
-pub fn find_madt(rsdp: u64) -> Result<Madt, &'static str> {
+fn find_madt(rsdp: u64) -> Result<Madt, &'static str> {
     if rsdp == 0 {
         return Err("the firmware provided no ACPI tables");
     }
@@ -152,7 +167,7 @@ mod tests {
 
     crate::ktest! {
         fn madt_lists_processors_and_io_apics() {
-            let madt = find_madt(crate::test::boot_info().rsdp).unwrap();
+            let madt = madt().unwrap();
             assert!(!madt.processors.is_empty());
             assert!(!madt.io_apics.is_empty());
             assert_ne!(madt.local_apic_address, 0);

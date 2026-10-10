@@ -14,6 +14,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::{apic, gdt};
+use crate::memory;
 use crate::sync::TakeOnce;
 
 // Vector assignments.
@@ -248,7 +249,17 @@ fn handle_exception(frame: &mut InterruptFrame) {
     // Nothing can recover from the rest yet. Once there is userspace, faults
     // in user code will end the process instead.
     let fault_address = if frame.vector == u64::from(PAGE_FAULT) { Some(super::read_cr2()) } else { None };
-    panic!("{}", ExceptionReport { frame, fault_address });
+    let hint = match fault_address {
+        Some(address) => memory::describe_fault_address(address),
+        // A double fault with the stack pointer at a guard page is almost
+        // always a stack overflow: the page fault couldn't be delivered
+        // because the CPU had no stack to push it on.
+        None if frame.vector == u64::from(DOUBLE_FAULT) => memory::describe_fault_address(frame.rsp.wrapping_sub(64))
+            .filter(|description| description.contains("guard page"))
+            .map(|_| "the stack pointer is at a kernel stack's guard page: the stack overflowed"),
+        None => None,
+    };
+    panic!("{}", ExceptionReport { frame, fault_address, hint });
 }
 
 const EXCEPTIONS: [(&str, &str); 32] = [
@@ -295,6 +306,8 @@ fn has_error_code(vector: u64) -> bool {
 struct ExceptionReport<'a> {
     frame: &'a InterruptFrame,
     fault_address: Option<u64>,
+    /// What we can tell about the cause.
+    hint: Option<&'static str>,
 }
 
 impl fmt::Display for ExceptionReport<'_> {
@@ -325,6 +338,9 @@ impl fmt::Display for ExceptionReport<'_> {
                 "page not present"
             };
             write!(f, "\n  {access} of {address:#x}: {cause}")?;
+        }
+        if let Some(hint) = self.hint {
+            write!(f, "\n  ({hint})")?;
         }
 
         write!(f, "\n  rip {:#018x}  rsp {:#018x}  rflags {:#010x}", frame.rip, frame.rsp, frame.rflags)?;
@@ -404,11 +420,11 @@ mod tests {
         fn page_fault_reports_explain_the_fault() {
             let frame = InterruptFrame { vector: 14, error_code: 0b10, rip: 0xFFFF_FFFF_8000_1000, cs: 8, ..Default::default() };
             let mut text = StrBuf::<1024>::new();
-            core::fmt::write(&mut text, format_args!("{}", ExceptionReport { frame: &frame, fault_address: Some(0xdead) }))
-                .unwrap();
+            let report = ExceptionReport { frame: &frame, fault_address: Some(0xdead), hint: Some("a hint") };
+            core::fmt::write(&mut text, format_args!("{report}")).unwrap();
             let text = text.as_str();
             assert!(text.starts_with("CPU exception: Page Fault (#PF, vector 14), error code 0x2"), "{text}");
-            assert!(text.contains("write of 0xdead: page not present"), "{text}");
+            assert!(text.contains("write of 0xdead: page not present\n  (a hint)"), "{text}");
             assert!(text.contains("rip 0xffffffff80001000"), "{text}");
         }
     }

@@ -5,8 +5,7 @@
 //! which route each input line (a "global system interrupt", GSI) to a vector
 //! on a chosen CPU.
 //!
-//! Both are accessed through memory-mapped registers via the direct map. The
-//! firmware's MTRRs mark that range uncacheable, which is what registers need.
+//! Both are accessed through memory-mapped registers, mapped uncached.
 
 use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -15,7 +14,7 @@ use super::interrupts::{APIC_ERROR, SPURIOUS};
 use super::{rdmsr, wrmsr};
 use crate::acpi::{InterruptOverride, Madt};
 use crate::collections::ArrayVec;
-use crate::memory;
+use crate::memory::{self, CacheType};
 use crate::sync::SpinLock;
 
 const IA32_APIC_BASE: u32 = 0x1B;
@@ -68,7 +67,7 @@ pub fn init_local(madt: &Madt) {
         wrmsr(IA32_APIC_BASE, msr | APIC_BASE_ENABLE);
         msr & APIC_BASE_ADDRESS_MASK
     };
-    LOCAL_APIC.store(memory::phys_to_virt(base) as u64, Ordering::Relaxed);
+    LOCAL_APIC.store(memory::map_device(base, 0x400, CacheType::Uncached) as u64, Ordering::Relaxed);
 
     // LINT0 carries the legacy PIC's output ("virtual wire" mode); that path
     // is off. The firmware tables say which input is the NMI line.
@@ -169,8 +168,8 @@ const REDIRECT_MASKED: u32 = 1 << 16;
 pub fn init_io(madt: &Madt) {
     let mut controllers = ArrayVec::new();
     for info in madt.io_apics.iter() {
-        let mut io_apic =
-            IoApic { base: memory::phys_to_virt(u64::from(info.address)) as u64, gsi_base: info.gsi_base, inputs: 0 };
+        let registers = memory::map_device(u64::from(info.address), 0x20, CacheType::Uncached);
+        let mut io_apic = IoApic { base: registers as u64, gsi_base: info.gsi_base, inputs: 0 };
         // Version register: bits 16-23 hold the index of the last input.
         io_apic.inputs = (io_apic.read(0x01) >> 16 & 0xFF) + 1;
         for input in 0..io_apic.inputs {

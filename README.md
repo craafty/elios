@@ -86,8 +86,10 @@ The exact machine state at kernel entry is documented in `bootinfo/src/lib.rs`.
 - [x] **Phase 2: CPU and interrupts.** GDT/TSS with IST stacks, IDT with
       custom entry stubs and exception reports, ACPI MADT, Local APIC + I/O
       APIC, TSC/APIC timer calibration, PS/2 keyboard
-- [ ] **Phase 3: Memory.** Physical frame allocator, kernel-owned page tables
-      (drop the identity map, reclaim bootloader memory), kernel heap (`alloc`)
+- [x] **Phase 3: Memory.** Bitmap frame allocator, kernel-owned page tables
+      (W^X kernel image, RAM-only direct map, write-combining framebuffer,
+      no identity map), guarded kernel stacks, bootloader memory reclaimed,
+      kernel heap with size classes (`alloc`), early log replay
 - [ ] **Phase 4: Multitasking.** Threads, context switching, preemptive
       scheduler, synchronization
 - [ ] **Phase 5: Userspace.** Ring 3, `syscall`/`sysret`, ELF process loading,

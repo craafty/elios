@@ -1,10 +1,53 @@
 //! Kernel output. Everything printed goes to the serial port and, once there
 //! is one, the screen console. Debug messages go to serial only, to keep the
 //! screen readable.
+//!
+//! Output is also kept in an in-memory log, so messages printed before the
+//! console existed can be shown on it afterwards.
 
 use core::fmt::{self, Write as _};
 
+use crate::sync::SpinLock;
 use crate::{console, serial, time};
+
+const LOG_SIZE: usize = 64 * 1024;
+
+/// The most recent output, oldest bytes dropped first.
+struct Log {
+    bytes: [u8; LOG_SIZE],
+    start: usize,
+    len: usize,
+}
+
+impl fmt::Write for Log {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for &byte in s.as_bytes() {
+            if self.len == LOG_SIZE {
+                self.start = (self.start + 1) % LOG_SIZE;
+                self.len -= 1;
+            }
+            self.bytes[(self.start + self.len) % LOG_SIZE] = byte;
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
+static LOG: SpinLock<Log> = SpinLock::new(Log { bytes: [0; LOG_SIZE], start: 0, len: 0 });
+
+/// Writes the whole log so far to `out`.
+pub fn replay(out: &mut impl fmt::Write) {
+    let log = LOG.lock();
+    let end = log.start + log.len;
+    let (first, second) = if end <= LOG_SIZE {
+        (&log.bytes[log.start..end], &[][..])
+    } else {
+        (&log.bytes[log.start..], &log.bytes[..end - LOG_SIZE])
+    };
+    for chunk in first.utf8_chunks().chain(second.utf8_chunks()) {
+        let _ = out.write_str(chunk.valid());
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Level {
@@ -30,6 +73,7 @@ impl Level {
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
+    let _ = LOG.lock().write_fmt(args);
     serial::write_fmt(args);
     console::with(|console| {
         let _ = console.write_fmt(args);

@@ -22,11 +22,11 @@ unsafe impl Send for Framebuffer {}
 
 impl Framebuffer {
     /// # Safety
-    /// `info` must describe a real framebuffer, mapped at `hhdm_offset` plus
-    /// its physical address, that nothing else is drawing to.
-    pub unsafe fn new(info: &bootinfo::Framebuffer, hhdm_offset: u64) -> Self {
+    /// `pixels` must be where the framebuffer `info` describes is mapped, and
+    /// nothing else may draw to it.
+    pub unsafe fn new(info: &bootinfo::Framebuffer, pixels: *mut u32) -> Self {
         Self {
-            pixels: (hhdm_offset + info.base) as *mut u32,
+            pixels,
             width: info.width as usize,
             height: info.height as usize,
             stride: info.stride as usize,

@@ -11,16 +11,21 @@ PHDRS
     data   PT_LOAD FLAGS(6); /* rw- */
 }
 
+/* The kernel maps itself using the __*_start symbols, so each permission
+   region starts on a page boundary. */
 SECTIONS
 {
     . = 0xFFFFFFFF80000000;
-    __kernel_start = .;
+    __text_start = .;
 
-    .text : ALIGN(4K) {
+    .text : {
         *(.text .text.*)
     } :text
 
-    .rodata : ALIGN(4K) {
+    . = ALIGN(4K);
+    __rodata_start = .;
+
+    .rodata : {
         *(.rodata .rodata.*)
         *(.data.rel.ro .data.rel.ro.*)
     } :rodata
@@ -32,7 +37,10 @@ SECTIONS
         __kernel_tests_end = .;
     } :rodata
 
-    .data : ALIGN(4K) {
+    . = ALIGN(4K);
+    __data_start = .;
+
+    .data : {
         *(.data .data.*)
         *(.got .got.*)
     } :data

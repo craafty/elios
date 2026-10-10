@@ -1,6 +1,7 @@
 //! Synchronization primitives.
 
 use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
@@ -108,6 +109,43 @@ impl<T> TakeOnce<T> {
     }
 }
 
+/// A value set once, at runtime, then shared read-only forever. For things
+/// discovered during boot, like the ACPI tables.
+pub struct Once<T> {
+    state: AtomicU8,
+    value: UnsafeCell<MaybeUninit<T>>,
+}
+
+const ONCE_EMPTY: u8 = 0;
+const ONCE_WRITING: u8 = 1;
+const ONCE_READY: u8 = 2;
+
+// SAFETY: the value is written once before being published, then only read.
+unsafe impl<T: Send + Sync> Sync for Once<T> {}
+
+impl<T> Once<T> {
+    pub const fn new() -> Self {
+        Self { state: AtomicU8::new(ONCE_EMPTY), value: UnsafeCell::new(MaybeUninit::uninit()) }
+    }
+
+    /// Stores the value, or hands it back if one was already stored.
+    pub fn set(&self, value: T) -> Result<&T, T> {
+        if self.state.compare_exchange(ONCE_EMPTY, ONCE_WRITING, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            return Err(value);
+        }
+        // SAFETY: winning the exchange makes us the only writer, and readers
+        // wait for ONCE_READY.
+        let stored = unsafe { (*self.value.get()).write(value) };
+        self.state.store(ONCE_READY, Ordering::Release);
+        Ok(stored)
+    }
+
+    pub fn get(&self) -> Option<&T> {
+        // SAFETY: ONCE_READY is only published after the value is written.
+        (self.state.load(Ordering::Acquire) == ONCE_READY).then(|| unsafe { (*self.value.get()).assume_init_ref() })
+    }
+}
+
 /// A fixed-size byte queue for one producer and one consumer, without locks.
 /// Made for interrupt handlers handing data to the rest of the kernel.
 pub struct ByteQueue<const N: usize> {
@@ -187,6 +225,14 @@ mod tests {
             assert_eq!(queue.pop(), Some(2));
             assert_eq!(queue.pop(), Some(4));
             assert_eq!(queue.pop(), None);
+        }
+
+        fn once_keeps_the_first_value() {
+            let once = Once::new();
+            assert_eq!(once.get(), None);
+            assert_eq!(once.set(1).copied(), Ok(1));
+            assert_eq!(once.set(2).err(), Some(2));
+            assert_eq!(once.get(), Some(&1));
         }
 
         fn take_once_hands_out_its_value_once() {

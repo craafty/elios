@@ -90,12 +90,83 @@ pub fn read_cr2() -> u64 {
 }
 
 /// Physical address of the active top-level page table.
-#[cfg(test)]
 pub fn page_table_root() -> u64 {
     let cr3: u64;
     // SAFETY: reading CR3 has no side effects.
     unsafe { asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)) };
     cr3 & 0x000F_FFFF_FFFF_F000
+}
+
+/// Switches to another set of page tables, flushing all non-global TLB
+/// entries.
+///
+/// # Safety
+/// The new tables must map everything currently in use: this code, the
+/// stack, and anything referenced through pointers.
+pub unsafe fn set_page_table_root(root: u64) {
+    unsafe { asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
+}
+
+/// Removes any cached translation for the page containing `address`.
+pub fn flush_tlb_page(address: u64) {
+    // SAFETY: invalidating a TLB entry only costs a page walk later.
+    unsafe { asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags)) };
+}
+
+/// Makes the CPU honor the global bit in page tables: global translations
+/// survive address space switches, which suits kernel mappings shared by
+/// every address space.
+pub fn enable_global_pages() {
+    // SAFETY: setting CR4.PGE only changes how long TLB entries live.
+    unsafe {
+        asm!(
+            "mov {tmp}, cr4",
+            "or {tmp}, {pge}",
+            "mov cr4, {tmp}",
+            tmp = out(reg) _,
+            pge = const 1 << 7,
+            options(nostack, preserves_flags),
+        )
+    };
+}
+
+const IA32_PAT: u32 = 0x277;
+
+/// Programs the page attribute table so page table entries can select
+/// write-combining memory (PWT alone), which makes framebuffer writes much
+/// faster on real hardware. The other entries keep their power-on meaning.
+pub fn init_page_attributes() {
+    // Entries 0-7: write-back, write-combining, uncached-minus, uncached,
+    // write-back, write-through, uncached-minus, uncached.
+    const PAT: u64 = u64::from_le_bytes([6, 1, 7, 0, 6, 4, 7, 0]);
+    // SAFETY: no existing mapping uses entry 1, the only one that changes,
+    // and caches are flushed so no stale line has the old type.
+    unsafe {
+        asm!("wbinvd", options(nostack, preserves_flags));
+        wrmsr(IA32_PAT, PAT);
+    }
+}
+
+/// Moves onto a new stack and calls `entry(argument)` there. The current
+/// stack is abandoned.
+///
+/// # Safety
+/// `stack_top` must be the 16-byte-aligned top of a mapped, unused stack.
+pub unsafe fn switch_stack(stack_top: u64, entry: extern "sysv64" fn(u64) -> !, argument: u64) -> ! {
+    unsafe {
+        asm!(
+            "mov rsp, {stack_top}",
+            "xor ebp, ebp",
+            // A zero return address, as at kernel entry: keeps SysV stack
+            // alignment and ends stack traces.
+            "push 0",
+            "jmp {entry}",
+            stack_top = in(reg) stack_top,
+            entry = in(reg) entry,
+            in("rdi") argument,
+            options(noreturn),
+        )
+    }
 }
 
 #[cfg(test)]

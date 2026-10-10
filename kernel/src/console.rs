@@ -8,11 +8,12 @@
 //! movement, erasing), the same ones terminal programs emit, so the kernel log
 //! looks the same here and on a serial terminal.
 
+use alloc::vec;
 use core::fmt;
 
 use crate::font;
 use crate::framebuffer::{Color, Framebuffer};
-use crate::sync::{SpinLock, TakeOnce};
+use crate::sync::SpinLock;
 
 pub const BACKGROUND: Color = Color(0x0B1026);
 pub const FOREGROUND: Color = Color(0xD8DAE5);
@@ -37,16 +38,12 @@ const PALETTE: [Color; 16] = [
     Color(0xFFFFFF), // bright white
 ];
 
-/// Room for a 1920x1200 screen. Larger screens use only the top part until
-/// the kernel has a heap to size this properly.
-const SHADOW_PIXELS: usize = 1920 * 1200;
-static SHADOW: TakeOnce<[u32; SHADOW_PIXELS]> = TakeOnce::new([0; SHADOW_PIXELS]);
-
 static CONSOLE: SpinLock<Option<Console<'static>>> = SpinLock::new(None);
 
 /// Takes over the framebuffer for the console and clears the screen.
 pub fn init(fb: Framebuffer) {
-    let shadow = SHADOW.take().expect("console initialized twice");
+    // The console lives until shutdown, so its shadow buffer is never freed.
+    let shadow = vec![0; fb.width() * fb.height()].leak();
     *CONSOLE.lock() = Some(Console::new(fb, shadow));
 }
 
