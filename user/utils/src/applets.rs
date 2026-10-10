@@ -13,6 +13,7 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("date", "show the date and time"),
     ("dmesg", "show the kernel log"),
     ("echo", "print arguments"),
+    ("edit", "edit a text file"),
     ("env", "show environment variables"),
     ("false", "do nothing, unsuccessfully"),
     ("fetch", "show system information"),

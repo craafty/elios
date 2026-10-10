@@ -36,7 +36,7 @@ fn output(text: &str) {
     let _ = io::write_all(STDOUT, text.as_bytes());
 }
 
-/// Reads one key's worth of bytes from the terminal.
+/// Reads one byte from the terminal.
 fn read_byte() -> Option<u8> {
     let mut byte = [0];
     match io::read(STDIN, &mut byte) {
@@ -45,7 +45,8 @@ fn read_byte() -> Option<u8> {
     }
 }
 
-enum Key {
+/// A key, decoded from the bytes a terminal sends for it.
+pub enum Key {
     Char(char),
     Enter,
     Backspace,
@@ -56,12 +57,16 @@ enum Key {
     Down,
     Home,
     End,
+    PageUp,
+    PageDown,
     Tab,
+    Escape,
     Control(u8),
     Unknown,
 }
 
-fn read_key() -> Option<Key> {
+/// Reads one key (in raw mode). `None` at end of input.
+pub fn read_key() -> Option<Key> {
     let byte = read_byte()?;
     Some(match byte {
         b'\r' | b'\n' => Key::Enter,
@@ -88,10 +93,13 @@ fn read_key() -> Option<Key> {
 }
 
 /// Decodes `ESC [ ...` (or `ESC O ...`) sequences for the special keys.
+/// A lone ESC (the Escape key) is followed by nothing: there's no way to
+/// tell it apart without a timeout, so an unrecognized follower makes it
+/// Escape.
 fn read_escape() -> Key {
-    let Some(kind) = read_byte() else { return Key::Unknown };
+    let Some(kind) = read_byte() else { return Key::Escape };
     if kind != b'[' && kind != b'O' {
-        return Key::Unknown;
+        return Key::Escape;
     }
     let mut parameter = 0;
     loop {
@@ -109,6 +117,8 @@ fn read_escape() -> Key {
                     1 | 7 => Key::Home,
                     4 | 8 => Key::End,
                     3 => Key::Delete,
+                    5 => Key::PageUp,
+                    6 => Key::PageDown,
                     _ => Key::Unknown,
                 };
             }

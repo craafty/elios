@@ -14,7 +14,9 @@ Things to try
   fetch                    system information
   free; uptime; date       memory, uptime, the clock
   dmesg | tail             the end of the kernel's log
-  echo hi > note.txt       files you create live in memory
+  edit note.txt            write something (^S saves, ^Q quits)
+  echo hi > note.txt       files in your home directory live in memory...
+  cp note.txt /disk/       ...but /disk is the boot disk: files there last
   cat note.txt | wc -c     pipes
   seq 100 | grep 7 | wc -l
   sleep 10 &               a background job (then: jobs, wait)

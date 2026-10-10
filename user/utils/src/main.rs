@@ -10,6 +10,7 @@ extern crate alloc;
 
 mod applets;
 mod commands;
+mod edit;
 mod editor;
 mod init;
 mod shell;
@@ -41,6 +42,7 @@ fn run(name: &str, arguments: &[String]) -> i32 {
     match name {
         "sh" => shell::main(arguments),
         "init" => init::main(),
+        "edit" => edit::main(arguments),
         _ => match commands::find(name) {
             Some(command) => command(arguments),
             None => {
