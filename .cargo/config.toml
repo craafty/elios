@@ -1,0 +1,12 @@
+[alias]
+xtask = "run --quiet --package xtask --"
+
+# Kernel code generation: linked at a fixed higher-half address (see
+# kernel/linker.ld), so no position-independent code. Frame pointers are kept
+# so we can produce stack traces on panic later.
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "code-model=kernel",
+    "-C", "force-frame-pointers=yes",
+]

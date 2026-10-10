@@ -1,0 +1,7 @@
+[package]
+name = "elikernel"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bootinfo = { path = "../bootinfo" }

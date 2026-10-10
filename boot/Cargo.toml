@@ -1,0 +1,7 @@
+[package]
+name = "eliboot"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bootinfo = { path = "../bootinfo" }
