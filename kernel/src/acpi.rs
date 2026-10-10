@@ -26,7 +26,8 @@ pub struct InterruptOverride {
 }
 
 /// A local APIC input wired to the NMI line. (The table also says which
-/// processors this applies to; with one CPU running, it's always ours.)
+/// processors this applies to; in practice it's all of them, so it's
+/// applied to every CPU.)
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LocalNmi {
     pub lint: u8,

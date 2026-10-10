@@ -7,10 +7,17 @@
 //! The descriptor order is fixed by `syscall`/`sysret`, which compute the
 //! user selectors from a single base: user data must directly precede user
 //! code.
+//!
+//! Every CPU needs its own TSS (it holds that CPU's stacks), so each has its
+//! own GDT too. The boot CPU's live in static storage, since it sets them up
+//! before there's a heap; the others' are allocated.
 
+use alloc::boxed::Box;
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
+use super::cpu::{self, Cpu};
+use crate::memory;
 use crate::sync::TakeOnce;
 
 pub const KERNEL_CODE: u16 = 0x08;
@@ -27,6 +34,7 @@ pub const IST_NMI: u8 = 2;
 pub const IST_MACHINE_CHECK: u8 = 3;
 
 const IST_STACK_SIZE: usize = 16 * 1024;
+const IST_STACK_PAGES: u64 = IST_STACK_SIZE as u64 / memory::PAGE_SIZE;
 
 #[repr(C, align(16))]
 struct Stack([u8; IST_STACK_SIZE]);
@@ -46,18 +54,19 @@ struct TaskStateSegment {
     io_bitmap_offset: u16,
 }
 
-static TSS_STORAGE: TakeOnce<TaskStateSegment> = TakeOnce::new(TaskStateSegment {
-    reserved0: 0,
-    privilege_stacks: [0; 3],
-    reserved1: 0,
-    interrupt_stacks: [0; 7],
-    reserved2: 0,
-    reserved3: 0,
-    io_bitmap_offset: 0,
-});
+impl TaskStateSegment {
+    const EMPTY: Self = Self {
+        reserved0: 0,
+        privilege_stacks: [0; 3],
+        reserved1: 0,
+        interrupt_stacks: [0; 7],
+        reserved2: 0,
+        reserved3: 0,
+        io_bitmap_offset: 0,
+    };
+}
 
-/// Where the TSS ended up, for updating the kernel stack pointer in it.
-static TSS_ADDRESS: AtomicU64 = AtomicU64::new(0);
+static TSS_STORAGE: TakeOnce<TaskStateSegment> = TakeOnce::new(TaskStateSegment::EMPTY);
 
 /// Null, kernel code/data, user data/code, and the TSS (which takes two
 /// slots).
@@ -77,16 +86,30 @@ pub struct DescriptorTablePointer {
     pub base: u64,
 }
 
-/// Builds the GDT and TSS and loads them, reloading every segment register.
-pub fn init() {
+/// Builds the boot CPU's GDT and TSS and loads them.
+pub fn init(cpu: &'static Cpu) {
     let stacks = IST_STACKS.take().expect("GDT initialized twice");
-    let stack_top = |index: usize| stacks[index].0.as_ptr_range().end as u64;
-    let mut interrupt_stacks = [0; 7];
-    interrupt_stacks[usize::from(IST_DOUBLE_FAULT) - 1] = stack_top(0);
-    interrupt_stacks[usize::from(IST_NMI) - 1] = stack_top(1);
-    interrupt_stacks[usize::from(IST_MACHINE_CHECK) - 1] = stack_top(2);
-
+    let tops = [0, 1, 2].map(|index| stacks[index].0.as_ptr_range().end as u64);
     let tss = TSS_STORAGE.take().expect("GDT initialized twice");
+    let gdt = GDT.take().expect("GDT initialized twice");
+    load(cpu, gdt, tss, tops);
+}
+
+/// Builds and loads a GDT and TSS for another CPU, with guarded stacks for
+/// the exceptions that need their own.
+pub fn init_other(cpu: &'static Cpu) {
+    let tops = [0; 3].map(|_| memory::allocate_kernel_stack(IST_STACK_PAGES).top);
+    load(cpu, Box::leak(Box::new([0; 7])), Box::leak(Box::new(TaskStateSegment::EMPTY)), tops);
+}
+
+/// Fills in a GDT and TSS (with `ist_tops` as the double fault, NMI and
+/// machine check stacks) and loads them, reloading every segment register.
+fn load(cpu: &Cpu, gdt: &'static mut [u64; 7], tss: &'static mut TaskStateSegment, ist_tops: [u64; 3]) {
+    let mut interrupt_stacks = [0; 7];
+    interrupt_stacks[usize::from(IST_DOUBLE_FAULT) - 1] = ist_tops[0];
+    interrupt_stacks[usize::from(IST_NMI) - 1] = ist_tops[1];
+    interrupt_stacks[usize::from(IST_MACHINE_CHECK) - 1] = ist_tops[2];
+
     *tss = TaskStateSegment {
         reserved0: 0,
         privilege_stacks: [0; 3],
@@ -98,9 +121,8 @@ pub fn init() {
         io_bitmap_offset: size_of::<TaskStateSegment>() as u16,
     };
 
-    TSS_ADDRESS.store(core::ptr::from_mut(tss) as u64, Ordering::Relaxed);
+    cpu.tss.store(core::ptr::from_mut(tss) as u64, Ordering::Relaxed);
 
-    let gdt = GDT.take().expect("GDT initialized twice");
     let (tss_low, tss_high) = tss_descriptor(core::ptr::from_ref(tss) as u64);
     *gdt = [
         0,
@@ -126,8 +148,9 @@ pub fn init() {
             "mov ds, {data:x}",
             "mov es, {data:x}",
             "mov ss, {data:x}",
+            // Loading GS would clear the GS base, which holds this CPU's
+            // data; FS is cleared for a clean start.
             "mov fs, {null:x}",
-            "mov gs, {null:x}",
             "ltr {tss:x}",
             pointer = in(reg) &raw const pointer,
             code = in(reg) u64::from(KERNEL_CODE),
@@ -139,10 +162,10 @@ pub fn init() {
     }
 }
 
-/// Sets the stack the CPU switches to when an interrupt arrives in user
+/// Sets the stack this CPU switches to when an interrupt arrives in user
 /// mode. Called on every switch to a thread.
 pub fn set_kernel_stack(top: u64) {
-    let tss = TSS_ADDRESS.load(Ordering::Relaxed) as *mut TaskStateSegment;
+    let tss = cpu::current().tss.load(Ordering::Relaxed) as *mut TaskStateSegment;
     // SAFETY: the TSS is 'static; the field is misaligned (it's packed),
     // hence the unaligned write.
     unsafe { (&raw mut (*tss).privilege_stacks).cast::<u64>().write_unaligned(top) };

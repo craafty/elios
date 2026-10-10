@@ -229,17 +229,21 @@ fn maps(process: &process::Process) -> String {
     text
 }
 
-/// CPU time totals, in 1/100 s: everything not spent in processes counts
-/// as idle.
+/// CPU time totals, overall and per CPU, in 1/100 s.
 fn system_stat() -> String {
-    let total = time::uptime_nanos() / 10_000_000;
-    let busy: u64 = process::list().iter().map(|p| p.cpu_ms / 10).sum();
-    let idle = total.saturating_sub(busy);
-    format!(
-        "cpu  {busy} 0 0 {idle} 0 0 0 0 0 0\ncpu0 {busy} 0 0 {idle} 0 0 0 0 0 0\nbtime {}\nprocesses {}\nprocs_running 1\nprocs_blocked 0\n",
+    let times = crate::task::cpu_times();
+    let line = |name: &str, (busy, idle): (u64, u64)| format!("{name} {} 0 0 {} 0 0 0 0 0 0\n", busy / 10, idle / 10);
+    let total = times.iter().fold((0, 0), |(busy, idle), &(b, i)| (busy + b, idle + i));
+    let mut text = line("cpu ", total);
+    for (index, &cpu) in times.iter().enumerate() {
+        text.push_str(&line(&format!("cpu{index}"), cpu));
+    }
+    text.push_str(&format!(
+        "btime {}\nprocesses {}\nprocs_running 1\nprocs_blocked 0\n",
         time::unix_time() - time::uptime_nanos() / 1_000_000_000,
         process::count()
-    )
+    ));
+    text
 }
 
 fn mounts() -> String {
@@ -288,7 +292,14 @@ fn cpuinfo() -> String {
     }
     let model = String::from_utf8_lossy(&model).trim_matches(char::from(0)).trim().to_string();
     let mhz = time::tsc_hz() / 1_000_000;
-    format!(
-        "processor\t: 0\nvendor_id\t: {vendor}\nmodel name\t: {model}\ncpu MHz\t\t: {mhz}.000\ncpu cores\t: 1\nflags\t\t: fpu sse sse2 syscall nx lm\n\n"
-    )
+    let count = crate::arch::cpu::online_count();
+    let mut text = String::new();
+    for cpu in crate::arch::cpu::online() {
+        text.push_str(&format!(
+            "processor\t: {index}\nvendor_id\t: {vendor}\nmodel name\t: {model}\ncpu MHz\t\t: {mhz}.000\nphysical id\t: 0\nsiblings\t: {count}\ncore id\t\t: {index}\ncpu cores\t: {count}\napicid\t\t: {apic}\nflags\t\t: fpu sse sse2 syscall nx lm\n\n",
+            index = cpu.index(),
+            apic = cpu.apic_id.load(core::sync::atomic::Ordering::Relaxed),
+        ));
+    }
+    text
 }

@@ -29,7 +29,10 @@ options:
   --trace      log interrupts and CPU resets to target/qemu.log (run, test)
   --fresh      start from an empty disk image instead of updating it (run)
   --no-kvm     emulate the CPU even if hardware virtualization is available
+  --cpus N     give the machine N CPUs (default 4)
 ";
+
+const DEFAULT_CPUS: usize = 4;
 
 const BOOTLOADER_TARGET: &str = "x86_64-unknown-uefi";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
@@ -64,6 +67,8 @@ struct Options {
     trace: bool,
     fresh: bool,
     no_kvm: bool,
+    /// None for the default.
+    cpus: Option<usize>,
     qemu_args: Vec<String>,
 }
 
@@ -115,6 +120,10 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options, Stri
             "--trace" => options.trace = true,
             "--fresh" => options.fresh = true,
             "--no-kvm" => options.no_kvm = true,
+            "--cpus" => {
+                let count = args.next().and_then(|count| count.parse().ok()).filter(|&count| (1..=64).contains(&count));
+                options.cpus = Some(count.ok_or("--cpus needs a number from 1 to 64")?);
+            }
             "--" => options.qemu_args.extend(args.by_ref()),
             _ => return Err(format!("unknown option `{arg}`\n\n{USAGE}")),
         }
@@ -477,7 +486,8 @@ fn run(disk: &Path, options: &Options) -> Result<(), String> {
 fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
     let firmware = find_ovmf()?;
     let mut qemu = Command::new("qemu-system-x86_64");
-    qemu.args(["-machine", "q35", "-m", "256M", "-nic", "none"])
+    let cpus = options.cpus.unwrap_or(DEFAULT_CPUS).to_string();
+    qemu.args(["-machine", "q35", "-m", "256M", "-smp", &cpus, "-nic", "none"])
         .arg("-bios")
         .arg(&firmware)
         // On the q35 machine the disk is attached to an AHCI (SATA)

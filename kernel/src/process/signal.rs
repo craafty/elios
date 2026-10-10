@@ -79,13 +79,16 @@ pub struct ThreadSignals {
     alternate_stack: Option<(u64, u64)>,
     /// For a signal raised by a CPU fault: the faulting address.
     fault_address: u64,
+    /// The mask to go back to after the next handler, set while
+    /// `rt_sigsuspend` waits with a temporary one.
+    saved_mask: Option<u64>,
 }
 
 impl ThreadSignals {
     /// The state of a forked child's thread: the same mask and alternate
     /// stack.
     pub fn for_child(&self) -> Self {
-        Self { pending: 0, fault_address: 0, ..self.clone() }
+        Self { pending: 0, fault_address: 0, saved_mask: None, ..self.clone() }
     }
 
     /// A new thread in the same process: only the mask carries over.
@@ -228,6 +231,10 @@ pub fn deliver(thread: &UserThread, frame: &mut InterruptFrame, syscall: Option<
         signals.pending &= !ignored;
         let deliverable = deliverable(&process, &signals);
         if deliverable == 0 {
+            // rt_sigsuspend woke for a signal another thread took.
+            if let Some(mask) = signals.saved_mask.take() {
+                signals.blocked = mask;
+            }
             return;
         }
         let signal = deliverable.trailing_zeros() + 1;
@@ -292,8 +299,10 @@ fn context_registers(frame: &InterruptFrame) -> [u64; 18] {
 
 fn push_frame(thread: &UserThread, frame: &mut InterruptFrame, signal: u32, action: &SigAction) -> Result<()> {
     let (blocked, alternate, fault_address) = {
-        let signals = thread.signals.lock();
-        (signals.blocked, signals.alternate_stack, signals.fault_address)
+        let mut signals = thread.signals.lock();
+        // After rt_sigsuspend, the handler returns to the mask from before.
+        let restore = signals.saved_mask.take().unwrap_or(signals.blocked);
+        (restore, signals.alternate_stack, signals.fault_address)
     };
     let on_alternate = alternate.is_some_and(|(base, size)| (base..base + size).contains(&frame.rsp));
     let mut top = match alternate {
@@ -439,6 +448,27 @@ pub fn set_mask(thread: &UserThread, how: u64, set: Option<u64>) -> Result<u64> 
         };
     }
     Ok(old)
+}
+
+/// Where `pause` and `rt_sigsuspend` wait: nothing wakes it but signals.
+static SIGNAL_WAIT: task::WaitQueue = task::WaitQueue::new();
+
+/// `pause`: waits for a signal. Always returns `EINTR`.
+pub fn pause() -> Result<u64> {
+    SIGNAL_WAIT.wait_until(|| pending().then_some(()));
+    Err(Errno::EINTR)
+}
+
+/// `rt_sigsuspend`: waits for a signal with `mask` as the thread's mask;
+/// the old mask comes back once the handler returns.
+pub fn suspend(thread: &UserThread, mask: u64) -> Result<u64> {
+    {
+        let mut signals = thread.signals.lock();
+        let old = signals.blocked;
+        signals.saved_mask = Some(old);
+        signals.blocked = mask & !UNBLOCKABLE;
+    }
+    pause()
 }
 
 const SS_DISABLE: u64 = 2;

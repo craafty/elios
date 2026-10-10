@@ -17,6 +17,7 @@ pub use self::system::HOSTNAME;
 
 use crate::arch::interrupts::InterruptFrame;
 use crate::errno::{Errno, Result};
+use crate::process::signal;
 use crate::{arch, process};
 
 /// eliOS-specific calls.
@@ -56,6 +57,7 @@ fn name(number: u64) -> Option<&'static str> {
         28 => "madvise",
         32 => "dup",
         33 => "dup2",
+        34 => "pause",
         35 => "nanosleep",
         39 => "getpid",
         40 => "sendfile",
@@ -198,6 +200,7 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         28 => Ok(0),
         32 => files::dup(a[0]),
         33 => files::dup2(a[0], a[1]),
+        34 => signal::pause(),
         35 => processes::nanosleep(a[0]),
         39 => processes::getpid(),
         40 => files::sendfile(a[0], a[1], a[2], a[3]),
@@ -235,6 +238,7 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         111 => processes::getpgid(0),
         112 => processes::setsid(),
         121 | 124 => processes::getpgid(a[0]),
+        130 => processes::sigsuspend(a[0], a[1]),
         131 => processes::sigaltstack(a[0], a[1]),
         137 => files::statfs(a[0], a[1]),
         138 => files::fstatfs(a[0], a[1]),

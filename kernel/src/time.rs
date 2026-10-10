@@ -9,7 +9,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::interrupts::{self, InterruptFrame};
-use crate::arch::{apic, cpuid, pit, rdtsc};
+use crate::arch::{apic, cpu, cpuid, pit, rdtsc};
 
 /// Periodic timer interrupts per second.
 pub const TICK_HZ: u64 = 1000;
@@ -22,6 +22,8 @@ static TSC_AT_BOOT: AtomicU64 = AtomicU64::new(0);
 static BOOT_UNIX_TIME: AtomicU64 = AtomicU64::new(0);
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
+/// The APIC timer count between ticks, for starting other CPUs' timers.
+static TIMER_PERIOD: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the moment uptime counts from. Called first thing at boot.
 pub fn mark_boot() {
@@ -45,7 +47,8 @@ pub fn init() {
     TSC_HZ.store(tsc_hz, Ordering::Relaxed);
 
     interrupts::set_handler(interrupts::TIMER, on_tick);
-    apic::timer_start_periodic(interrupts::TIMER, (apic_hz / TICK_HZ) as u32);
+    TIMER_PERIOD.store(apic_hz / TICK_HZ, Ordering::Relaxed);
+    start_timer();
 
     info!(
         "time: TSC at {} MHz{}, APIC timer at {} MHz, ticking at {TICK_HZ} Hz",
@@ -55,8 +58,16 @@ pub fn init() {
     );
 }
 
+/// Starts this CPU's periodic tick. Every CPU's APIC timer runs at the
+/// rate measured on the boot CPU (they share the bus clock).
+pub fn start_timer() {
+    apic::timer_start_periodic(interrupts::TIMER, TIMER_PERIOD.load(Ordering::Relaxed) as u32);
+}
+
+/// Every CPU's timer fires every millisecond; the boot CPU's also keeps the
+/// time.
 fn on_tick(_frame: &mut InterruptFrame) {
-    let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = if cpu::current().index() == 0 { Some(TICKS.fetch_add(1, Ordering::Relaxed) + 1) } else { None };
     crate::task::on_tick(now);
 }
 

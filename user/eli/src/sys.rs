@@ -28,6 +28,7 @@ pub const SYSINFO: usize = 99;
 pub const GETPPID: usize = 110;
 pub const SETPGID: usize = 109;
 pub const REBOOT: usize = 169;
+pub const SCHED_GETAFFINITY: usize = 204;
 pub const GETDENTS64: usize = 217;
 pub const CLOCK_GETTIME: usize = 228;
 pub const OPENAT: usize = 257;

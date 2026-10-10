@@ -362,6 +362,55 @@ hitting the guard page can't be delivered on the overflowed stack, so the
 CPU raises a double fault, which runs on its own IST stack and produces a
 readable report ("the stack overflowed") instead of a triple fault.
 
+Each CPU has its own TSS (it holds that CPU's stacks) and therefore its own
+GDT. The boot CPU's live in static storage, because it sets them up before
+the heap exists; the others' are allocated, with guard-paged IST stacks.
+The IDT is shared: every CPU handles every vector the same way.
+
+### Per-CPU data (`arch/cpu.rs`)
+
+Each CPU has a `Cpu` block: the running thread's kernel stack and a scratch
+slot for the system call entry code (at fixed offsets the assembly uses),
+the CPU's index and APIC ID, its TSS, the running thread, and flags other
+CPUs set to ask it for something (switch threads, flush its TLB). The GS
+base register points at the block while in the kernel, and the block
+stores its own address at offset 16, so `cpu::current()` is a single
+`mov rax, gs:[16]`.
+
+The answer is only meaningful while the thread can't move to another CPU,
+so per-CPU lookups that matter happen with interrupts disabled (preemption
+only happens in interrupts).
+
+### Starting the other CPUs (`arch/smp.rs`)
+
+The firmware leaves every CPU but one halted, waiting for two signals sent
+through the local APIC: INIT, then STARTUP with a page number. STARTUP
+starts the CPU in 16-bit real mode at that page, which must be below 1 MiB.
+(This is why the frame allocator never hands out low memory.)
+
+eliOS copies a small trampoline there. In about 30 instructions it loads a
+temporary GDT, enables PAE and global pages, loads page tables, turns on
+long mode and no-execute in EFER, and then sets the protection *and*
+paging bits in CR0 at once: real mode straight to long mode, skipping
+32-bit protected mode entirely (it works, and it halves the trampoline). A
+far jump then enters 64-bit code. The trampoline's page tables are built
+next to it, also below 1 MiB (CR3 can only hold a 32-bit address at that
+point): they map the first 2 MiB at their own addresses, so the code keeps
+running after paging turns on, and copy the kernel's top-level entries, so
+the kernel is mapped too. The trampoline then jumps to `ap_main` on a stack
+the boot CPU allocated.
+
+`ap_main` switches to the kernel's own page tables, copies the boot CPU's
+CR0 and CR4, and sets up everything per-CPU: the GS base, the page
+attribute table, the GDT and TSS, the IDT, the `syscall` MSRs, the FPU,
+the local APIC and its timer. The code it's running becomes that CPU's idle
+thread.
+
+The boot CPU starts the others one at a time, following Intel's documented
+sequence (INIT, 10 ms, STARTUP, 200 µs, STARTUP again if needed) and
+waiting for each to report in. CPUs with APIC IDs above 254 are skipped;
+they'd need x2APIC mode.
+
 ### Interrupt entry (`arch/interrupts.rs`)
 
 All 256 vectors enter through assembly stubs, generated with an assembler
@@ -429,6 +478,9 @@ mode. `route_isa_irq` applies them.
 | 0x20-0x2F | the masked legacy PICs (spurious only) |
 | 0x30 + IRQ | I/O APIC interrupts (keyboard 0x31, serial 0x34) |
 | 0xF0 | local APIC timer |
+| 0xF1 | reschedule request from another CPU |
+| 0xF2 | TLB shootdown request from another CPU |
+| NMI | after a panic, stops the other CPUs |
 | 0xFE | local APIC error |
 | 0xFF | spurious |
 
@@ -458,7 +510,10 @@ both frequencies. 50 ms is long enough for good precision and short enough
 not to slow the boot noticeably.
 
 The APIC timer then fires every millisecond (1 kHz): the scheduler's tick.
-Uptime comes from the TSC, with nanosecond resolution.
+Every CPU's timer runs at the rate measured on the boot CPU (they share the
+bus clock), and each drives its own CPU's time slices; only the boot CPU's
+advances the tick count. Uptime comes from the TSC, with nanosecond
+resolution.
 
 The TSC on older CPUs (and in QEMU's default CPU model) isn't "invariant":
 it can change speed with power states. The kernel warns but uses it anyway;
@@ -554,6 +609,30 @@ the stack touches the guard page and faults, instead of silently overwriting
 whatever happened to be below. The boot stack (from eliboot) had no guard,
 so the kernel switches to a guarded stack as soon as its page tables are up.
 
+### TLB shootdowns
+
+The CPU caches page translations in its TLB, and each CPU has its own.
+When the kernel removes or restricts a mapping, its own CPU flushes the
+entry, but another CPU may still hold the old translation: if the memory
+were then reused, that CPU could keep reading or writing it. So every
+unmapping (heap pages, kernel stacks, `munmap`, `mprotect`) calls
+`smp::flush_tlb(range)`, which flushes locally, flags each other CPU,
+sends them all an interrupt, and waits until every one has flushed. Only
+then is the memory freed.
+
+A subtle deadlock lurks here. A CPU spinning on a spinlock has interrupts
+disabled, so it never sees the shootdown interrupt; if the lock's holder is
+the CPU waiting for the shootdown, neither moves. The fix: the spinlock's
+wait loop also serves pending shootdown requests. Small ranges are flushed
+page by page with `invlpg`; large ones flush everything by toggling CR4's
+global-pages bit (which also drops global, kernel, translations).
+
+A related, gentler case: when a page gains permissions (an `mprotect`
+that adds write access, say), other CPUs may still hold the old read-only
+translation and fault on a write that's now allowed. The page fault handler
+recognizes this (the page table entry permits the access) and just flushes
+the stale entry.
+
 ### Reclaiming boot memory
 
 Once the kernel runs on its own page tables and stack, eliboot's page
@@ -587,11 +666,15 @@ where returning memory matters, are returned immediately.
 
 `sync.rs`.
 
-- **`SpinLock`** disables interrupts while held, and restores the previous
-  state when released. Without this, an interrupt handler that takes a lock
-  the interrupted code holds would spin forever on a single CPU. Making
-  *every* spinlock interrupt-safe removes that class of deadlock entirely.
-  The rule that follows: never block while holding a spinlock.
+- **`SpinLock`** is an atomic flag other CPUs spin on, and it also disables
+  interrupts while held (restoring the previous state when released).
+  Without that, an interrupt handler that takes a lock the code it
+  interrupted holds would spin forever on that CPU. Making *every* spinlock
+  interrupt-safe removes that class of deadlock entirely. The rules that
+  follow: never block while holding a spinlock, and never allocate while
+  holding a lock the heap itself needs (the kernel page table lock: the heap
+  takes it to grow, so allocating under it deadlocks, which a test caught).
+  Spinning CPUs serve TLB shootdown requests (section 8).
 - **`Mutex`** puts waiting threads to sleep on a wait queue, with interrupts
   left on. It's for slow operations, like disk I/O, where holding interrupts
   off for milliseconds would delay the timer.
@@ -631,9 +714,28 @@ kernel stack the CPU uses on entry from user mode.
 
 ### Scheduling policy
 
-Round-robin with 10 ms time slices: the simplest fair policy. The timer
-interrupt (1 kHz) decrements the current slice and wakes sleeping threads
-whose time has come; when a switch is due it only sets a flag.
+Round-robin with 10 ms time slices: the simplest fair policy. There's one
+ready queue, which every CPU takes threads from, so work naturally spreads
+across CPUs. Each CPU's timer interrupt (1 kHz) decrements that CPU's
+slice, and the boot CPU's also wakes sleeping threads whose time has come;
+when a switch is due it only sets a per-CPU flag.
+
+When a thread becomes ready and some CPU is idle, that CPU is "kicked":
+its flag is set and it's sent a reschedule interrupt, which wakes it from
+`hlt`. (Without that, an idle CPU would notice new work at its next timer
+tick, up to a millisecond later.)
+
+One queue under one lock is simple and fair; its cost is contention, which
+per-CPU queues with work stealing would avoid. At eliOS's scale (a few
+CPUs, short critical sections) the simple design measures fine.
+
+**The lock is held across the switch.** The CPU switching away takes the
+scheduler lock, decides, swaps per-thread state, and calls `switch_context`
+*still holding it*; the thread it switches to releases it first thing. If
+the lock were released before the switch, another CPU could see the old
+thread as ready and start running it on its stack before its registers
+were even saved. With the lock held, no CPU can observe a thread in a
+half-switched state.
 
 **Where switches happen.** The flag is checked at the end of interrupt
 handling, after the end-of-interrupt has been sent to the APIC, and before
@@ -646,29 +748,38 @@ holding one.
 
 ### The idle thread
 
-When nothing is ready, a dedicated idle thread runs `sti; hlt` in a loop.
+Each CPU has an idle thread, run when nothing is ready; it executes
+`sti; hlt` in a loop.
 The two instructions execute as a unit (`sti` takes effect after the next
 instruction), so an interrupt can't slip in between them and be missed. If
 an interrupt makes a thread ready, the switch happens on its way out.
 
 ### Sleeping, blocking and wait queues
 
-- `sleep_ms` marks the thread sleeping with a wake-up tick and switches
-  away; the timer wakes it.
+- `sleep_ms` blocks the thread with a wake-up tick; the timer wakes it.
 - **Wait queues** are how threads wait for events (a key press, data in a
-  pipe, a child exiting). `wait_until(condition)` checks the condition with
-  interrupts disabled, and if it isn't met, adds the thread to the queue and
-  blocks, all without re-enabling interrupts. This closes the classic
-  "lost wakeup" race, where the event arrives between checking and going to
-  sleep. Whoever changes the condition calls `wake_all`; woken threads
-  recheck it and go back to sleep if it still doesn't hold. Waits can also
-  have a deadline (for `poll` timeouts).
+  pipe, a child exiting). The danger is the classic "lost wakeup": the
+  event arrives between checking the condition and going to sleep, and the
+  thread sleeps forever. On one CPU, disabling interrupts around the check
+  is enough. With several CPUs it isn't: the event can come from another
+  CPU at any moment. So `wait_until(condition)` adds the thread to the
+  queue *first*, then checks the condition, then blocks. A wakeup that
+  comes after the check finds the thread in the queue. If the thread hasn't
+  actually blocked yet, the wakeup leaves a "wake pending" mark, and the
+  attempt to block returns at once, so the thread rechecks. Whoever changes
+  the condition calls `wake_all`; woken threads recheck it and go back to
+  sleep if it still doesn't hold. Waits can also have a deadline (for
+  `poll` timeouts).
+
+A kernel test bounces a token between two threads 2,000 times through a
+wait queue; a single lost wakeup would hang it.
 
 ### Exiting
 
-A thread can't free its own stack while running on it. Exited threads are
-marked and freed by `reap` at the next scheduling decision, by whichever
-thread runs then.
+A thread can't free its own stack while running on it, and with several
+CPUs, can't be freed while any CPU is still on its stack. Exited threads go
+on a list and are freed after a later switch, once no CPU's current thread
+is one of them.
 
 ## 11. Entering and leaving user mode
 
@@ -1303,7 +1414,8 @@ expose bugs that debug builds hide.
 
 Current limits, roughly in order of how much they'd matter to a user:
 
-- **One CPU.** Other cores are left idle.
+- **Scheduling is simple**: one shared queue, no priorities, and no CPU
+  affinity, so threads move between CPUs freely.
 - **eliOS's own Rust programs are single-threaded**: libeli has no thread
   API yet (C programs have pthreads).
 - **The kernel can fault on user memory another thread unmapped**: system

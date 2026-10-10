@@ -42,6 +42,7 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("touch", "create empty files"),
     ("true", "do nothing, successfully"),
     ("uname", "show system name and version"),
+    ("nproc", "show how many CPUs there are"),
     ("uptime", "show how long the system has been up"),
     ("wc", "count lines, words and bytes"),
     ("yes", "print a line forever"),

@@ -19,36 +19,45 @@ impl WaitQueue {
     }
 
     /// Blocks until `ready` returns a value, and returns it. `ready` runs
-    /// with interrupts disabled, so a wakeup from an interrupt handler can't
-    /// be lost between checking and going to sleep.
+    /// with interrupts disabled.
     pub fn wait_until<T>(&self, ready: impl FnMut() -> Option<T>) -> T {
         self.wait_until_deadline(None, ready).expect("waits without a deadline don't time out")
     }
 
     /// Like [`wait_until`](Self::wait_until), but gives up (returning
     /// `None`) at timer tick `deadline`.
+    ///
+    /// A waiter joins the queue *before* checking the condition. A wakeup
+    /// can then never fall between the check and going to sleep, even from
+    /// another CPU: either the check sees the change, or the wakeup finds
+    /// the waiter queued (and if it hasn't blocked yet, it won't).
     pub fn wait_until_deadline<T>(&self, deadline: Option<u64>, mut ready: impl FnMut() -> Option<T>) -> Option<T> {
         let enabled = arch::interrupts_enabled();
-        loop {
+        let me = super::current();
+        let result = loop {
             arch::disable_interrupts();
-            if let Some(value) = ready() {
-                if enabled {
-                    arch::enable_interrupts();
+            {
+                let mut waiters = self.waiters.lock();
+                if !waiters.contains(&me) {
+                    waiters.push_back(me);
                 }
-                return Some(value);
+            }
+            if let Some(value) = ready() {
+                break Some(value);
             }
             if deadline.is_some_and(|deadline| crate::time::ticks() >= deadline) {
-                if enabled {
-                    arch::enable_interrupts();
-                }
-                return None;
+                break None;
             }
-            self.waiters.lock().push_back(super::current());
             super::block_current(deadline);
             if enabled {
                 arch::enable_interrupts();
             }
+        };
+        self.waiters.lock().retain(|&waiter| waiter != me);
+        if enabled {
+            arch::enable_interrupts();
         }
+        result
     }
 
     /// Wakes every waiting thread. Callable from interrupt handlers.

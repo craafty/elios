@@ -209,12 +209,16 @@ pub fn allocate_kernel_stack(pages: u64) -> KernelStack {
 /// stray pointers into it fault rather than hitting a newer stack.
 pub fn free_kernel_stack(stack: KernelStack) {
     let bottom = stack.top - stack.pages * PAGE_SIZE;
+    // Allocated first: the heap may need the page table lock to grow.
+    let mut freed = alloc::vec::Vec::with_capacity(stack.pages as usize);
     with_kernel_table(|table| {
         for page in 0..stack.pages {
-            let mapping = table.unmap(bottom + page * PAGE_SIZE).expect("kernel stack page not mapped");
-            frames::free(mapping.phys);
+            freed.push(table.unmap(bottom + page * PAGE_SIZE).expect("kernel stack page not mapped").phys);
         }
     });
+    // Other CPUs may still have the pages' translations cached.
+    arch::smp::flush_tlb(bottom, stack.top);
+    freed.into_iter().for_each(frames::free);
 }
 
 /// Frees the memory the bootloader and firmware were using. Call once the

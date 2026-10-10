@@ -27,6 +27,8 @@ const TASK_PRIORITY: usize = 0x80;
 const END_OF_INTERRUPT: usize = 0xB0;
 const SPURIOUS_VECTOR: usize = 0xF0;
 const ERROR_STATUS: usize = 0x280;
+const INTERRUPT_COMMAND_LOW: usize = 0x300;
+const INTERRUPT_COMMAND_HIGH: usize = 0x310;
 const LVT_TIMER: usize = 0x320;
 const LVT_LINT0: usize = 0x350;
 const LVT_LINT1: usize = 0x360;
@@ -43,6 +45,14 @@ const LVT_DELIVERY_NMI: u32 = 0b100 << 8;
 const LVT_ACTIVE_LOW: u32 = 1 << 13;
 /// Timer divide configuration value for dividing the bus clock by 16.
 const TIMER_DIVIDE_BY_16: u32 = 0b0011;
+
+// Interrupt command register bits.
+const DELIVERY_NMI: u32 = 0b100 << 8;
+const DELIVERY_INIT: u32 = 0b101 << 8;
+const DELIVERY_STARTUP: u32 = 0b110 << 8;
+const DELIVERY_PENDING: u32 = 1 << 12;
+const LEVEL_ASSERT: u32 = 1 << 14;
+const ALL_EXCLUDING_SELF: u32 = 0b11 << 18;
 
 /// Virtual address of the local APIC's registers.
 static LOCAL_APIC: AtomicU64 = AtomicU64::new(0);
@@ -67,7 +77,11 @@ pub fn init_local(madt: &Madt) {
         wrmsr(IA32_APIC_BASE, msr | APIC_BASE_ENABLE);
         msr & APIC_BASE_ADDRESS_MASK
     };
-    LOCAL_APIC.store(memory::map_device(base, 0x400, CacheType::Uncached) as u64, Ordering::Relaxed);
+    // Every CPU's APIC is at the same address (each sees its own there), so
+    // the mapping is made once.
+    if LOCAL_APIC.load(Ordering::Relaxed) == 0 {
+        LOCAL_APIC.store(memory::map_device(base, 0x400, CacheType::Uncached) as u64, Ordering::Relaxed);
+    }
 
     // LINT0 carries the legacy PIC's output ("virtual wire" mode); that path
     // is off. The firmware tables say which input is the NMI line.
@@ -91,6 +105,48 @@ pub fn init_local(madt: &Madt) {
 /// This CPU's local APIC ID.
 pub fn local_id() -> u8 {
     (local_read(ID) >> 24) as u8
+}
+
+/// Sends an inter-processor interrupt: `command` goes in the low half of
+/// the interrupt command register, `destination` (an APIC ID) in the high.
+fn send(destination: u32, command: u32) {
+    let enabled = super::interrupts_enabled();
+    super::disable_interrupts();
+    while local_read(INTERRUPT_COMMAND_LOW) & DELIVERY_PENDING != 0 {
+        core::hint::spin_loop();
+    }
+    local_write(INTERRUPT_COMMAND_HIGH, destination << 24);
+    // Writing the low half sends it.
+    local_write(INTERRUPT_COMMAND_LOW, command);
+    if enabled {
+        super::enable_interrupts();
+    }
+}
+
+/// Interrupts the CPU with local APIC ID `destination` on `vector`.
+pub fn send_ipi(destination: u32, vector: u8) {
+    send(destination, u32::from(vector));
+}
+
+/// Interrupts every other CPU on `vector`.
+pub fn broadcast_ipi(vector: u8) {
+    send(0, u32::from(vector) | ALL_EXCLUDING_SELF);
+}
+
+/// Sends every other CPU a non-maskable interrupt.
+pub fn broadcast_nmi() {
+    send(0, DELIVERY_NMI | ALL_EXCLUDING_SELF);
+}
+
+/// The INIT signal: resets a CPU into its wait-for-startup state.
+pub fn send_init(destination: u32) {
+    send(destination, DELIVERY_INIT | LEVEL_ASSERT);
+}
+
+/// The startup signal: the CPU begins executing in real mode at physical
+/// address `page * 4096`.
+pub fn send_startup(destination: u32, page: u8) {
+    send(destination, DELIVERY_STARTUP | u32::from(page));
 }
 
 /// Tells the local APIC the current interrupt has been handled.

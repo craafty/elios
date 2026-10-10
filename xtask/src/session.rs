@@ -45,9 +45,13 @@ pub fn run(mut qemu: Command, steps: &[String], monitor: &Path) -> Result<(), St
         })
     };
     let length = || output.lock().unwrap().len();
+    // The line editor redraws the prompt as each key is typed, so only a
+    // prompt after the newline that Enter produces counts.
     let prompt_since = |start: usize| {
         let data = output.lock().unwrap();
-        data[start.min(data.len())..].windows(PROMPT_END.len()).any(|window| window == PROMPT_END)
+        let typed = &data[start.min(data.len())..];
+        let Some(enter) = typed.iter().position(|&byte| byte == b'\n') else { return false };
+        typed[enter..].windows(PROMPT_END.len()).any(|window| window == PROMPT_END)
     };
     let wait_for_prompt = |start: usize, timeout: Duration| {
         let deadline = Instant::now() + timeout;

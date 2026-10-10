@@ -7,6 +7,7 @@
 
 use alloc::collections::BTreeMap;
 
+use crate::arch::smp;
 use crate::errno::{Errno, Result};
 use crate::memory::paging::{NO_EXECUTE, PageSize, PageTable, USER, WRITABLE};
 use crate::memory::{self, PAGE_SIZE, frames, phys_to_virt};
@@ -100,14 +101,20 @@ impl AddressSpace {
         self.split_at(start);
         self.split_at(end);
         let doomed: alloc::vec::Vec<u64> = self.areas.range(start..end).map(|(&s, _)| s).collect();
+        let mut freed = alloc::vec::Vec::new();
         for area_start in doomed {
             let area = self.areas.remove(&area_start).unwrap();
             for page in (area_start..area.end).step_by(PAGE_SIZE as usize) {
                 if let Some(mapping) = self.table.unmap(page) {
-                    frames::free(mapping.phys);
+                    freed.push(mapping.phys);
                     self.resident_pages -= 1;
                 }
             }
+        }
+        if !freed.is_empty() {
+            // Other threads of the program may be running on other CPUs.
+            smp::flush_tlb(start, end);
+            freed.into_iter().for_each(frames::free);
         }
     }
 
@@ -130,6 +137,7 @@ impl AddressSpace {
                 self.table.set_flags(page, page_flags(protection));
             }
         }
+        smp::flush_tlb(start, end);
         Ok(())
     }
 
@@ -168,10 +176,19 @@ impl AddressSpace {
             area.protection != 0
         };
         let page = address & !(PAGE_SIZE - 1);
-        if !allowed || self.table.translate(page).is_some() {
-            // Not permitted, or the page exists and this was a protection
-            // violation.
+        if !allowed {
             return false;
+        }
+        if let Some(mapping) = self.table.translate(page) {
+            // The page exists. If its entry allows the access, this CPU had
+            // an outdated translation cached (another CPU just mapped or
+            // unprotected it): drop it and retry. Otherwise it's a genuine
+            // protection violation.
+            let permits = (!write || mapping.flags & WRITABLE != 0) && (!execute || mapping.flags & NO_EXECUTE == 0);
+            if permits {
+                crate::arch::flush_tlb_page(page);
+            }
+            return permits;
         }
         self.map_fresh_page(page, area.protection).is_ok()
     }

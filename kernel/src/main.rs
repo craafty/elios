@@ -68,7 +68,11 @@ pub extern "sysv64" fn _start(boot_info: &'static BootInfo) -> ! {
     }
     info!("eliOS {} starting", env!("CARGO_PKG_VERSION"));
 
-    arch::gdt::init();
+    // The boot CPU's per-CPU block; its APIC ID is filled in once the APIC
+    // is up.
+    let cpu = arch::cpu::allocate(0).expect("no per-CPU block for the boot CPU");
+    arch::cpu::install(cpu);
+    arch::gdt::init(cpu);
     arch::interrupts::init();
     arch::syscall::init();
     arch::fpu::init();
@@ -127,8 +131,13 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
         arch::pic::disable();
     }
     arch::apic::init_local(madt);
+    arch::cpu::current().apic_id.store(u32::from(arch::apic::local_id()), core::sync::atomic::Ordering::Relaxed);
     arch::apic::init_io(madt);
     time::init();
+    match arch::smp::start_others(boot_info, madt) {
+        1 => info!("smp: running on 1 CPU"),
+        count => info!("smp: running on {count} CPUs"),
+    }
     match keyboard::init() {
         Ok(()) => info!("keyboard: PS/2 ready"),
         Err(error) => warn!("keyboard: {error}"),
@@ -229,6 +238,7 @@ impl fmt::Display for Size {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     arch::disable_interrupts();
+    arch::smp::stop_others();
     // SAFETY: we never return, so interleaving with an interrupted writer is
     // the worst that can happen.
     let mut port = unsafe { serial::panic_port() };

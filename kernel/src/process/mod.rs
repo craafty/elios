@@ -64,6 +64,9 @@ pub struct Process {
     /// Whether to print every system call (see `strace`). Inherited by
     /// children and kept across `exec`.
     pub trace: AtomicBool,
+    /// The signal the parent gets when this process ends (normally SIGCHLD;
+    /// 0 for none).
+    exit_signal: AtomicU32,
 }
 
 /// Why a process's threads are ending.
@@ -140,6 +143,7 @@ fn create(parent: Pid, group: Option<Pid>, name: &str, cwd: String, files: FileT
         thread_exits: WaitQueue::new(),
         ending: SpinLock::new(None),
         trace: AtomicBool::new(false),
+        exit_signal: AtomicU32::new(signal::SIGCHLD),
     });
     PROCESSES.lock().insert(pid, process.clone());
     process
@@ -298,9 +302,11 @@ pub const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
 pub const CLONE_CHILD_SETTID: u64 = 0x100_0000;
 
 /// The arguments of `clone` and `clone3` that eliOS uses.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct CloneArgs {
     pub flags: u64,
+    /// For a new process: the signal its parent gets when it ends.
+    pub exit_signal: u32,
     /// The new thread's stack pointer, or 0 to keep the caller's.
     pub stack: u64,
     pub parent_tid: u64,
@@ -311,7 +317,8 @@ pub struct CloneArgs {
 /// `fork`: a copy of the running process, continuing from the same system
 /// call but seeing 0 as its result.
 pub fn fork(frame: &InterruptFrame) -> Result<Pid> {
-    clone(frame, &CloneArgs::default())
+    let args = CloneArgs { flags: 0, exit_signal: signal::SIGCHLD, stack: 0, parent_tid: 0, child_tid: 0, tls: 0 };
+    clone(frame, &args)
 }
 
 /// `clone`: a new thread in this process (`CLONE_THREAD`), or a new
@@ -369,6 +376,7 @@ pub fn clone(frame: &InterruptFrame, args: &CloneArgs) -> Result<Pid> {
     *child.executable.lock() = parent.executable.lock().clone();
     *child.arguments.lock() = parent.arguments.lock().clone();
     child.trace.store(parent.trace.load(Ordering::Relaxed), Ordering::Relaxed);
+    child.exit_signal.store(args.exit_signal, Ordering::Relaxed);
     if flags & CLONE_PARENT_SETTID != 0 {
         user::write_value(args.parent_tid, &child.pid)?;
     }
@@ -512,6 +520,12 @@ fn end_process(process: &Process, status: i32) {
     *process.status.lock() = Some(status);
     if process.pid == INIT && INIT_RUNNING.load(Ordering::Relaxed) {
         panic!("init exited (wait status {status:#x})");
+    }
+    let exit_signal = process.exit_signal.load(Ordering::Relaxed);
+    if exit_signal != 0
+        && let Some(parent) = find(process.parent())
+    {
+        send_signal(&parent, exit_signal);
     }
     CHILD_EVENTS.wake_all();
 }
@@ -803,8 +817,7 @@ mod tests {
             shell("true");
             let before = memory::frames::stats().free_bytes;
             assert_eq!(shell("seq 1000 > /dev/null"), exit_status(0));
-            // Reaping the thread (and its kernel stack) happens at a switch.
-            task::yield_now();
+            task::wait_for_reaping();
             let after = memory::frames::stats().free_bytes;
             assert!(after + 16 * memory::PAGE_SIZE >= before, "{} KiB not returned", (before - after) / 1024);
         }

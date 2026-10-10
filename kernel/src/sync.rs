@@ -32,10 +32,23 @@ impl<T> SpinLock<T> {
             // Wait with plain loads so contended cores don't keep stealing
             // the cache line from each other.
             while self.locked.load(Ordering::Relaxed) {
+                // With interrupts off, this CPU can't take the TLB
+                // shootdown interrupt; the lock's holder may be waiting on
+                // exactly that, so serve any request here.
+                arch::smp::serve_shootdown();
                 core::hint::spin_loop();
             }
         }
         SpinLockGuard { lock: self, interrupts_were_enabled }
+    }
+
+    /// Releases a lock whose guard was forgotten: the scheduler holds its
+    /// lock across a thread switch, and the thread switched to releases it.
+    ///
+    /// # Safety
+    /// The lock must be held, and its guard forgotten.
+    pub unsafe fn force_unlock(&self) {
+        self.locked.store(false, Ordering::Release);
     }
 
     /// Access through exclusive ownership needs no locking.

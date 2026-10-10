@@ -14,10 +14,10 @@ pub fn fork(frame: &InterruptFrame) -> Result<u64> {
 }
 
 /// `clone(flags, stack, parent_tid, child_tid, tls)`. The low byte of the
-/// flags is the signal to send the parent on exit, which isn't needed:
-/// SIGCHLD is ignored unless handled, and nothing else is sent.
+/// flags is the signal to send the parent when the child exits.
 pub fn clone(frame: &InterruptFrame, flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) -> Result<u64> {
-    let args = CloneArgs { flags: flags & !0xFF, stack, parent_tid, child_tid, tls };
+    let args =
+        CloneArgs { flags: flags & !0xFF, exit_signal: (flags & 0xFF) as u32, stack, parent_tid, child_tid, tls };
     process::clone(frame, &args).map(u64::from)
 }
 
@@ -28,14 +28,18 @@ pub fn clone3(frame: &InterruptFrame, address: u64, size: u64) -> Result<u64> {
     if size < 64 {
         return Err(Errno::EINVAL);
     }
-    let [flags, _pidfd, child_tid, parent_tid, _exit_signal, stack, stack_size, tls]: [u64; 8] =
+    let [flags, _pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls]: [u64; 8] =
         user::read_value(address)?;
     if flags & CLONE_PIDFD != 0 {
         return Err(Errno::EINVAL);
     }
     // clone3 gives the stack as a range; the stack pointer starts at its top.
     let stack = if stack == 0 { 0 } else { stack + stack_size };
-    process::clone(frame, &CloneArgs { flags, stack, parent_tid, child_tid, tls }).map(u64::from)
+    if exit_signal >= process::SIGNAL_COUNT as u64 {
+        return Err(Errno::EINVAL);
+    }
+    let args = CloneArgs { flags, exit_signal: exit_signal as u32, stack, parent_tid, child_tid, tls };
+    process::clone(frame, &args).map(u64::from)
 }
 
 pub fn exec(frame: &mut InterruptFrame, path: u64, arguments: u64, environment: u64) -> Result<u64> {
@@ -210,6 +214,14 @@ pub fn sigprocmask(how: u64, set: u64, old_set: u64) -> Result<u64> {
     Ok(0)
 }
 
+pub fn sigsuspend(mask: u64, size: u64) -> Result<u64> {
+    if size != 8 {
+        return Err(Errno::EINVAL);
+    }
+    let mask = user::read_value(mask)?;
+    signal::suspend(&process::current_thread(), mask)
+}
+
 pub fn sigreturn(frame: &mut InterruptFrame) -> Result<u64> {
     signal::sigreturn(&process::current_thread(), frame)
 }
@@ -381,12 +393,14 @@ pub fn sched_yield() -> Result<u64> {
     Ok(0)
 }
 
-/// `sched_getaffinity`: the CPUs the process may run on, as a bit mask.
+/// `sched_getaffinity`: the CPUs the process may run on (all of them), as
+/// a bit mask.
 pub fn sched_getaffinity(len: u64, mask: u64) -> Result<u64> {
     if len < 8 {
         return Err(Errno::EINVAL);
     }
-    user::write_value(mask, &1u64)?;
+    let bits = crate::arch::cpu::online().fold(0u64, |bits, cpu| bits | 1 << cpu.index());
+    user::write_value(mask, &bits)?;
     Ok(8)
 }
 

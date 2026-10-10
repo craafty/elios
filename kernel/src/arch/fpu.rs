@@ -19,6 +19,16 @@ static INITIAL_STATE: Once<FpuState> = Once::new();
 /// Enables SSE for user programs and records the clean register state new
 /// programs start with.
 pub fn init() {
+    init_cpu();
+    let mut state = FpuState([0; 512]);
+    save(&mut state);
+    // The default MXCSR: all SIMD exceptions masked, round to nearest.
+    state.0[24..28].copy_from_slice(&0x1F80u32.to_le_bytes());
+    let _ = INITIAL_STATE.set(state);
+}
+
+/// Enables the FPU and SSE on this CPU.
+pub fn init_cpu() {
     // SAFETY: CR0.EM off and CR0.MP on enable the FPU; CR4.OSFXSR and
     // OSXMMEXCPT enable SSE and its exceptions.
     unsafe {
@@ -35,11 +45,6 @@ pub fn init() {
             options(nostack),
         );
     }
-    let mut state = FpuState([0; 512]);
-    save(&mut state);
-    // The default MXCSR: all SIMD exceptions masked, round to nearest.
-    state.0[24..28].copy_from_slice(&0x1F80u32.to_le_bytes());
-    let _ = INITIAL_STATE.set(state);
 }
 
 impl FpuState {

@@ -62,6 +62,7 @@ cargo xtask run --fresh       # start with a fresh disk image
 cargo xtask run --release     # optimized build
 cargo xtask run --gdb         # wait for a debugger on localhost:1234
 cargo xtask run --trace       # log interrupts and CPU resets to target/qemu.log
+cargo xtask run --cpus 8      # more (or fewer) CPUs; the default is 4
 cargo xtask test              # boot a test kernel and run its 75 tests
 cargo xtask image             # a fresh bootable disk image, target/eliOS.img
 ```
@@ -103,9 +104,9 @@ enabled may work too, but QEMU is the one eliOS is tested on.
 - **Memory:** a bitmap frame allocator; kernel page tables with a W^X kernel
   image, guard pages under every kernel stack, and no identity map; a heap
   with size classes. User address spaces are demand-paged.
-- **Processes:** preemptive round-robin scheduling of kernel threads; user
-  processes with `fork`, `exec` (ELF, `#!` scripts, dynamic linkers), `wait`,
-  process groups, and Linux-style signals with handlers.
+- **Processes:** preemptive round-robin scheduling on every CPU; user
+  processes with threads, `fork`, `exec` (ELF, `#!` scripts, dynamic
+  linkers), `wait`, process groups, and Linux-style signals with handlers.
 - **Files:** a VFS over an in-memory file system, a FAT32 driver for disks,
   `/dev`, `/proc`, pipes, and a terminal with line editing and job control.
 - **Devices:** framebuffer console (with ANSI escape codes and its own 8x16
@@ -187,6 +188,7 @@ glyph and rebuild.
 - [x] **Storage:** PCI, AHCI, NVMe, partitions, FAT32, bootable disk images
 - [x] **Hardware support:** ACPI power off and reset, KVM
 - [x] **Threads:** `clone`, futexes, per-thread signals; glibc's pthreads
-- [ ] **Next:** multiple CPUs (SMP), USB (keyboards on machines without
-      PS/2 emulation), networking with an own TCP/IP stack, and a graphical
-      desktop
+- [x] **Multiple CPUs:** startup through a real-mode trampoline, per-CPU
+      data, a scheduler shared by all CPUs, TLB shootdowns
+- [ ] **Next:** USB (keyboards on machines without PS/2 emulation),
+      networking with an own TCP/IP stack, and a graphical desktop

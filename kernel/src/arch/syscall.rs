@@ -8,8 +8,9 @@
 //! way, and all return through `interrupt_return`.
 
 use core::arch::{asm, global_asm};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
+use super::cpu;
 use super::gdt::{self, KERNEL_CODE, USER_CODE, USER_DATA};
 use super::interrupts::InterruptFrame;
 use super::{rdmsr, wrmsr};
@@ -19,24 +20,10 @@ const IA32_STAR: u32 = 0xC000_0081;
 const IA32_LSTAR: u32 = 0xC000_0082;
 const IA32_FMASK: u32 = 0xC000_0084;
 const IA32_FS_BASE: u32 = 0xC000_0100;
-const IA32_GS_BASE: u32 = 0xC000_0101;
-const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
 const EFER_SYSCALL_ENABLE: u64 = 1 << 0;
 /// RFLAGS bits cleared on entry: interrupts, direction, trap, alignment check.
 const SYSCALL_FLAG_MASK: u64 = 0x200 | 0x400 | 0x100 | 0x4_0000;
-
-/// Per-CPU data, reached through GS while in the kernel. The entry code
-/// relies on the field offsets.
-#[repr(C)]
-struct CpuLocal {
-    /// Top of the running thread's kernel stack (offset 0).
-    kernel_stack: AtomicU64,
-    /// The user stack pointer during system call entry (offset 8).
-    user_stack: AtomicU64,
-}
-
-static CPU_LOCAL: CpuLocal = CpuLocal { kernel_stack: AtomicU64::new(0), user_stack: AtomicU64::new(0) };
 
 global_asm!(
     r#"
@@ -85,7 +72,8 @@ unsafe extern "C" {
     fn interrupt_return();
 }
 
-/// Enables the `syscall` instruction and sets up per-CPU data.
+/// Enables the `syscall` instruction on this CPU. The per-CPU block (see
+/// `cpu::install`) holds the stacks the entry code uses.
 pub fn init() {
     // SAFETY: the standard configuration for 64-bit system calls. The
     // selector bases match the GDT layout (see gdt.rs).
@@ -97,17 +85,13 @@ pub fn init() {
         wrmsr(IA32_STAR, star);
         wrmsr(IA32_LSTAR, syscall_entry as *const () as u64);
         wrmsr(IA32_FMASK, SYSCALL_FLAG_MASK);
-        // In the kernel, GS points at the per-CPU block; `swapgs` trades it
-        // for the user's value on the way in and out.
-        wrmsr(IA32_GS_BASE, &raw const CPU_LOCAL as u64);
-        wrmsr(IA32_KERNEL_GS_BASE, 0);
     }
 }
 
 /// Records the stack to use when the current thread enters the kernel from
 /// user mode (by system call or interrupt).
 pub fn set_kernel_stack(top: u64) {
-    CPU_LOCAL.kernel_stack.store(top, Ordering::Relaxed);
+    cpu::current().kernel_stack.store(top, Ordering::Relaxed);
     gdt::set_kernel_stack(top);
 }
 

@@ -14,6 +14,7 @@ use core::ptr;
 
 use super::paging::{GLOBAL, NO_EXECUTE, PageSize, WRITABLE};
 use super::{HEAP_END, HEAP_START, PAGE_SIZE, frames, with_kernel_table};
+use crate::arch::smp;
 use crate::sync::SpinLock;
 
 const MIN_BLOCK: usize = 16;
@@ -183,12 +184,22 @@ impl Heap {
     }
 
     fn free_pages(&mut self, start: u64, pages: u64) {
-        with_kernel_table(|table| {
-            for page in 0..pages {
-                let mapping = table.unmap(start + page * PAGE_SIZE).expect("freeing unmapped heap page");
-                frames::free(mapping.phys);
-            }
-        });
+        // In batches: other CPUs must drop their cached translations before
+        // the frames can be reused, and the heap can't allocate a list.
+        const BATCH: u64 = 64;
+        for first in (0..pages).step_by(BATCH as usize) {
+            let count = (pages - first).min(BATCH);
+            let batch_start = start + first * PAGE_SIZE;
+            let mut freed = [0; BATCH as usize];
+            with_kernel_table(|table| {
+                for (index, frame) in freed[..count as usize].iter_mut().enumerate() {
+                    let page = batch_start + index as u64 * PAGE_SIZE;
+                    *frame = table.unmap(page).expect("freeing unmapped heap page").phys;
+                }
+            });
+            smp::flush_tlb(batch_start, batch_start + count * PAGE_SIZE);
+            freed[..count as usize].iter().for_each(|&frame| frames::free(frame));
+        }
         self.stats.bytes_mapped -= pages * PAGE_SIZE;
         self.release(start, pages);
     }

@@ -57,6 +57,7 @@ pub fn find(name: &str) -> Option<Command> {
         "touch" => touch,
         "true" => |_| 0,
         "uname" => uname,
+        "nproc" => nproc,
         "uptime" => uptime,
         "wc" => wc,
         "yes" => yes,
@@ -764,6 +765,11 @@ fn uptime(_: &[String]) -> i32 {
     0
 }
 
+fn nproc(_arguments: &[String]) -> i32 {
+    println!("{}", system::cpu_count());
+    0
+}
+
 fn uname(arguments: &[String]) -> i32 {
     let (flags, _) = split_flags(arguments);
     let info = system::uname();
@@ -846,7 +852,7 @@ fn fetch(_: &[String]) -> i32 {
             human_size(info.total_memory - info.free_memory),
             human_size(info.total_memory)
         ),
-        format!("\x1b[1;36mCPU\x1b[0m: {}", cpu_name()),
+        format!("\x1b[1;36mCPU\x1b[0m: {} (x{})", cpu_name(), system::cpu_count()),
         format!("\x1b[1;36mTerminal\x1b[0m: {columns}x{rows}"),
     ];
     // Pad the art to a fixed width, counting only visible characters.

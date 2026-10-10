@@ -13,6 +13,18 @@ pub struct Uname {
     pub machine: String,
 }
 
+/// How many CPUs programs can run on.
+pub fn cpu_count() -> usize {
+    let mut mask = [0u64; 16];
+    // SAFETY: the buffer has room for the mask, whose size is passed.
+    let result =
+        unsafe { sys::syscall(sys::SCHED_GETAFFINITY, [0, size_of_val(&mask), mask.as_mut_ptr() as usize, 0, 0, 0]) };
+    if result <= 0 {
+        return 1;
+    }
+    mask.iter().map(|word| word.count_ones() as usize).sum::<usize>().max(1)
+}
+
 pub fn uname() -> Uname {
     let mut buffer = [0u8; 65 * 6];
     // SAFETY: room for a `struct utsname`.

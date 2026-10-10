@@ -29,6 +29,10 @@ pub const PIC_BASE: u8 = 0x20;
 /// Interrupts routed through the I/O APIC start here.
 pub const IRQ_BASE: u8 = 0x30;
 pub const TIMER: u8 = 0xF0;
+/// Sent to a CPU to make it look for a thread to run.
+pub const RESCHEDULE: u8 = 0xF1;
+/// Sent to a CPU to make it flush its TLB (see `smp::flush_tlb`).
+pub const TLB_SHOOTDOWN: u8 = 0xF2;
 pub const APIC_ERROR: u8 = 0xFE;
 pub const SPURIOUS: u8 = 0xFF;
 
@@ -190,6 +194,8 @@ impl IdtEntry {
 }
 
 static IDT: TakeOnce<[IdtEntry; 256]> = TakeOnce::new([IdtEntry::MISSING; 256]);
+/// Where the IDT is, for other CPUs to load it too.
+static IDT_ADDRESS: AtomicU64 = AtomicU64::new(0);
 
 /// Builds and loads the IDT. Exceptions are handled from this point on.
 pub fn init() {
@@ -205,7 +211,14 @@ pub fn init() {
         *entry = IdtEntry::new(stubs + STUB_SIZE * vector as u64, ist);
     }
 
-    let pointer = gdt::DescriptorTablePointer { limit: (size_of_val(idt) - 1) as u16, base: idt.as_ptr() as u64 };
+    IDT_ADDRESS.store(idt.as_ptr() as u64, Ordering::Relaxed);
+    load();
+}
+
+/// Loads the (shared) IDT on this CPU.
+pub fn load() {
+    let base = IDT_ADDRESS.load(Ordering::Relaxed);
+    let pointer = gdt::DescriptorTablePointer { limit: (size_of::<[IdtEntry; 256]>() - 1) as u16, base };
     // SAFETY: the IDT is 'static and every entry points at a valid stub.
     unsafe { asm!("lidt [{}]", in(reg) &raw const pointer, options(nostack, preserves_flags)) };
 }
@@ -227,7 +240,8 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut InterruptFrame) {
     let vector = frame.vector as u8;
     let from_user = frame.cs & 3 == 3;
     if vector < 32 {
-        if from_user {
+        // NMIs and machine checks aren't caused by the code they interrupt.
+        if from_user && vector != NMI && vector != MACHINE_CHECK {
             crate::process::handle_user_exception(frame);
             crate::process::before_return_to_user(frame, None);
         } else {
@@ -272,6 +286,10 @@ pub fn breakpoint_count() -> u64 {
 }
 
 fn handle_exception(frame: &mut InterruptFrame) {
+    if frame.vector == u64::from(NMI) && super::smp::stopping() {
+        // Another CPU panicked and is stopping the rest.
+        super::halt_forever();
+    }
     if frame.vector == u64::from(BREAKPOINT) {
         BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
         debug!("breakpoint at {:#x}", frame.rip);
