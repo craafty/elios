@@ -23,10 +23,36 @@ cargo xtask run               # build and boot in a QEMU window
 cargo xtask run --headless    # serial output only
 cargo xtask run --gdb         # wait for gdb on :1234
 cargo xtask run --trace       # log interrupts/resets to target/qemu.log
+cargo xtask test              # run the kernel's tests inside QEMU
 cargo xtask build --release   # just build
 ```
 
 Kernel and bootloader logs appear on the serial port, which is your terminal.
+The kernel also logs to the screen; `debug!` messages go to serial only.
+
+## Tests
+
+Kernel tests live next to the code they test, inside `#[cfg(test)]` modules:
+
+```rust
+crate::ktest! {
+    fn spinlock_guards_its_value() {
+        let lock = SpinLock::new(5);
+        *lock.lock() += 1;
+        assert_eq!(*lock.lock(), 6);
+    }
+}
+```
+
+`cargo xtask test` builds a test kernel, boots it with eliboot in QEMU, runs
+every registered test and reports the result through QEMU's exit code. A
+failing assertion prints the panic and stops the run.
+
+## The font
+
+The console font is the eliOS 8x16 font, drawn as ASCII art in
+`kernel/font/eli-8x16.txt`. Edit a glyph there and rebuild; `kernel/build.rs`
+turns the file into the kernel's glyph tables.
 
 ## Layout
 
@@ -34,6 +60,7 @@ Kernel and bootloader logs appear on the serial port, which is your terminal.
 |-------------|------------------------------------------------------------------|
 | `boot/`     | **eliboot**, the UEFI bootloader (`x86_64-unknown-uefi`)         |
 | `kernel/`   | The kernel (`x86_64-unknown-none`), linked at `0xFFFFFFFF80000000` |
+| `kernel/font/` | The console font, as editable ASCII art                      |
 | `bootinfo/` | The boot protocol: the contract between eliboot and the kernel   |
 | `xtask/`    | Build tool: compiles everything, lays out the boot volume, runs QEMU |
 
@@ -53,8 +80,8 @@ The exact machine state at kernel entry is documented in `bootinfo/src/lib.rs`.
 
 - [x] **Phase 0: Boot.** Custom UEFI bootloader, ELF loading, paging and the
       handoff, serial output, framebuffer splash
-- [ ] **Phase 1: Output and safety nets.** Custom bitmap font and framebuffer
-      text console, logging, in-QEMU test harness
+- [x] **Phase 1: Output and safety nets.** Custom bitmap font and framebuffer
+      text console with ANSI colors, logging, in-QEMU test harness
 - [ ] **Phase 2: CPU and interrupts.** GDT/TSS, IDT and exception handlers,
       Local APIC + I/O APIC, timer, keyboard
 - [ ] **Phase 3: Memory.** Physical frame allocator, kernel-owned page tables

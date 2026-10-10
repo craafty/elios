@@ -71,8 +71,7 @@ pub fn init() {
     PORT.lock().init();
 }
 
-#[doc(hidden)]
-pub fn _print(args: fmt::Arguments) {
+pub fn write_fmt(args: fmt::Arguments) {
     use fmt::Write as _;
     let _ = PORT.lock().write_fmt(args);
 }
@@ -84,15 +83,4 @@ pub fn _print(args: fmt::Arguments) {
 /// Output may interleave with whoever holds the lock.
 pub unsafe fn panic_port() -> SerialPort {
     SerialPort::new(COM1)
-}
-
-#[macro_export]
-macro_rules! print {
-    ($($arg:tt)*) => { $crate::serial::_print(format_args!($($arg)*)) };
-}
-
-#[macro_export]
-macro_rules! println {
-    () => { $crate::print!("\n") };
-    ($($arg:tt)*) => { $crate::print!("{}\n", format_args!($($arg)*)) };
 }

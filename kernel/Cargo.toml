@@ -3,5 +3,12 @@ name = "elikernel"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "elikernel"
+path = "src/main.rs"
+# `cargo test` builds the kernel with cfg(test) but without Rust's standard
+# test harness, which needs an OS. Our own harness is in src/test.rs.
+harness = false
+
 [dependencies]
 bootinfo = { path = "../bootinfo" }

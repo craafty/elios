@@ -16,6 +16,23 @@ pub unsafe fn inb(port: u16) -> u8 {
     value
 }
 
+/// Physical address of the active top-level page table.
+#[cfg(test)]
+pub fn page_table_root() -> u64 {
+    let cr3: u64;
+    // SAFETY: reading CR3 has no side effects.
+    unsafe { asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags)) };
+    cr3 & 0x000F_FFFF_FFFF_F000
+}
+
+#[cfg(test)]
+pub fn stack_pointer() -> u64 {
+    let rsp: u64;
+    // SAFETY: reading RSP has no side effects.
+    unsafe { asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
+    rsp
+}
+
 pub fn disable_interrupts() {
     // SAFETY: masking interrupts can't violate memory safety.
     unsafe { asm!("cli", options(nomem, nostack)) };

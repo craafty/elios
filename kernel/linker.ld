@@ -25,6 +25,13 @@ SECTIONS
         *(.data.rel.ro .data.rel.ro.*)
     } :rodata
 
+    /* Test cases registered by ktest! (empty outside test builds). */
+    .kernel_tests : ALIGN(8) {
+        __kernel_tests_start = .;
+        KEEP(*(.kernel_tests))
+        __kernel_tests_end = .;
+    } :rodata
+
     .data : ALIGN(4K) {
         *(.data .data.*)
         *(.got .got.*)

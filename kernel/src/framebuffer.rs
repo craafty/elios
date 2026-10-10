@@ -1,11 +1,13 @@
-//! Drawing to the linear framebuffer the bootloader found.
+//! The linear framebuffer the bootloader found.
 
 use bootinfo::PixelFormat;
 
 /// A color as 0xRRGGBB.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color(pub u32);
 
+/// Exclusive access to video memory. Drawing happens elsewhere (see
+/// `console`); this only knows the pixel layout and how to copy rows in.
 pub struct Framebuffer {
     pixels: *mut u32,
     width: usize,
@@ -13,6 +15,10 @@ pub struct Framebuffer {
     stride: usize,
     format: PixelFormat,
 }
+
+// SAFETY: a Framebuffer is the only handle to its memory, so moving it to
+// another CPU is fine.
+unsafe impl Send for Framebuffer {}
 
 impl Framebuffer {
     /// # Safety
@@ -28,6 +34,16 @@ impl Framebuffer {
         }
     }
 
+    /// A framebuffer in ordinary memory, for tests.
+    ///
+    /// # Safety
+    /// `pixels` must be valid for `stride * height` pixels for as long as the
+    /// framebuffer is used.
+    #[cfg(test)]
+    pub unsafe fn from_raw(pixels: *mut u32, width: usize, height: usize, stride: usize, format: PixelFormat) -> Self {
+        Self { pixels, width, height, stride, format }
+    }
+
     pub fn width(&self) -> usize {
         self.width
     }
@@ -36,21 +52,8 @@ impl Framebuffer {
         self.height
     }
 
-    /// Fills a rectangle, clipped to the screen.
-    pub fn fill_rect(&mut self, x: usize, y: usize, width: usize, height: usize, color: Color) {
-        let pixel = self.encode(color);
-        let x_end = (x + width).min(self.width);
-        let y_end = (y + height).min(self.height);
-        for row in y.min(y_end)..y_end {
-            for column in x.min(x_end)..x_end {
-                // SAFETY: clipped to the visible area, which lies inside the
-                // framebuffer. Volatile because this is device memory.
-                unsafe { self.pixels.add(row * self.stride + column).write_volatile(pixel) };
-            }
-        }
-    }
-
-    fn encode(&self, Color(rgb): Color) -> u32 {
+    /// The pixel value that displays as `color`.
+    pub fn encode(&self, Color(rgb): Color) -> u32 {
         match self.format {
             // Bytes B, G, R in memory: exactly 0xRRGGBB as a little-endian u32.
             PixelFormat::Bgr => rgb,
@@ -58,59 +61,21 @@ impl Framebuffer {
             PixelFormat::Absent => 0,
         }
     }
-}
 
-const BACKGROUND_TOP: Color = Color(0x0B1026);
-const BACKGROUND_BOTTOM: Color = Color(0x2A0F3D);
-const LOGO_ELI: Color = Color(0xF2F2F7);
-const LOGO_OS: Color = Color(0x4FD1FF);
-
-/// 5x7 glyphs for the boot logo, one row per byte, leftmost pixel in bit 4.
-const GLYPH_E: [u8; 7] = [0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01110];
-const GLYPH_L: [u8; 7] = [0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110];
-const GLYPH_I: [u8; 7] = [0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110];
-const GLYPH_O: [u8; 7] = [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110];
-const GLYPH_S: [u8; 7] = [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110];
-
-/// Draws the eliOS boot splash: a gradient with the logo in the middle.
-pub fn draw_splash(fb: &mut Framebuffer) {
-    for row in 0..fb.height() {
-        let color = blend(BACKGROUND_TOP, BACKGROUND_BOTTOM, row, fb.height());
-        fb.fill_rect(0, row, fb.width(), 1, color);
+    /// Copies already-encoded pixels into row `y`, starting at the left edge.
+    pub fn write_row(&mut self, y: usize, pixels: &[u32]) {
+        assert!(y < self.height);
+        let len = pixels.len().min(self.width);
+        // SAFETY: row `y` exists and we write at most `width` pixels into it.
+        // Video memory only needs to be written, never read back, so a plain
+        // copy is fine.
+        unsafe { core::ptr::copy_nonoverlapping(pixels.as_ptr(), self.pixels.add(y * self.stride), len) };
     }
 
-    let logo =
-        [(&GLYPH_E, LOGO_ELI), (&GLYPH_L, LOGO_ELI), (&GLYPH_I, LOGO_ELI), (&GLYPH_O, LOGO_OS), (&GLYPH_S, LOGO_OS)];
-    // Each glyph is 5 cells wide plus 1 cell of spacing; aim for the logo to
-    // span about a third of the screen.
-    let logo_cells = logo.len() * 6 - 1;
-    let scale = (fb.width() / 3 / logo_cells).max(1);
-    let left = (fb.width() - logo_cells * scale) / 2;
-    let top = (fb.height() - 7 * scale) / 2;
-
-    for (index, (glyph, color)) in logo.iter().enumerate() {
-        let glyph_left = left + index * 6 * scale;
-        for (row, bits) in glyph.iter().enumerate() {
-            for column in 0..5 {
-                if bits & (0b10000 >> column) != 0 {
-                    fb.fill_rect(glyph_left + column * scale, top + row * scale, scale, scale, *color);
-                }
-            }
-        }
+    #[cfg(test)]
+    pub fn read_pixel(&self, x: usize, y: usize) -> u32 {
+        assert!(x < self.width && y < self.height);
+        // SAFETY: bounds checked above.
+        unsafe { self.pixels.add(y * self.stride + x).read_volatile() }
     }
-
-    // An accent line under the logo.
-    let line_top = top + 9 * scale;
-    fb.fill_rect(left, line_top, logo_cells * scale, (scale / 4).max(1), LOGO_OS);
-}
-
-/// Linear interpolation between two colors, `step` of `steps` of the way.
-fn blend(Color(from): Color, Color(to): Color, step: usize, steps: usize) -> Color {
-    let channel = |shift: u32| {
-        let a = (from >> shift & 0xFF) as usize;
-        let b = (to >> shift & 0xFF) as usize;
-        let value = (a * (steps - step) + b * step) / steps.max(1);
-        (value as u32) << shift
-    };
-    Color(channel(16) | channel(8) | channel(0))
 }
