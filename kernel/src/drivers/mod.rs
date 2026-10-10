@@ -2,6 +2,7 @@
 
 pub mod ahci;
 pub mod block;
+pub mod nvme;
 pub mod pci;
 
 use alloc::sync::Arc;
@@ -27,5 +28,8 @@ pub fn init() -> Vec<Arc<dyn Disk>> {
         );
     }
     info!("pci: {} devices", devices.len());
-    ahci::probe(&devices).into_iter().map(|disk| disk as Arc<dyn Disk>).collect()
+    let mut disks: Vec<Arc<dyn Disk>> = Vec::new();
+    disks.extend(ahci::probe(&devices).into_iter().map(|disk| disk as Arc<dyn Disk>));
+    disks.extend(nvme::probe(&devices).into_iter().map(|disk| disk as Arc<dyn Disk>));
+    disks
 }

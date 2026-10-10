@@ -44,9 +44,10 @@ cargo xtask image --release
 sudo dd if=target/eliOS.img of=/dev/sdX bs=4M conv=fsync   # sdX = the stick
 ```
 
-Real machines vary far more than QEMU; eliOS needs a PS/2 keyboard (or
-firmware that emulates one for USB keyboards) and an AHCI (SATA) controller
-for disk access. It boots and runs from memory without one.
+Real machines vary far more than QEMU. eliOS needs a PS/2 keyboard (or
+firmware that emulates one for USB keyboards, which many do), and reads and
+writes disks through AHCI (SATA) or NVMe controllers; without a supported
+disk it still boots and runs from memory. `poweroff` and `reboot` use ACPI.
 
 eliOS boots to a shell. Type in the QEMU window, or in the terminal you ran
 `cargo xtask run` from: the serial port is a second console. Try `help`,
@@ -169,7 +170,7 @@ The exact machine state at kernel entry is documented in `bootinfo/src/lib.rs`.
       and dynamically linked (via glibc's own ld.so); signal handlers with
       Linux's signal frame, masks, SA_RESTART and alternate stacks; poll and
       select; /proc; strace
-- [x] **Phase 7: Storage.** PCI, an AHCI (SATA) driver, GPT/MBR partitions,
+- [x] **Phase 7: Storage.** PCI, AHCI (SATA) and NVMe drivers, GPT/MBR partitions,
       a FAT32 file system with long names (shared with the image builder),
       the boot disk mounted at /disk, bootable GPT disk images
 - [ ] **Next:** SMP, threads in user programs, networking (own TCP/IP
