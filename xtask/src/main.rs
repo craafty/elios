@@ -24,6 +24,7 @@ options:
   --gdb        wait for a debugger on localhost:1234 (run, test)
   --trace      log interrupts and CPU resets to target/qemu.log (run, test)
   --fresh      start from an empty disk image instead of updating it (run)
+  --no-kvm     emulate the CPU even if hardware virtualization is available
 ";
 
 const BOOTLOADER_TARGET: &str = "x86_64-unknown-uefi";
@@ -58,6 +59,7 @@ struct Options {
     gdb: bool,
     trace: bool,
     fresh: bool,
+    no_kvm: bool,
     qemu_args: Vec<String>,
 }
 
@@ -103,6 +105,7 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options, Stri
             "--gdb" => options.gdb = true,
             "--trace" => options.trace = true,
             "--fresh" => options.fresh = true,
+            "--no-kvm" => options.no_kvm = true,
             "--" => options.qemu_args.extend(args.by_ref()),
             _ => return Err(format!("unknown option `{arg}`\n\n{USAGE}")),
         }
@@ -472,9 +475,17 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
         // controller, as on a real PC.
         .arg("-drive")
         .arg(format!("format=raw,file={}", disk.display()))
-        .args(["-serial", "stdio"])
+        // The serial port is a second console in this terminal. With
+        // signal=off, Ctrl+C goes to eliOS instead of stopping QEMU.
+        .args(["-chardev", "stdio,id=console,signal=off", "-serial", "chardev:console"])
         // A triple fault should stop the machine, not quietly reboot it.
         .arg("-no-reboot");
+    // Hardware virtualization is much faster than emulating the CPU, when
+    // the host allows it.
+    let kvm = fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok();
+    if kvm && !options.no_kvm {
+        qemu.args(["-enable-kvm", "-cpu", "host"]);
+    }
     if options.gdb {
         qemu.args(["-s", "-S"]);
         eprintln!("xtask: waiting for gdb on localhost:1234");
