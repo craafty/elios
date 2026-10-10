@@ -1185,8 +1185,9 @@ lock-free queue) and wakes the keyboard thread, which decodes them (shift,
 caps lock, ctrl, extended keys; US layout) and feeds the terminal. Keeping
 the handler tiny keeps interrupts short.
 
-USB keyboards work only if the firmware emulates a PS/2 keyboard for them,
-which many PCs do and QEMU does.
+Both this and the USB keyboard driver turn keys into `Key` values and hand
+them to `keyboard::send_key`, which sends the terminal the bytes a terminal
+would (`ESC [ A` for the up arrow, and so on).
 
 ### PCI (`drivers/pci.rs`)
 
@@ -1195,6 +1196,59 @@ configuration ports 0xCF8/0xCFC. These must be accessed as whole 32-bit
 values: on many chipsets the neighboring port 0xCF9 is the *reset control
 register*, so byte-wise access could reboot a real machine. (The first
 version did exactly that; it was caught before it ran.)
+
+**Interrupts from PCI devices** use MSI or MSI-X ("message signaled
+interrupts"): the device signals an interrupt by writing a value to an
+address that the local APIC recognizes, and the value is the vector. The
+alternative, the legacy interrupt lines, are wired differently on every
+board, and only ACPI's AML code (which eliOS doesn't interpret) says how.
+MSI is configured in the device's PCI capability list; MSI-X puts the same
+information in a table inside one of the device's memory regions, one
+entry per interrupt. eliOS uses MSI if the device has it, else MSI-X.
+
+### USB (`drivers/usb/`)
+
+USB keyboards are the norm on PCs, and many recent machines no longer
+emulate a PS/2 keyboard for them once an operating system takes over the
+USB controller. So eliOS drives the controller itself.
+
+**xHCI** (`xhci.rs`) is the controller interface on every PC from the last
+decade; it handles USB 1, 2 and 3 devices. The driver and the controller
+share rings of 16-byte entries ("TRBs") in memory: the driver writes
+commands on the command ring and transfers on each endpoint's ring, then
+rings a doorbell register; the controller writes completions and port
+changes on the event ring. Instead of shared indexes, each ring has a
+cycle bit that flips every time it wraps, which is how each side tells
+new entries from stale ones. Setup is: take the controller over from the
+firmware (the "USB legacy support" capability, which also stops the
+firmware's PS/2 emulation), reset it, give it the device context array,
+the command ring and the event ring, and start it.
+
+**Finding devices.** For each connected port: reset it (USB 2 ports; USB 3
+ports enable themselves), ask the controller for a device slot, and
+"address" the device with an input context describing it (its speed, its
+port, and endpoint 0). Then, through *control transfers* on endpoint 0
+(a setup packet, optional data, a status acknowledgment), read the device
+descriptor (its first 8 bytes first: they give endpoint 0's real packet
+size, which can differ on full-speed devices) and the configuration
+descriptor with its interfaces and endpoints. Ports that change later
+(plug and unplug) arrive as events and are handled the same way.
+
+**Keyboards** (`hid.rs`) are driven through the HID *boot protocol*, a
+fixed 8-byte report every USB keyboard supports so that firmware can use
+them without parsing HID report descriptors: a byte of modifier keys and
+up to six keys held down. eliOS selects the boot protocol, configures the
+keyboard's interrupt endpoint, and keeps one transfer queued on it; each
+completed transfer is a report. A key press is a key that's in a report
+but wasn't in the previous one. USB keyboards don't repeat held keys (PS/2
+ones do it themselves), so the driver does: after 500 ms, every 33 ms. It
+also sets the Caps Lock LED.
+
+One kernel thread owns each controller. It sleeps until the controller's
+interrupt (MSI or MSI-X), or until a key is due to repeat; without either
+kind of interrupt, it polls every 10 ms. Boot waits (up to two seconds) for
+the devices present at startup, so the keyboard works by the time the shell
+starts.
 
 ### AHCI (`drivers/ahci.rs`)
 
@@ -1423,7 +1477,8 @@ Current limits, roughly in order of how much they'd matter to a user:
   while another thread's system call is using it makes the kernel fault
   (and panic). Linux avoids this with "exception tables" that turn such
   faults into errors; eliOS will need the same.
-- **USB:** keyboards only through firmware PS/2 emulation; no USB storage.
+- **USB:** keyboards only, and only on the controller's own ports (no hub
+  support yet); no USB storage or mice.
 - **No networking.**
 - **No graphical desktop** (planned, deliberately postponed).
 - **fork copies eagerly**; copy-on-write would make it cheaper.

@@ -4,6 +4,7 @@ pub mod ahci;
 pub mod block;
 pub mod nvme;
 pub mod pci;
+pub mod usb;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -31,5 +32,6 @@ pub fn init() -> Vec<Arc<dyn Disk>> {
     let mut disks: Vec<Arc<dyn Disk>> = Vec::new();
     disks.extend(ahci::probe(&devices).into_iter().map(|disk| disk as Arc<dyn Disk>));
     disks.extend(nvme::probe(&devices).into_iter().map(|disk| disk as Arc<dyn Disk>));
+    usb::probe(&devices);
     disks
 }

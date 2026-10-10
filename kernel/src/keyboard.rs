@@ -3,8 +3,9 @@
 //! The interrupt handler only queues raw scancodes; decoding happens later,
 //! outside interrupt context, through [`Decoder`].
 //!
-//! Many modern machines have no real PS/2 port, and their USB keyboards only
-//! appear here if the firmware emulates PS/2. Real USB support comes later.
+//! Many modern machines have no real PS/2 port; their USB keyboards appear
+//! here if the firmware emulates PS/2, and through the USB driver
+//! (`drivers::usb`) otherwise. Both feed the terminal through [`send_key`].
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -90,36 +91,41 @@ pub fn start_terminal_input() {
     task::spawn("keyboard", || {
         let mut decoder = Decoder::default();
         loop {
-            let Some(key) = decoder.feed(read_scancode()) else { continue };
-            let mut utf8 = [0; 4];
-            let bytes: &[u8] = match key {
-                Key::Char(c) => c.encode_utf8(&mut utf8).as_bytes(),
-                Key::Ctrl(c) => {
-                    utf8[0] = c as u8 - b'a' + 1;
-                    &utf8[..1]
-                }
-                Key::Enter => b"\r",
-                Key::Backspace => b"\x7f",
-                Key::Tab => b"\t",
-                Key::Escape => b"\x1b",
-                Key::Up => b"\x1b[A",
-                Key::Down => b"\x1b[B",
-                Key::Right => b"\x1b[C",
-                Key::Left => b"\x1b[D",
-                Key::Home => b"\x1b[H",
-                Key::End => b"\x1b[F",
-                Key::Delete => b"\x1b[3~",
-                Key::PageUp => b"\x1b[5~",
-                Key::PageDown => b"\x1b[6~",
-                Key::Function(_) => continue,
-            };
-            tty::input(bytes);
+            if let Some(key) = decoder.feed(read_scancode()) {
+                send_key(key);
+            }
         }
     });
 }
 
-/// Makes the controller act as if the keyboard sent `scancode`, interrupt
-/// and all. For testing the whole input path.
+/// Types a key at the terminal, as the bytes a terminal sends for it. Any
+/// keyboard (PS/2 or USB) ends up here.
+pub fn send_key(key: Key) {
+    let mut utf8 = [0; 4];
+    let bytes: &[u8] = match key {
+        Key::Char(c) => c.encode_utf8(&mut utf8).as_bytes(),
+        Key::Ctrl(c) => {
+            utf8[0] = c as u8 - b'a' + 1;
+            &utf8[..1]
+        }
+        Key::Enter => b"\r",
+        Key::Backspace => b"\x7f",
+        Key::Tab => b"\t",
+        Key::Escape => b"\x1b",
+        Key::Up => b"\x1b[A",
+        Key::Down => b"\x1b[B",
+        Key::Right => b"\x1b[C",
+        Key::Left => b"\x1b[D",
+        Key::Home => b"\x1b[H",
+        Key::End => b"\x1b[F",
+        Key::Delete => b"\x1b[3~",
+        Key::PageUp => b"\x1b[5~",
+        Key::PageDown => b"\x1b[6~",
+        Key::Function(_) => return,
+    };
+    tty::input(bytes);
+}
+
 #[cfg(test)]
 pub fn simulate_scancode(scancode: u8) {
     send_command(WRITE_FIRST_PORT_OUTPUT).unwrap();

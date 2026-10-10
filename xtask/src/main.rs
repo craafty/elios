@@ -20,7 +20,8 @@ commands:
   image        build a fresh disk image (for a USB stick or another VM)
   session      boot, type the given steps at the shell, print a transcript
                (steps: `command`, `@raw TEXT`, `@sleep S`, `@key NAME`,
-               `@screenshot FILE.png`; see xtask/src/session.rs)
+               `@screenshot FILE.png`, `@monitor COMMAND`; see
+               xtask/src/session.rs)
 
 options:
   --release    build with optimizations
@@ -497,6 +498,9 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
         // The serial port is a second console in this terminal. With
         // signal=off, Ctrl+C goes to eliOS instead of stopping QEMU.
         .args(["-chardev", "stdio,id=console,signal=off", "-serial", "chardev:console"])
+        // A USB controller with a keyboard. QEMU types into the keyboard
+        // added last, so the window's keystrokes arrive over USB.
+        .args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"])
         // A triple fault should stop the machine, not quietly reboot it.
         .arg("-no-reboot");
     // Hardware virtualization is much faster than emulating the CPU, when

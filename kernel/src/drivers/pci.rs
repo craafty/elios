@@ -8,7 +8,10 @@
 
 use alloc::vec::Vec;
 
+use core::ptr;
+
 use crate::arch::{inl, outl};
+use crate::memory::{self, CacheType};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -72,6 +75,86 @@ impl Device {
     pub fn enable_bus_mastering(&self) {
         let command = self.read(0x04);
         self.write(0x04, command | 0x2 | 0x4);
+    }
+
+    /// The offset of capability `id` in configuration space, if the device
+    /// has it.
+    fn capability(&self, id: u8) -> Option<u8> {
+        // Status bit 4: there's a capability list.
+        if self.read(0x04) >> 16 & 0x10 == 0 {
+            return None;
+        }
+        let mut offset = self.read(0x34) as u8 & !3;
+        // A bound, in case of a looping list.
+        for _ in 0..48 {
+            if offset == 0 {
+                return None;
+            }
+            let header = self.read(offset);
+            if header as u8 == id {
+                return Some(offset);
+            }
+            offset = (header >> 8) as u8 & !3;
+        }
+        None
+    }
+
+    /// Makes the device signal interrupts as messages: a write the local
+    /// APIC of CPU `apic_id` sees as interrupt `vector`. This needs no
+    /// knowledge of how the board wires interrupt lines (which only ACPI's
+    /// AML code describes). Uses MSI, or else MSI-X; returns false if the
+    /// device has neither.
+    pub fn enable_msi(&self, apic_id: u8, vector: u8) -> bool {
+        const MSI: u8 = 0x05;
+        let Some(offset) = self.capability(MSI) else { return self.enable_msi_x(apic_id, vector) };
+        let control = self.read(offset) >> 16;
+        let wide = control & 0x80 != 0;
+        self.write(offset + 4, 0xFEE0_0000 | u32::from(apic_id) << 12);
+        if wide {
+            self.write(offset + 8, 0);
+            self.write(offset + 12, u32::from(vector));
+        } else {
+            self.write(offset + 8, u32::from(vector));
+        }
+        // Enable with one message (multiple-message enable = 0), and turn
+        // off the legacy interrupt line.
+        let header = self.read(offset) & !(0x70 << 16);
+        self.write(offset, header | 1 << 16);
+        let command = self.read(0x04);
+        self.write(0x04, command | 1 << 10);
+        true
+    }
+
+    /// MSI-X: like MSI, but the messages are set in a table in one of the
+    /// device's memory BARs, one entry per interrupt. Only the first entry
+    /// is used; the others stay masked.
+    fn enable_msi_x(&self, apic_id: u8, vector: u8) -> bool {
+        const MSI_X: u8 = 0x11;
+        let Some(offset) = self.capability(MSI_X) else { return false };
+        let control = self.read(offset) >> 16;
+        let entries = u64::from(control & 0x7FF) + 1;
+        let table = self.read(offset + 4);
+        let Some(bar) = self.memory_bar((table & 0x7) as u8) else { return false };
+        let address = bar + u64::from(table & !0x7);
+        let base = memory::map_device(address, entries * 16, CacheType::Uncached);
+        // SAFETY: the table is mapped; each entry is four 32-bit words:
+        // address low, address high, data, and vector control (bit 0 masks).
+        unsafe {
+            let entry = |index: u64, word: u64| base.add((index * 16 + word * 4) as usize).cast::<u32>();
+            for index in 0..entries {
+                ptr::write_volatile(entry(index, 3), 1);
+            }
+            ptr::write_volatile(entry(0, 0), 0xFEE0_0000 | u32::from(apic_id) << 12);
+            ptr::write_volatile(entry(0, 1), 0);
+            ptr::write_volatile(entry(0, 2), u32::from(vector));
+            ptr::write_volatile(entry(0, 3), 0);
+        }
+        // Enable (bit 15), not masked as a whole (bit 14).
+        let header = self.read(offset) & !(1 << 30);
+        self.write(offset, header | 1 << 31);
+        let command = self.read(0x04);
+        self.write(0x04, command | 1 << 10);
+        true
     }
 }
 

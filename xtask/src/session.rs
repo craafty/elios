@@ -9,6 +9,7 @@
 //! - `@sleep SECONDS`
 //! - `@key NAME`: a key on the PS/2 keyboard (QEMU names: `ret`, `f12`, `ctrl-c`...)
 //! - `@screenshot PATH`: saves the screen as a PNG
+//! - `@monitor COMMAND`: any QEMU monitor command (`device_add ...`)
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -71,6 +72,8 @@ pub fn run(mut qemu: Command, steps: &[String], monitor: &Path) -> Result<(), St
             Ok(())
         } else if let Some(key) = step.strip_prefix("@key ") {
             monitor_command(monitor, &format!("sendkey {key}"))
+        } else if let Some(command) = step.strip_prefix("@monitor ") {
+            monitor_command(monitor, command)
         } else if let Some(path) = step.strip_prefix("@screenshot ") {
             monitor_command(monitor, &format!("screendump {path} -f png"))
         } else if let Some(text) = step.strip_prefix("@raw ") {

@@ -77,8 +77,8 @@ cargo xtask image --release
 sudo dd if=target/eliOS.img of=/dev/sdX bs=4M conv=fsync   # sdX = the stick
 ```
 
-Real machines vary far more than QEMU. eliOS needs a PS/2 keyboard, or
-firmware that emulates one for USB keyboards (many do). It reads and writes
+Real machines vary far more than QEMU. Keyboards work over PS/2 or USB
+(plugged into the computer itself; not yet through a hub). It reads and writes
 SATA (AHCI) and NVMe disks; without a supported disk it still runs from
 memory. `poweroff` and `reboot` use ACPI. Other virtual machines with EFI
 enabled may work too, but QEMU is the one eliOS is tested on.
@@ -110,8 +110,9 @@ enabled may work too, but QEMU is the one eliOS is tested on.
 - **Files:** a VFS over an in-memory file system, a FAT32 driver for disks,
   `/dev`, `/proc`, pipes, and a terminal with line editing and job control.
 - **Devices:** framebuffer console (with ANSI escape codes and its own 8x16
-  font), PS/2 keyboard, serial port, Local and I/O APICs, PIT/TSC/APIC
-  timers, CMOS clock, PCI, AHCI and NVMe, ACPI power management.
+  font), PS/2 and USB keyboards (an xHCI driver), serial port, Local and
+  I/O APICs, PIT/TSC/APIC timers, CMOS clock, PCI with MSI/MSI-X, AHCI and
+  NVMe, ACPI power management.
 - **The Linux ABI:** about 100 system calls, with Linux's numbers,
   structures and error codes, plus a few of eliOS's own (process list, kernel
   log, tracing).
@@ -190,5 +191,7 @@ glyph and rebuild.
 - [x] **Threads:** `clone`, futexes, per-thread signals; glibc's pthreads
 - [x] **Multiple CPUs:** startup through a real-mode trampoline, per-CPU
       data, a scheduler shared by all CPUs, TLB shootdowns
-- [ ] **Next:** USB (keyboards on machines without PS/2 emulation),
-      networking with an own TCP/IP stack, and a graphical desktop
+- [x] **USB:** an xHCI host controller driver, HID keyboards, plugging and
+      unplugging
+- [ ] **Next:** networking with an own TCP/IP stack, USB hubs and storage,
+      and a graphical desktop
