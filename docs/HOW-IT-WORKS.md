@@ -1,0 +1,1281 @@
+# How eliOS works
+
+This is the long version: how eliOS gets from the power button to a shell
+prompt, how each part works, and why it was built that way. Where a choice
+was made between alternatives, the alternatives and the reasons are given.
+
+Contents:
+
+1. [Principles](#1-principles)
+2. [The build](#2-the-build)
+3. [Booting: firmware to kernel](#3-booting-firmware-to-kernel)
+4. [Kernel startup, step by step](#4-kernel-startup-step-by-step)
+5. [Output: serial, console, font, log](#5-output-serial-console-font-log)
+6. [The CPU: descriptor tables and interrupts](#6-the-cpu-descriptor-tables-and-interrupts)
+7. [Time](#7-time)
+8. [Memory](#8-memory)
+9. [Locks and other synchronization](#9-locks-and-other-synchronization)
+10. [Threads and the scheduler](#10-threads-and-the-scheduler)
+11. [Entering and leaving user mode](#11-entering-and-leaving-user-mode)
+12. [Processes](#12-processes)
+13. [Signals](#13-signals)
+14. [System calls and Linux compatibility](#14-system-calls-and-linux-compatibility)
+15. [Files](#15-files)
+16. [The terminal](#16-the-terminal)
+17. [Devices and drivers](#17-devices-and-drivers)
+18. [ACPI: tables and power](#18-acpi-tables-and-power)
+19. [Userland](#19-userland)
+20. [Disk images and the build tool](#20-disk-images-and-the-build-tool)
+21. [Testing](#21-testing)
+22. [Limits and what's next](#22-limits-and-whats-next)
+23. [Reference tables](#23-reference-tables)
+
+---
+
+## 1. Principles
+
+Two goals pull in different directions and shape everything:
+
+- **Everything is custom.** No third-party crates: the bootloader, kernel,
+  user runtime and build tool use only Rust's `core` and `alloc` (and `std`
+  on the host). Writing the UEFI bindings, ELF loader, page tables, FAT32
+  driver and so on by hand is the point of the project.
+- **It runs existing software.** A new OS with no programs is a curiosity.
+
+The resolution: **original internals, standard interfaces.** Programs only
+see the system call interface, so eliOS implements Linux's: the same call
+numbers, register conventions, structure layouts and error codes. Everything
+behind that line (how memory is managed, how scheduling works, how files are
+stored) is eliOS's own design. The same thinking applies to formats other
+systems touch: ELF executables, cpio archives, FAT32 and GPT disks are
+standard so eliOS can exchange data with the rest of the world.
+
+Smaller principles that come up repeatedly:
+
+- **Simple first, then measured.** Polling disk drivers, eager `fork`
+  copies, a round-robin scheduler: each is the simplest thing that works
+  correctly, with the faster design noted for later.
+- **Fail loudly and clearly.** Every CPU fault produces a readable report;
+  user faults are explained in the kernel log; the kernel panics rather than
+  limping on in a corrupt state.
+- **Test in the real environment.** Kernel tests run inside eliOS in QEMU,
+  after a full boot, and many run real user programs.
+
+## 2. The build
+
+### Targets
+
+eliOS is four kinds of binary, each needing a different compiler target:
+
+| Binary | Target | Why |
+|---|---|---|
+| eliboot | `x86_64-unknown-uefi` | UEFI applications are PE files with the Microsoft calling convention; this target produces exactly that. |
+| kernel | `x86_64-unknown-none` | Freestanding, no OS, soft-float (no SSE in the kernel, see section 11), no red zone (interrupts would clobber it). |
+| user programs | `x86_64-unknown-linux-none` | "Linux system call ABI, no libc": precisely what eliOS programs are. Being Linux binaries, they also run on Linux. |
+| xtask | the host | The build tool. |
+
+The kernel adds three code generation flags (in `.cargo/config.toml`):
+`relocation-model=static` and `code-model=kernel` because it's linked at one
+fixed address in the top 2 GiB, and `force-frame-pointers=yes` so stack
+traces are possible later.
+
+User programs are built with `+crt-static` and `relocation-model=static`,
+giving plain static executables at fixed addresses (`ET_EXEC`), the simplest
+kind to load. `x86_64-unknown-linux-none` is a tier-3 target with no
+prebuilt standard library, so xtask builds `core` and `alloc` from source
+(`-Zbuild-std`), which needs the `rust-src` component.
+
+### Why nightly
+
+`rust-toolchain.toml` selects nightly. Two things need it: `-Zbuild-std` for
+the user target, and the tier-3 target itself. The kernel itself uses no
+unstable language features; it would build on stable.
+
+### Why xtask
+
+A cargo alias (`cargo xtask ...`) runs a small Rust program that drives the
+build. The alternatives were a Makefile or shell scripts; xtask keeps
+everything in Rust, works anywhere cargo does, and can do real work (writing
+cpio archives, FAT32 file systems and GPT tables) without external tools.
+The workspace's `default-members` is just xtask, so a bare `cargo build`
+doesn't try to build the kernel for the host.
+
+### Profiles
+
+Both profiles use `panic = "abort"`: there's no unwinding in a kernel. The
+release profile keeps debug info (useful with gdb). User programs are always
+built optimized and without debug info, because they go into the initrd
+where size matters: with debug info eliutils was 7 MB, without it 270 KB.
+
+## 3. Booting: firmware to kernel
+
+### Why UEFI, and why our own bootloader
+
+PCs start in one of two ways: legacy BIOS (16-bit real mode, from 1981) or
+UEFI (the modern standard; every PC from the last decade has it, and many
+new ones have dropped BIOS support). UEFI starts us in 64-bit mode with
+paging on, gives us a memory map, a framebuffer and the ACPI tables through
+clean interfaces, and reads FAT file systems for us. There was no reason to
+write 16-bit real-mode code in 2026.
+
+Existing bootloaders (Limine, GRUB) would have worked, but writing our own
+was a stated goal, and a UEFI loader is a manageable amount of code
+(about 1,200 lines).
+
+### UEFI bindings (`boot/src/uefi.rs`)
+
+UEFI is a C interface: tables of function pointers. The bindings declare
+the tables eliboot uses as `#[repr(C)]` structs with `extern "efiapi"`
+function pointers. Functions eliboot never calls are declared as `usize`
+placeholders: they only have to occupy the right slot so later fields land
+at the right offsets. This keeps the bindings short while staying faithful
+to the specification's layouts.
+
+The system table pointer is kept in an `AtomicPtr` rather than a
+`static mut`. After `ExitBootServices` it's set to null, so any later attempt
+to print through the firmware becomes a no-op instead of a jump into memory
+the firmware no longer owns.
+
+Strings for the firmware are UCS-2 with CRLF line endings; the console
+converts in fixed 128-unit chunks so no allocator is needed.
+
+### What eliboot does (`boot/src/main.rs`)
+
+1. **Disables the watchdog.** UEFI reboots the machine if a boot application
+   runs for five minutes, which is easy to hit while debugging.
+2. **Checks for 5-level paging.** If the firmware left it on, our 4-level
+   tables would be meaningless; it refuses rather than crashing.
+3. **Finds the framebuffer** through the Graphics Output Protocol. Only the
+   RGB and BGR 32-bit formats are accepted: bitmask formats are vanishingly
+   rare and "blit-only" modes have no framebuffer at all.
+4. **Finds the ACPI RSDP** in the configuration tables, preferring the ACPI
+   2.0 version (which has the 64-bit XSDT).
+5. **Loads the kernel ELF** from `\EFI\eliOS\kernel.elf` on the same volume
+   eliboot came from (found through the Loaded Image protocol's device
+   handle).
+6. **Loads the initrd** from `\EFI\eliOS\initrd.cpio`, if present. It's
+   optional: without it the kernel still boots, which helps debugging.
+7. **Builds the kernel's initial page tables** (below).
+8. **Allocates the kernel stack** (64 KiB) and the `BootInfo` block.
+9. **Exits boot services** and jumps to the kernel.
+
+### Loading the kernel
+
+eliboot has its own small ELF parser (validated with bounds checks
+throughout; a malformed kernel produces an error, not a crash). For each
+`PT_LOAD` segment it allocates fresh zeroed pages, copies the file contents
+in (the zeroing takes care of `.bss`), and maps the pages at the segment's
+virtual address with exactly its permissions: writable only if the segment
+says so, executable only if the segment says so (W^X).
+
+The kernel's linker script (`kernel/linker.ld`) produces three segments
+(r-x code, r-- read-only data, rw- data) at page-aligned boundaries
+specifically so they can be mapped with different permissions.
+
+### Memory types
+
+Everything eliboot allocates for the kernel uses UEFI memory types from the
+range reserved for OS loaders (0x80000000 and up): kernel, kernel stack,
+page tables, boot info, initrd. When eliboot translates the final memory map
+for the kernel, those regions come out labeled (`MemoryKind::Kernel` and so
+on), so the kernel knows exactly what each region holds and when it can be
+freed. Firmware memory is labeled "bootloader reclaimable".
+
+### The initial page tables
+
+The kernel starts on page tables eliboot builds:
+
+- **An identity map of all RAM** (virtual address = physical address).
+  eliboot is running from identity-mapped memory when it loads CR3, so the
+  instruction after the switch must still be mapped. The kernel removes this
+  map early.
+- **A direct map of all RAM at `0xFFFF_8000_0000_0000`** ("higher-half direct
+  map"), non-executable. The kernel uses it to reach any physical address.
+- **The kernel image at `0xFFFF_FFFF_8000_0000`**, the top 2 GiB, which the
+  `kernel` code model requires.
+
+The maps use 2 MiB pages. 1 GiB pages would be smaller still, but QEMU's
+default CPU model doesn't support them and eliboot shouldn't depend on it.
+
+How much to map: everything up to the end of the highest RAM-like region
+(and the framebuffer), but not MMIO or "reserved" regions. That matters:
+QEMU's memory map includes a reserved hole at 1 TiB, and mapping up to it
+would have cost megabytes of page tables.
+
+The NX bit is only set if the CPU supports it, and `EFER.NXE` is enabled
+just before the switch (setting NX bits without NXE makes them "reserved
+bits", which fault).
+
+### Exiting boot services
+
+The memory map buffer is allocated with room for 128 extra entries, because
+allocations after sizing it (including the buffer itself) can split
+regions. The map is fetched immediately before `ExitBootServices`, with
+nothing in between that could change it. If the call still fails (firmware
+events can allocate), the specification says to fetch the map again and
+retry once; eliboot does.
+
+After that, there's no firmware: no console, no allocator, no way to report
+errors. eliboot disables interrupts, converts the memory map into eliOS's
+format (sorted, adjacent regions of the same kind merged), fills in
+`BootInfo`, and jumps.
+
+### The jump
+
+```
+mov cr3, <page tables>
+mov rsp, <kernel stack top>
+xor ebp, ebp
+push 0
+jmp <kernel entry>
+```
+
+The `push 0` is a fake return address: it makes the stack look as if the
+kernel's entry function was called normally (the System V ABI expects
+`rsp + 8` to be 16-byte aligned at function entry), and the zero terminates
+stack traces. `boot_info` is passed in `rdi`, the first argument register,
+so the kernel's entry point is an ordinary `extern "sysv64" fn(&BootInfo)`.
+
+### The boot protocol (`bootinfo/src/lib.rs`)
+
+`BootInfo` is the contract between eliboot and the kernel: a `#[repr(C)]`
+struct with a magic number and version (so a mismatched kernel and
+bootloader fail clearly), the direct map offset, the page table root, the
+memory map, the framebuffer, the RSDP and the initrd. All pointers in it are
+direct-map addresses, so they stay valid after the kernel drops the identity
+map. The crate's documentation specifies the machine state at entry
+precisely; it's the one place both sides agree on.
+
+## 4. Kernel startup, step by step
+
+`kernel/src/main.rs`. The order is dictated by dependencies:
+
+1. **Record the boot timestamp** (TSC), so uptime counts from here.
+2. **Serial port.** The first output channel, needing nothing else.
+3. **Validate `BootInfo`.**
+4. **GDT, TSS, IDT, `syscall` MSRs, FPU.** From here, CPU exceptions produce
+   reports instead of triple faults (which silently reset the machine).
+5. **ACPI tables.** Must happen while eliboot's identity map is still active:
+   ACPI tables can be anywhere in the low 4 GiB, and the kernel's own direct
+   map only covers RAM. This step can't allocate (there's no heap yet).
+6. **Memory:** the frame allocator, then the kernel's own page tables, then
+   the switch to them.
+7. **Switch to a kernel stack with a guard page** (`switch_stack` into
+   `kernel_main`). The bootloader's stack had no guard.
+8. **Reclaim the bootloader's memory** (now unused: its page tables, its
+   stack, firmware boot services memory).
+9. **Start the scheduler**, turning the running code into the first thread.
+10. **Console** on the framebuffer (needs the heap for its shadow buffer),
+    then replay everything logged so far onto it.
+11. **Interrupt controllers** (legacy PIC off, local APIC, I/O APIC), then
+    **timers**, then the **keyboard**.
+12. **File systems:** unpack the initrd, set up `/dev` and `/proc`, free the
+    initrd's memory.
+13. **Drivers:** PCI scan, AHCI and NVMe, mount the boot disk at `/disk`.
+14. **Serial input and the keyboard thread**, then enable interrupts.
+15. **Start `/sbin/init`** and let the boot thread exit.
+
+In a test build, step 15 is replaced by running the tests.
+
+## 5. Output: serial, console, font, log
+
+### Serial (`serial.rs`)
+
+The 16550 UART on COM1 is the first thing initialized and the last resort
+for debugging: it works without memory management, without interrupts, and
+in headless QEMU it's the terminal. It runs at 115200 baud, 8N1. Output
+converts `\n` to `\r\n`. The panic handler builds a fresh, unlocked handle
+to the port, because the panic may have happened while the normal lock was
+held.
+
+### The framebuffer console (`console.rs`)
+
+Text is drawn by the kernel itself into the UEFI framebuffer, one 8x16 glyph
+per character cell.
+
+**The shadow buffer.** All drawing goes into a copy of the screen in RAM;
+`flush` copies only the changed rows (tracked as a dirty range) to video
+memory. The reason is scrolling: scrolling means moving every pixel up one
+line, which requires *reading* the screen, and video memory is extremely
+slow to read on real hardware (it's mapped uncached or write-combining).
+With the shadow buffer, video memory is only ever written. The shadow buffer
+is allocated on the heap at the exact screen size. (Before the heap existed
+it was a 9 MB static capped at 1920x1200; moving it to the heap was one of
+the first uses of the heap.)
+
+**ANSI escape sequences.** The console interprets the standard terminal
+escape codes: colors (16-color, 256-color mapped to the palette, and 24-bit
+truecolor), cursor movement and positioning, erasing (`J`, `K`), and the
+cursor show/hide sequence. This means kernel log colors work identically on
+screen and over serial, and, more importantly, ordinary terminal programs
+like `vi` and `top` work on the console. Unsupported sequences (including
+escape sequences with intermediate bytes, like `ESC ( B`) are consumed and
+ignored rather than printed; a test caught the case where they weren't.
+
+**Line wrapping** is "deferred", as on real terminals: writing the last
+column leaves the cursor past the end, and the wrap happens on the *next*
+character. Otherwise a full-width line followed by a newline would produce a
+blank line.
+
+**The cursor** is drawn only into video memory, never the shadow buffer, so
+it can't get scrolled or overwritten; the shadow copy of a cell is what
+erases it.
+
+### The font (`kernel/font/eli-8x16.txt`, `kernel/build.rs`)
+
+The font is eliOS's own, drawn as ASCII art (`#` and `.`), 95 printable ASCII
+characters plus a fallback box. The build script parses the file into glyph
+tables at compile time, with line-numbered errors for malformed glyphs. ASCII
+art was chosen so the font can be edited in any text editor and reviewed in
+a diff. Metrics: capitals on rows 3-12, lowercase 6-12, descenders to 14,
+column 7 always empty as letter spacing.
+
+### Logging (`log.rs`)
+
+`info!`, `warn!`, `error!` and `debug!` print timestamped, colored lines.
+Debug messages go to serial only, to keep the screen readable (the boot
+memory map, for instance, is debug output).
+
+Everything printed is also kept in a 64 KiB ring buffer. This solves an
+ordering problem: the console can't exist until the heap does, but the
+kernel logs things before that. When the console starts, it replays the
+buffer, so the screen shows the whole boot. The same buffer backs `dmesg`
+(through an eliOS system call).
+
+## 6. The CPU: descriptor tables and interrupts
+
+### GDT and TSS (`arch/gdt.rs`)
+
+64-bit mode mostly ignores segmentation, but the CPU still requires a GDT
+with code and data descriptors for each privilege level, and a TSS. The
+layout is fixed by `syscall`/`sysret`, which compute the user selectors from
+one base: user data must directly precede user code. So: null, kernel code
+(0x08), kernel data (0x10), user data (0x1B), user code (0x23), TSS (0x28,
+two slots).
+
+The TSS holds the kernel stack pointer the CPU switches to when an interrupt
+arrives in user mode (`rsp0`, updated on every thread switch), and three
+Interrupt Stack Table entries: separate, known-good stacks for double faults,
+NMIs and machine checks. Those exceptions can happen when the current stack
+is unusable, most commonly a kernel stack overflow: the page fault from
+hitting the guard page can't be delivered on the overflowed stack, so the
+CPU raises a double fault, which runs on its own IST stack and produces a
+readable report ("the stack overflowed") instead of a triple fault.
+
+### Interrupt entry (`arch/interrupts.rs`)
+
+All 256 vectors enter through assembly stubs, generated with an assembler
+`.rept` loop. Each stub pushes a zero error code (for vectors where the CPU
+doesn't push one), pushes its vector number, and jumps to common code. The
+stubs are padded to exactly 16 bytes, so stub `n` is at
+`interrupt_stubs + 16n` and no table of addresses is needed. (This was
+checked by disassembling: stubs for vectors above 127 need a longer `push`
+encoding and still fit.)
+
+The common code saves all 15 general-purpose registers. The result on the
+stack is an `InterruptFrame`: the complete register state of the interrupted
+code, in a fixed layout. This one structure is central to the kernel:
+
+- exception reports print it;
+- system calls build the same frame (section 11), so system calls,
+  interrupts and exceptions all describe user state the same way;
+- `fork` copies it; `execve` rewrites it; signal handlers save and restore
+  it;
+- new user threads start by "returning" through a hand-built one.
+
+The `rustc`-provided `extern "x86-interrupt"` ABI would have been an
+alternative, but it gives each handler only the CPU-pushed part of the
+state and requires nightly; the hand-written stubs give the full frame.
+
+Before calling Rust, the entry code clears the direction flag (the ABI
+requires it clear at function entry) and, if the interrupt came from user
+mode (checked from the saved CS), runs `swapgs` (section 11). The frame is
+22 words, which keeps the stack 16-byte aligned for the call.
+
+### Exceptions
+
+Breakpoints (`int3`) are counted and return. Every other exception in
+kernel mode is fatal and produces a report: the exception's name and
+mnemonic, the error code, all registers, and for page faults a decoded
+explanation ("write of 0xdead: page not present") plus a hint from the
+memory manager when the address is recognizable (the null page, a stack
+guard page). Exceptions in user mode become signals (section 13).
+
+### Interrupt controllers (`arch/pic.rs`, `arch/apic.rs`)
+
+**The legacy 8259 PICs** are reprogrammed so their vectors don't collide
+with CPU exceptions (by default they do), then fully masked. Spurious
+interrupts can still arrive on their vectors, so those vectors are
+recognized and ignored.
+
+**The local APIC** (one per CPU) delivers interrupts and has a timer. It's
+used in xAPIC mode (memory-mapped registers), which every x86_64 CPU and
+every hypervisor supports; x2APIC (MSR-based) would be needed beyond 255
+CPUs. Setup: LINT0 (the legacy PIC's "virtual wire") masked; LINT1 set as
+the NMI input if the MADT says so; an error vector; the spurious vector
+(0xFF) with the APIC enabled.
+
+**The I/O APIC** routes device interrupt lines to vectors. All its inputs
+start masked. Legacy ISA interrupts (keyboard IRQ1, serial IRQ4) aren't
+always wired to the input with the same number: the MADT's interrupt source
+overrides say where each one really goes and with what polarity and trigger
+mode. `route_isa_irq` applies them.
+
+### Vector assignments
+
+| Vectors | Use |
+|---|---|
+| 0-31 | CPU exceptions |
+| 0x20-0x2F | the masked legacy PICs (spurious only) |
+| 0x30 + IRQ | I/O APIC interrupts (keyboard 0x31, serial 0x34) |
+| 0xF0 | local APIC timer |
+| 0xFE | local APIC error |
+| 0xFF | spurious |
+
+### Dispatch
+
+`interrupt_dispatch` sends exceptions to their handlers and other vectors
+to registered handler functions (stored as addresses in atomics, so
+registration needs no lock). After a device interrupt it sends the APIC its
+end-of-interrupt, *then* gives the scheduler a chance to switch threads
+(section 10), and if returning to user mode, acts on pending signals.
+
+## 7. Time
+
+### Calibration (`time.rs`)
+
+The kernel needs two clocks: the TSC (a per-CPU counter that's cheap to
+read, for timestamps and uptime) and the local APIC timer (for periodic
+interrupts). Neither runs at a frequency known in advance. Both are measured
+against the PIT, the ancient 8254 timer whose input clock is fixed at
+1.193182 MHz.
+
+PIT channel 2 can be used without interrupts: its gate and output are
+visible in I/O port 0x61. The kernel programs it for about 50 ms (one-shot),
+starts the APIC timer counting down from its maximum, reads the TSC, waits
+for the PIT's output to go high, and reads both again. The differences give
+both frequencies. 50 ms is long enough for good precision and short enough
+not to slow the boot noticeably.
+
+The APIC timer then fires every millisecond (1 kHz): the scheduler's tick.
+Uptime comes from the TSC, with nanosecond resolution.
+
+The TSC on older CPUs (and in QEMU's default CPU model) isn't "invariant":
+it can change speed with power states. The kernel warns but uses it anyway;
+in QEMU it's stable.
+
+### Wall-clock time (`rtc.rs`)
+
+The CMOS real-time clock is read once at boot (twice in a row until two
+reads agree, so a read can't straddle an update; BCD and 12-hour formats are
+handled). Wall-clock time is that plus uptime. The clock is assumed to hold
+UTC, as on most non-Windows systems.
+
+## 8. Memory
+
+### Physical frames (`memory/frames.rs`)
+
+One bit per 4 KiB frame of physical memory; the bitmap lives at the start of
+the first free region big enough to hold it. The alternatives:
+
+- a free list (each free frame stores a pointer to the next) is O(1) but
+  can't find physically contiguous runs, which device drivers need for DMA;
+- a buddy allocator is the classic answer to both, but is considerably more
+  code.
+
+The bitmap supports both single frames and aligned contiguous runs.
+Single-frame allocation is "next fit": it continues from where the last one
+succeeded, so it usually finds a free frame in the first 64-bit word
+checked. Freeing checks the bit and panics on a double free, which turns a
+whole class of memory corruption bugs into immediate, explained failures.
+
+Memory below 1 MiB is never handed out: starting other CPUs needs a page
+there (they start in 16-bit mode), and firmware leftovers like to live
+there.
+
+### The kernel's page tables (`memory/mod.rs`, `memory/paging.rs`)
+
+Early in boot the kernel builds its own page tables and switches to them.
+Why not keep eliboot's? Because they contain the identity map, which makes
+null pointers and other low addresses silently valid; and because the kernel
+needs to know and control everything mapped.
+
+The new tables have:
+
+- **The kernel image**, section by section, with permissions from the linker
+  script's boundaries: code read-only and executable; read-only data
+  non-executable; data writable and non-executable. All marked *global*, so
+  they survive address space switches in the TLB.
+- **The direct map** at the same address eliboot used (so pointers made
+  before the switch, like `BootInfo`, stay valid), but now covering only RAM
+  (plus the first megabyte, where firmware tables can hide). Device memory is
+  deliberately absent: it gets mapped individually with the right caching.
+- **Nothing at all in the lower half.** Null pointer dereferences fault.
+
+`map_range` uses the largest pages each piece's alignment allows (1 GiB if
+the CPU supports it, else 2 MiB, else 4 KiB), which keeps the direct map to
+a handful of page table pages.
+
+**Pre-created top-level entries.** All 256 top-level (PML4) entries for the
+kernel half are created at boot, even though most of the regions are empty.
+Every user address space copies these 256 entries. If a later kernel mapping
+needed a *new* top-level entry, existing address spaces wouldn't see it; with
+all of them created up front, every kernel mapping made at any time is
+visible in every address space automatically. Cost: 256 pages (1 MiB).
+
+**Kernel address space layout:**
+
+| Start | Region |
+|---|---|
+| `0xFFFF_8000_0000_0000` | direct map of RAM |
+| `0xFFFF_C000_0000_0000` | kernel heap |
+| `0xFFFF_D000_0000_0000` | device memory (framebuffer, registers) |
+| `0xFFFF_E000_0000_0000` | kernel stacks, each with a guard page |
+| `0xFFFF_FFFF_8000_0000` | the kernel image |
+
+Each region is a whole 512 GiB top-level entry, and the heap, device and
+stack regions are bump-allocated: simple, and with 512 GiB each, exhaustion
+isn't a practical concern.
+
+### Device memory and caching
+
+`map_device(phys, len, cache)` maps registers and framebuffers into the
+device region. Caching matters: registers must be uncached (every access
+must reach the device), and framebuffers should be write-combining (writes
+are batched into bursts, which on real GPUs makes drawing several times
+faster). x86 selects a memory type through the Page Attribute Table; at boot
+the kernel reprograms PAT entry 1 from write-through to write-combining, so
+a page table entry with only the PWT bit set means write-combining.
+
+### Kernel stacks and guard pages
+
+Each kernel stack is allocated with one unmapped page below it. Overflowing
+the stack touches the guard page and faults, instead of silently overwriting
+whatever happened to be below. The boot stack (from eliboot) had no guard,
+so the kernel switches to a guarded stack as soon as its page tables are up.
+
+### Reclaiming boot memory
+
+Once the kernel runs on its own page tables and stack, eliboot's page
+tables, eliboot's stack and the firmware's boot-time memory are unused. The
+kernel hands those regions to the frame allocator: in QEMU about 48 MB, a
+fifth of the 256 MB machine. The initrd's memory is likewise freed after
+it's unpacked. ACPI regions are kept: the tables are needed later (power
+off reads them).
+
+### The heap (`memory/heap.rs`)
+
+`alloc` (and so `Vec`, `Box`, `String`, `BTreeMap`) needs a global
+allocator. The design:
+
+- **Small allocations (up to 2 KiB)** come from power-of-two size classes:
+  16, 32, ..., 2048 bytes. Each class has a free list threaded through the
+  free blocks themselves; an empty class takes a fresh 4 KiB page and splits
+  it. Blocks are aligned to their size, which covers any alignment up to
+  that size.
+- **Large allocations** get whole pages in the heap region, each backed by
+  its own physical frame (so they needn't be physically contiguous), and are
+  unmapped and returned to the frame allocator when freed. The virtual
+  ranges are reused first-fit from a list of freed ranges, merged with
+  their neighbors.
+
+The trade-off: small-block pages are never returned to the system (blocks
+are only reused), in exchange for a very simple, fast design. Large blocks,
+where returning memory matters, are returned immediately.
+
+## 9. Locks and other synchronization
+
+`sync.rs`.
+
+- **`SpinLock`** disables interrupts while held, and restores the previous
+  state when released. Without this, an interrupt handler that takes a lock
+  the interrupted code holds would spin forever on a single CPU. Making
+  *every* spinlock interrupt-safe removes that class of deadlock entirely.
+  The rule that follows: never block while holding a spinlock.
+- **`Mutex`** puts waiting threads to sleep on a wait queue, with interrupts
+  left on. It's for slow operations, like disk I/O, where holding interrupts
+  off for milliseconds would delay the timer.
+- **`Once`** holds a value set once at runtime and read forever after (the
+  parsed ACPI tables, for instance).
+- **`TakeOnce`** hands out a `&'static mut` to a static exactly once, which
+  gives safe access to static storage (the GDT, IDT, TSS) without
+  `static mut`.
+- **`ByteQueue`** is a lock-free single-producer single-consumer ring of
+  bytes, for interrupt handlers handing data to threads (keyboard
+  scancodes).
+
+## 10. Threads and the scheduler
+
+`task/mod.rs`, `task/wait.rs`.
+
+### Context switching
+
+Each thread has its own kernel stack. `switch_context(save, load)` (a few
+lines of assembly) pushes the callee-saved registers (rbx, rbp, r12-r15),
+stores the stack pointer, loads the other thread's, pops its registers and
+returns. That's the whole switch: everything else a thread was doing,
+including an interrupt it was in the middle of handling, is already on its
+stack.
+
+A new thread gets a hand-made stack that looks as if `switch_context` had
+been called, with the "return address" pointing at a trampoline. The
+trampoline takes the thread's closure (from a register) and calls
+`thread_start`, which enables interrupts, runs the closure and exits the
+thread. The return address slot is placed so the stack ends up 16-byte
+aligned at the `call`, as the ABI requires.
+
+Beyond the stack, a switch also swaps the per-thread state user programs
+can see: FPU/SSE registers (`fxsave`/`fxrstor`), the FS base (user
+thread-local storage), CR3 (the address space, only if it differs) and the
+kernel stack the CPU uses on entry from user mode.
+
+### Scheduling policy
+
+Round-robin with 10 ms time slices: the simplest fair policy. The timer
+interrupt (1 kHz) decrements the current slice and wakes sleeping threads
+whose time has come; when a switch is due it only sets a flag.
+
+**Where switches happen.** The flag is checked at the end of interrupt
+handling, after the end-of-interrupt has been sent to the APIC, and before
+returning to user mode. Switching from inside a handler before the EOI
+would leave the APIC thinking the interrupt was still in service, blocking
+other interrupts of equal or lower priority until this thread ran again.
+
+Because spinlocks disable interrupts, a thread can never be preempted while
+holding one.
+
+### The idle thread
+
+When nothing is ready, a dedicated idle thread runs `sti; hlt` in a loop.
+The two instructions execute as a unit (`sti` takes effect after the next
+instruction), so an interrupt can't slip in between them and be missed. If
+an interrupt makes a thread ready, the switch happens on its way out.
+
+### Sleeping, blocking and wait queues
+
+- `sleep_ms` marks the thread sleeping with a wake-up tick and switches
+  away; the timer wakes it.
+- **Wait queues** are how threads wait for events (a key press, data in a
+  pipe, a child exiting). `wait_until(condition)` checks the condition with
+  interrupts disabled, and if it isn't met, adds the thread to the queue and
+  blocks, all without re-enabling interrupts. This closes the classic
+  "lost wakeup" race, where the event arrives between checking and going to
+  sleep. Whoever changes the condition calls `wake_all`; woken threads
+  recheck it and go back to sleep if it still doesn't hold. Waits can also
+  have a deadline (for `poll` timeouts).
+
+### Exiting
+
+A thread can't free its own stack while running on it. Exited threads are
+marked and freed by `reap` at the next scheduling decision, by whichever
+thread runs then.
+
+## 11. Entering and leaving user mode
+
+`arch/syscall.rs`, `arch/fpu.rs`.
+
+### System call entry
+
+User programs enter the kernel with the `syscall` instruction. It jumps to
+the address in an MSR, switches to ring 0, saves the return address and
+flags in rcx and r11, and *does not switch stacks*. So the entry code must
+find the kernel stack without a free register, using `swapgs`: GS normally
+points at a per-CPU block in the kernel; `swapgs` exchanges it with the
+user's GS value. The entry code then:
+
+1. `swapgs`, save the user stack pointer in the per-CPU block, load the
+   current thread's kernel stack from it;
+2. push exactly what an interrupt from user mode would have pushed (user
+   SS, RSP, RFLAGS, CS, RIP), a zero error code and a vector of -1 (meaning
+   "system call");
+3. save all registers into an `InterruptFrame`;
+4. call `syscall_dispatch`, which enables interrupts (system calls are
+   preemptible), runs the call and stores the result in the frame's rax;
+5. leave through the same `interrupt_return` code interrupts use.
+
+Building the same frame as interrupts means every user transition is
+described one way, and returning through `iretq` (rather than `sysret`)
+handles every case, including `execve` changing every register, and avoids
+`sysret`'s well-known pitfalls with non-canonical return addresses. `sysret`
+is faster and could be added as a fast path later.
+
+`interrupt_return` checks the saved CS: if going back to user mode it runs
+`swapgs` again just before `iretq`.
+
+### Entering user mode the first time
+
+A new user thread starts with a hand-built `InterruptFrame` (user code and
+stack selectors, entry point, stack pointer, interrupts enabled) and jumps
+into `interrupt_return` with the stack pointer at it.
+
+### FPU and SSE
+
+The kernel is compiled without floating point (soft-float), so FPU and SSE
+registers only ever hold user values. That allows a simple scheme: save and
+restore them (`fxsave`/`fxrstor`, 512 bytes) on every thread switch. The
+"lazy" alternative (trap on first use) saves time but adds complexity, and
+switches are infrequent enough not to matter.
+
+Only the legacy FXSAVE state is managed; XSAVE (for AVX registers) isn't
+enabled. That's deliberate: with `CR4.OSXSAVE` off, CPUID tells programs AVX
+isn't usable, so glibc and others won't use AVX registers that eliOS
+wouldn't save.
+
+New programs start with a clean FPU state (captured at boot after `fninit`,
+with the standard MXCSR value).
+
+## 12. Processes
+
+`process/`.
+
+A process is: an address space, a file descriptor table, a working
+directory, signal state, a process group, and (for now) one thread.
+
+### Address spaces (`process/address_space.rs`)
+
+An address space is a set of **areas** (ranges with access rights, kept in
+a `BTreeMap`) plus the page tables. Pages are allocated on first touch: a
+page fault inside an area maps a fresh zeroed page; outside any area (or
+violating its rights) it's a segmentation fault. This "demand paging" means
+reserving memory is free: an 8 MiB stack area costs nothing until used, and
+programs can `mmap` large regions they only partly touch.
+
+The top 256 page table entries are copied from the kernel's, so the kernel
+is mapped (supervisor-only) in every address space, and system calls don't
+need to switch page tables.
+
+### The kernel touching user memory (`process/user.rs`)
+
+System calls receive user pointers. Before touching user memory, the kernel
+checks the whole range lies in areas with the needed rights and maps any
+untouched pages (`prepare_access`). After that the access can't fault, and
+the kernel reads or writes through the user address directly (the process's
+address space is the active one).
+
+The alternative, used by Linux, is to let the access fault and have an
+"exception table" turn faults at known instructions into `EFAULT` errors.
+That's faster (no up-front walk) but needs careful compiler cooperation;
+the check-first approach is simple and safe for now.
+
+### Loading programs (`process/elf.rs`)
+
+The ELF loader accepts static executables (`ET_EXEC`), position-independent
+ones (`ET_DYN`, loaded at a fixed base) and dynamically linked ones (those
+with a `PT_INTERP` naming a dynamic linker). For each `PT_LOAD` segment it
+creates an area with the segment's rights and copies the file data in.
+
+For dynamically linked programs it also loads the interpreter (glibc's
+`ld-linux-x86-64.so.2`) at a fixed address above where `mmap` places things,
+and starts *it* instead of the program. The interpreter finds the program
+through the auxiliary vector, loads the shared libraries with ordinary
+`open`/`mmap`/`mprotect` system calls, applies relocations and jumps to the
+program. eliOS needed nothing else to support dynamic linking: the
+complicated part is entirely in glibc, which is how Linux does it too.
+
+`#!` scripts run their interpreter with the script as an argument, like
+Linux.
+
+### The initial stack
+
+Linux programs expect a precise stack layout at entry, specified by the
+System V ABI: `argc`; the `argv` pointers and a null; the `envp` pointers and
+a null; the auxiliary vector (key/value pairs); then the strings. The
+auxiliary vector tells the C library where the program headers are (`AT_PHDR`,
+which glibc needs to set up thread-local storage), the page size, the entry
+point, where the interpreter was loaded (`AT_BASE`), 16 random bytes
+(`AT_RANDOM`, for stack protectors and pointer mangling), CPU capabilities and
+more. Getting this exactly right is what lets unmodified glibc programs
+start.
+
+### fork, exec, exit, wait
+
+- **`fork`** copies the address space page by page (eager copying),
+  duplicates the file table (sharing the open files, so the position is
+  shared as on Linux), copies the signal state, and starts a thread whose
+  frame is the parent's with rax = 0. Copy-on-write would avoid copying
+  pages that are never written (most of them, before an `exec`); it's a
+  known future optimization. eliOS's own programs are small enough that the
+  copy is quick.
+- **`execve`** builds the complete new address space first. Only when that
+  succeeded does it discard the old one, so a failed `exec` leaves the
+  process intact, as the API requires. It then closes close-on-exec files,
+  resets handled signals to default, and rewrites the system call's frame so
+  "returning" from `execve` starts the new program.
+- **`exit`** closes files, frees the address space (after switching to the
+  kernel's page tables: it can't free the tables it's running on), gives
+  children to init, records the status and wakes waiting parents. The
+  process stays as a "zombie" until its parent collects it.
+- **`wait4`** finds a matching zombie child (by pid, any child, or process
+  group, as Linux defines) and removes it, or sleeps until one appears.
+
+Wait statuses use Linux's encoding: exit code in bits 8-15, or the signal
+number in the low 7 bits.
+
+### Process groups
+
+Each pipeline the shell runs is a process group, and the terminal knows
+which group is in the foreground. Ctrl+C sends SIGINT to that group: the
+running program is interrupted, the shell (in its own group) isn't.
+
+### init
+
+Process 1 is special: orphans are given to it, and it must never exit (the
+kernel panics if it does, because nothing could ever reap orphans again).
+
+## 13. Signals
+
+`process/signal.rs`.
+
+Each process has a pending set, a blocked mask, a `sigaction` per signal,
+and an optional alternate stack. Signal sets use Linux's numbering, where
+signal *n* is bit *n - 1* (the obvious `1 << n` overflows for signal 64, a
+bug that was found by `yes | head`'s SIGPIPE).
+
+**Sending** marks the signal pending and, if it isn't ignored or blocked,
+interrupts the target thread if it's sleeping or blocked. Blocking system
+calls check for pending signals in their wait conditions and return `EINTR`.
+
+**Delivery** happens just before returning to user mode. A signal with the
+default action either does nothing (SIGCHLD, SIGWINCH, ...) or ends the
+process. A signal with a handler gets a **signal frame**:
+
+1. The FPU state is saved on the user stack (64-byte aligned).
+2. An `rt_sigframe` is built below it, laid out exactly as Linux's: the
+   return address (the C library's "restorer"), a `ucontext` with the saved
+   registers, the old signal mask and a pointer to the FPU state, and a
+   `siginfo`.
+3. The frame's registers are changed to enter the handler with the signal
+   number, the siginfo and the ucontext as arguments.
+
+The handler returns into the restorer, which calls `rt_sigreturn`; the
+kernel reloads all registers, the mask and the FPU state from the frame.
+Because the layout is Linux's, glibc's restorer, `siginfo` handling and
+`siglongjmp` all work unmodified. Restored flags are sanitized (only bits a
+program may change), and the restored MXCSR has its reserved bits cleared,
+since a corrupt value would make `fxrstor` fault inside the kernel.
+
+`SA_RESTART`: if a handler interrupted a system call that returned `EINTR`,
+the frame is rewound to re-execute the `syscall` instruction (2 bytes) with
+the original call number, so the call transparently restarts after the
+handler.
+
+**CPU faults** in user code become signals: page faults outside any area
+and protection faults become SIGSEGV, invalid opcodes SIGILL, division by
+zero SIGFPE. If the program handles the signal, the handler runs (that's how
+`sigtest` recovers from a null pointer write with `siglongjmp`); otherwise
+the process ends and the kernel logs why.
+
+## 14. System calls and Linux compatibility
+
+`syscall/`.
+
+### The ABI
+
+Linux x86_64's convention: call number in rax; arguments in rdi, rsi, rdx,
+r10, r8, r9; result in rax, with errors as negated error numbers. eliOS uses
+the same numbers for the same calls, and the same structure layouts (`stat`,
+`termios`, `sigaction`, `dirent64`, `pollfd`, `utsname`, `sysinfo`, ...). About
+100 calls are implemented. eliOS's own calls (process list, kernel log,
+tracing) are numbered from 0x1000, far from Linux's range.
+
+`uname` reports the system as "eliOS", but with release "6.8.0-eliOS":
+programs that check for a minimum kernel version compare the release
+number, and eliOS supports what they'd check for.
+
+### Details that matter
+
+These were all found by running real programs:
+
+- **Integer arguments are 32-bit.** File descriptors, directory fds, pids and
+  flags are C `int`s; the upper half of the register can be garbage. glibc
+  passes `AT_FDCWD` (-100) as `0xFFFFFF9C`, which a 64-bit comparison
+  missed. eliOS now truncates these as Linux does.
+- **`isatty` uses `TCGETS2`**, the newer terminal query with baud rates, in
+  current glibc. Without it glibc decides stdout isn't a terminal and fully
+  buffers it, so output appears out of order.
+- **`fstat` is often `newfstatat(fd, "", AT_EMPTY_PATH)`.**
+- **Thread-local storage** needs `arch_prctl(ARCH_SET_FS)`, and the FS base
+  must be saved and restored per thread and inherited by `fork`.
+- BusyBox needed `prctl(PR_SET_NAME)`, `statfs` and `sendfile`.
+
+### Tracing
+
+`strace <program>` (in eliutils) turns on a per-process tracing flag (an
+eliOS system call) and runs the program; the kernel prints every system call
+with its first three arguments and result (with error names). The flag is
+inherited by children and kept across `exec`. Unimplemented calls are also
+logged by name at debug level. These two tools are how every compatibility
+gap above was found.
+
+## 15. Files
+
+`fs/`.
+
+### The VFS
+
+Everything that can be opened is an `Inode`: a trait with methods for
+reading, writing, directory lookups, creating, linking, renaming, ioctl,
+poll readiness and more. Every method has a default that refuses the
+operation, so each kind of inode implements only what makes sense for it.
+Implementations: the in-memory file system, FAT files and directories,
+devices, pipes, the terminal, and `/proc`'s generated files.
+
+There's no mount table: mounting means linking another file system's root
+into a directory (`/proc`, `/disk`). `..` is resolved lexically (by
+normalizing the path string), which avoids needing parent pointers.
+
+**Path resolution** walks one component at a time and follows symbolic
+links (relative to the link's directory, up to 8 deep, then `ELOOP`).
+
+**Open files and descriptors** follow POSIX: an `OpenFile` is an inode plus
+a position and flags; descriptors point to open files; `dup` and `fork`
+share the open file (so the position is shared); `exec` closes descriptors
+marked close-on-exec. The position lock is never held across a read, since
+reads can block (a pipe, the terminal) and a spinlock must never be held
+while sleeping.
+
+**Renaming** is an inode method with a default (link under the new name,
+unlink the old) and a FAT override. Each inode reports which file system it
+belongs to, and renames across file systems fail with `EXDEV`, as on Linux;
+`mv` then falls back to copy-and-delete.
+
+### The in-memory file system and the initrd
+
+The root file system is in memory (`ramfs.rs`): files are byte vectors and
+directories are `BTreeMap`s. It's filled at boot from the initrd, a **cpio
+archive** in the "newc" format, the same format Linux uses for its
+initramfs. newc is simple (ASCII hex headers, 4-byte alignment) and standard
+(any `cpio` tool can inspect it). xtask writes it with its own code.
+
+eliutils is one binary; `/bin` holds a symbolic link per command, which is
+why symlinks were implemented early.
+
+### /dev and /proc
+
+`/dev` has `null`, `zero`, `random`, `urandom`, `console` and `tty`.
+
+`/proc` follows Linux's layout because programs read it: `meminfo`,
+`uptime`, `cpuinfo`, `stat`, `mounts`, `version`, `loadavg`, and per
+process `exe`, `cwd`, `cmdline`, `status`, `stat`, `maps` and `fd/`. Files are
+generated when first read and the result is kept for that open file. A bug
+showed why: `cat /proc/self/maps` reads in chunks, and `cat`'s own
+allocations changed its memory map between reads, so regenerated content
+shifted under the read position and lines appeared repeated. Like Linux,
+`/proc` files report size 0.
+
+### Pipes
+
+A 64 KiB buffer with reader and writer counts. Readers block while empty
+(end of file once all writers are gone); writers block while full and get
+`EPIPE` plus SIGPIPE when no readers remain, which is how `yes | head` ends.
+Each end is one open file, so `dup` and `fork` share it rather than
+counting twice.
+
+### poll and select
+
+Each inode reports its readiness (for pipes it depends on which end, so the
+open file's flags are passed in). Waiting uses one global wait queue that's
+woken whenever any terminal or pipe changes; `poll` rechecks every
+descriptor. That's simpler than per-file wait lists and cheap at eliOS's
+scale. `select` and `pselect6` are translated into the same mechanism.
+
+## 16. The terminal
+
+`tty.rs`.
+
+`/dev/console` behaves like a Linux terminal, because programs depend on
+its behavior:
+
+- **Canonical mode** (the default): the kernel edits a line at a time. It
+  echoes typed characters, handles backspace (a whole UTF-8 character at a
+  time), Ctrl+U, and Ctrl+D (end of file on an empty line), and programs
+  read whole lines. Escape sequences (arrow keys) are dropped in this mode.
+- **Raw mode**, selected through the standard termios ioctls: bytes go
+  straight to the program. The shell's line editor, `edit` and `vi` use it.
+- **Ctrl+C** sends SIGINT to the foreground process group (when the termios
+  `ISIG` flag is on).
+- The **window size** ioctl reports the console's columns and rows.
+
+Input comes from two places that both behave like a real terminal sending
+bytes: the keyboard (decoded to the bytes a terminal would send, such as
+`ESC [ A` for the up arrow) and the serial port (so a terminal on the host,
+or a script, can drive eliOS). Output goes to both the screen and serial.
+
+## 17. Devices and drivers
+
+### PS/2 keyboard (`keyboard.rs`)
+
+The i8042 controller is configured to interrupt on key presses and to
+translate scancodes to set 1, so the decoder needs only one table whatever
+the keyboard speaks. The interrupt handler only queues raw scancodes (in a
+lock-free queue) and wakes the keyboard thread, which decodes them (shift,
+caps lock, ctrl, extended keys; US layout) and feeds the terminal. Keeping
+the handler tiny keeps interrupts short.
+
+USB keyboards work only if the firmware emulates a PS/2 keyboard for them,
+which many PCs do and QEMU does.
+
+### PCI (`drivers/pci.rs`)
+
+Devices are found by probing every bus, device and function through the
+configuration ports 0xCF8/0xCFC. These must be accessed as whole 32-bit
+values: on many chipsets the neighboring port 0xCF9 is the *reset control
+register*, so byte-wise access could reboot a real machine. (The first
+version did exactly that; it was caught before it ran.)
+
+### AHCI (`drivers/ahci.rs`)
+
+AHCI is the standard SATA controller interface, on real PCs and in QEMU's
+q35 machine. Setup: take ownership from the firmware (BIOS/OS handoff), set
+the AHCI enable bit, and for each port with a SATA disk, stop it, give it a
+command list and a receive area, and start it. Commands are ATA commands
+(IDENTIFY, READ DMA EXT, WRITE DMA EXT) in a command table with one memory
+region. Transfers go through a 64 KiB physically contiguous bounce buffer
+and completion is polled. Interrupt-driven completion would let other
+threads run during I/O; polling is simpler and fast enough here.
+
+### NVMe (`drivers/nvme.rs`)
+
+NVMe is the interface to PCI Express SSDs, standard in modern laptops. The
+host writes 64-byte commands into submission queues in memory and rings
+doorbell registers; the controller writes 16-byte completions into
+completion queues, flipping a phase bit each time it wraps so new entries
+can be told from stale ones. Setup: reset, create the admin queue pair,
+enable, identify the controller and namespace 1, create one I/O queue pair.
+Transfers longer than two pages describe the buffer with a "PRP list" page.
+Only 512-byte sectors are supported (most drives default to them).
+
+### Partitions and the block layer (`drivers/block.rs`)
+
+Disks implement a small `Disk` trait (read and write whole sectors).
+Partition tables are read from GPT, falling back to MBR. The first FAT32 or
+EFI System Partition found is mounted at `/disk`.
+
+### FAT32 (`fat/`)
+
+FAT32 because UEFI requires it for the boot partition, and because every
+other system reads it, which makes it the right format for moving files in
+and out. The implementation is a separate `no_std` crate so the kernel
+(reading and writing disks) and xtask (building images) share exactly the
+same code.
+
+The layout: a boot sector describing the geometry; the FAT, one 32-bit entry
+per cluster giving the next cluster of the file ("cluster chains"); and the
+clusters. Directories are files of 32-byte entries. Long names are stored
+in extra entries preceding the classic 8.3 entry, with a checksum of the 8.3
+name tying them together; eliOS generates `NAME~1.EXT` short names when a
+name doesn't fit 8.3.
+
+Implementation choices:
+
+- Reads and writes find runs of physically consecutive clusters and
+  transfer each run in one device request.
+- One FAT sector is cached; the free cluster count is computed once and
+  then kept up to date.
+- Newly allocated clusters are zeroed, so gaps from writes past the end of a
+  file read as zeros.
+- Formatting chooses the cluster size so the volume has at least 65,525
+  clusters, because that number *defines* FAT32: with fewer, every other
+  implementation (including UEFI firmware) would read the volume as FAT16.
+  That's why eliOS's 128 MiB boot partition uses 512-byte clusters.
+
+The images are validated against independent implementations: Linux's
+`fsck.fat` finds no errors, and UEFI firmware boots from them.
+
+**In the VFS** (`fs/fatfs.rs`), each FAT file or directory is a node cached
+by its entry's position on disk, so the same file is always the same node
+however it's reached. Deleting a file marks any open node for it as deleted,
+because its clusters may be reused. FAT has no permissions, symlinks or hard
+links.
+
+## 18. ACPI: tables and power
+
+`acpi.rs`, `power.rs`.
+
+ACPI tables are found from the RSDP the bootloader passes on, through the
+XSDT (or the older RSDT), with every checksum verified.
+
+- **MADT**: the processors, I/O APICs, interrupt overrides and NMI wiring.
+- **FADT**: the power management ports and, on newer systems, the reset
+  register.
+- **DSDT**: to power off, ACPI says to write a "sleep type" for state S5 to
+  the PM1 control ports. The values come from the `\_S5` object in the
+  DSDT, which is AML bytecode. A full AML interpreter is a big project;
+  instead, eliOS scans for the byte pattern of `Name(_S5_, Package(){...})`
+  and decodes the two values (handling the encodings AML uses for small
+  numbers). This is a well-known approach that works on nearly all
+  hardware. If the firmware hasn't switched the chipset to ACPI mode, the
+  kernel does that first through the SMI command port.
+
+`reboot` uses the FADT's reset register when present, then the keyboard
+controller's reset line, then a deliberate triple fault.
+
+## 19. Userland
+
+### libeli (`user/eli`)
+
+The runtime for eliOS's own Rust programs, written against the Linux ABI.
+
+- **Startup:** `_start` (a naked function) passes the initial stack pointer
+  to Rust, which reads argc, argv and envp, calls the program's `main` and
+  exits with its result.
+- **Allocator:** the same size-class design as the kernel heap, on top of
+  `mmap`. Programs are single-threaded, so its state needs no locking; the
+  process-wide state uses `RefCell`, turning accidental overlapping use into
+  a clean panic.
+- **A small standard library:** I/O and print macros, files and directories,
+  processes (fork, exec, wait, kill, process groups, signal dispositions),
+  terminals (raw mode, window size, foreground group), time, system
+  information, and the eliOS-specific calls.
+
+### eliutils (`user/utils`)
+
+One binary, linked under each command's name; the name it's run as picks
+the command (`applets.rs` lists them, and xtask reads the same file to make
+the links). One binary keeps the initrd small: the whole userland is about
+300 KB.
+
+**The shell** (`shell.rs`):
+
+- Lines are split into words and operators with quoting respected, but
+  expansion (`$VAR`, `$?`, `~`, wildcards) happens when each pipeline
+  *runs*, not when the line is read. Expanding everything up front was the
+  first design and was wrong: `false; echo $?` printed a stale status, and
+  `touch x.txt; ls *.txt` didn't see the new file.
+- Each pipeline gets its own process group, which becomes the terminal's
+  foreground group while it runs, then the shell takes the terminal back.
+  The shell ignores SIGINT; children reset it to default before `exec`.
+- Redirections are applied in the child after `fork`, with `dup2`.
+- Pipes are created close-on-exec, so only the ends a child explicitly
+  moves into place survive into the next program.
+- Background jobs (`&`) are reported when they finish, before the next
+  prompt.
+
+**The line editor** (`editor.rs`) uses raw mode to provide cursor movement,
+history, Tab completion (commands for the first word, paths after) and the
+usual Ctrl shortcuts. It redraws the line on each key, which the console
+handles cheaply.
+
+**init** (`init.rs`) prints the welcome message, runs `/etc/rc` if present,
+and keeps a shell running: when the shell exits it starts a new one (with a
+pause if they're exiting immediately, to avoid a busy loop). It also
+collects orphaned processes.
+
+**edit** (`edit.rs`) is a small nano-style editor: the screen is redrawn
+from the buffer after each key.
+
+**The commands** are deliberately simple implementations; the ones with a
+subtle requirement are noted in the code (`head` streams its input so
+`yes | head` terminates; `mv` falls back to copying across file systems).
+
+### Linux programs
+
+- `user/c/` holds C programs compiled by the host's GCC and glibc: a hello
+  world, `ctest` (a self-test of the C library on eliOS) and `sigtest`
+  (signal handling). `*-dynamic.c` programs are dynamically linked, and
+  xtask copies the libraries `ldd` reports into the root file system.
+- If the host has a static BusyBox, it's included with links for the
+  commands eliutils doesn't have (about 200: `vi`, `awk`, `sed`, `find`,
+  `tar`, `gzip`, `top`, ...). Links go in `/usr/bin`, which comes after
+  `/bin` in `PATH`, so eliOS's own commands take precedence.
+
+## 20. Disk images and the build tool
+
+### The disk image (`xtask/src/image.rs`)
+
+`target/eliOS.img` is a GPT disk: a protective MBR (so MBR-only tools see
+the disk as in use), the GPT header and partition table with their CRC32s,
+the backup copies at the end of the disk, and one 128 MiB EFI System
+Partition formatted FAT32 by the `fat` crate. eliboot goes at the path UEFI
+boots by default (`\EFI\BOOT\BOOTX64.EFI`), so no firmware boot entries are
+needed.
+
+`cargo xtask run` *updates* the existing image (replacing only the boot
+files) rather than rebuilding it, so files saved to `/disk` persist between
+runs. `--fresh` and `cargo xtask image` start over.
+
+A raw disk image rather than an ISO: written to a USB stick it becomes an
+ordinary, writable disk, and QEMU boots it directly.
+
+### Running QEMU
+
+- Machine `q35`: a modern chipset with AHCI and PCI Express, closer to real
+  PCs than the default.
+- Firmware: OVMF, the open-source UEFI implementation.
+- KVM with the host's CPU model when `/dev/kvm` is usable: hardware
+  virtualization, dozens of times faster than emulation. eliOS boots in
+  about half a second under KVM.
+- The serial port is connected to the terminal through a chardev with
+  `signal=off`, so Ctrl+C reaches eliOS instead of stopping QEMU.
+- `-no-reboot`: a triple fault stops QEMU instead of looping through
+  reboots, which keeps crash output visible.
+
+### Sessions (`xtask/src/session.rs`)
+
+`cargo xtask session -- steps...` boots eliOS headless, types commands at
+the shell (waiting for each prompt), can press keys through the QEMU
+monitor and take screenshots, then prints a clean transcript. It's how
+end-to-end behavior is checked without a person typing.
+
+## 21. Testing
+
+- **Kernel tests** (`ktest!`) register themselves in a dedicated linker
+  section; the linker script brackets the section with symbols, so the
+  harness finds every test without a central list. `cargo xtask test`
+  builds the kernel with `cfg(test)` (and `harness = false`, since Rust's
+  normal test harness needs an OS), boots it, runs all tests, and exits QEMU
+  through its `isa-debug-exit` device with a status xtask understands. A
+  failing assertion panics, which prints the report and exits with the
+  failure status.
+- Tests run after the complete boot, with interrupts and the scheduler
+  running, so they cover real behavior: thread preemption, timer accuracy,
+  keyboard interrupts (the PS/2 controller is told to fake a key press),
+  a three-process pipeline, the C library self-test, disk I/O through AHCI.
+- **The FAT crate** has host unit tests (`cargo test -p fat`).
+- **End-to-end:** `cargo xtask session` and screenshots.
+
+Every phase was also tested in release builds, since optimizations can
+expose bugs that debug builds hide.
+
+## 22. Limits and what's next
+
+Current limits, roughly in order of how much they'd matter to a user:
+
+- **One CPU.** Other cores are left idle.
+- **No threads in user programs** (`clone` with shared memory), so programs
+  using pthreads won't run.
+- **USB:** keyboards only through firmware PS/2 emulation; no USB storage.
+- **No networking.**
+- **No graphical desktop** (planned, deliberately postponed).
+- **fork copies eagerly**; copy-on-write would make it cheaper.
+- **Disk I/O is polled** and holds the volume lock for whole operations.
+
+## 23. Reference tables
+
+### Physical memory at boot (QEMU, 256 MiB)
+
+The memory map is logged at debug level on every boot (serial output).
+Typical figures: about 197 MiB usable at entry, 48 MiB reclaimed from the
+bootloader afterwards, the kernel image under 1 MiB plus its 123 KiB data
+segment.
+
+### User address space
+
+| Address | Contents |
+|---|---|
+| `0x200000` (typically) | static executables (eliOS programs) |
+| `0x400000` (typically) | static executables (GCC) |
+| `0x5555_5560_0000` | position-independent executables |
+| below `0x7000_0000_0000` | `mmap` regions, placed top-down |
+| `0x7F00_0000_0000` | the dynamic linker, for dynamically linked programs |
+| `0x7FFF_FF7F_F000`-`0x7FFF_FFFF_F000` | the stack (8 MiB, demand-paged) |
+
+### Selectors
+
+| Selector | Descriptor |
+|---|---|
+| 0x08 | kernel code |
+| 0x10 | kernel data |
+| 0x1B | user data (RPL 3) |
+| 0x23 | user code (RPL 3) |
+| 0x28 | TSS |

@@ -1,6 +1,7 @@
 //! Build and run eliOS. Invoked as `cargo xtask <command>`.
 
 mod image;
+mod session;
 
 use std::env;
 use std::fs;
@@ -10,13 +11,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "\
-usage: cargo xtask <command> [options] [-- <extra qemu args>]
+usage: cargo xtask <command> [options] [-- <extra qemu args, or session steps>]
 
 commands:
   build        build everything and update the disk image (target/eliOS.img)
   run          build, then boot the disk image in QEMU
   test         boot a test build of the kernel in QEMU and run its tests
   image        build a fresh disk image (for a USB stick or another VM)
+  session      boot, type the given steps at the shell, print a transcript
+               (steps: `command`, `@raw TEXT`, `@sleep S`, `@key NAME`,
+               `@screenshot FILE.png`; see xtask/src/session.rs)
 
 options:
   --release    build with optimizations
@@ -52,7 +56,7 @@ const OVMF_CANDIDATES: &[&str] = &[
     "/usr/share/edk2/ovmf/OVMF.fd",
 ];
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Options {
     release: bool,
     headless: bool,
@@ -75,6 +79,11 @@ fn main() -> ExitCode {
         Some("build") => build(&options).map(|_| ()),
         Some("run") => build(&options).and_then(|disk| run(&disk, &options)),
         Some("test") => test(&options),
+        Some("session") => build(&options).and_then(|disk| {
+            let mut qemu = qemu_command(&disk, &Options { qemu_args: Vec::new(), ..options.clone() })?;
+            qemu.arg("-no-shutdown");
+            session::run(qemu, &options.qemu_args, &workspace_root().join("target/session-monitor.sock"))
+        }),
         Some("image") => {
             let options = Options { fresh: true, ..options };
             build(&options).map(|disk| eprintln!("xtask: wrote {}", disk.display()))
