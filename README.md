@@ -83,6 +83,11 @@ They're plain Linux executables, unmodified, and run on eliOS. So does
 linker, which loads `libc.so.6` (copied from the host into the initrd). Run
 `strace <program>` to watch any program's system calls.
 
+If the build machine has a static BusyBox (Debian/Ubuntu: `busybox-static`),
+it's included unmodified, with links in `/usr/bin` for each of its commands
+that eliutils doesn't have: `vi`, `less`, `awk`, `sed`, `find`, `tar`,
+`gzip`, `diff`, `top`, `df` and about 200 more.
+
 The shell (`sh`) has pipes, redirection (`<`, `>`, `>>`, `2>&1`), `;` `&&`
 `||`, background jobs, quoting, `$VARIABLES`, `~`, `*` wildcards, scripts,
 history (arrow keys) and Tab completion. Ctrl+C interrupts the foreground

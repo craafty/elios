@@ -129,10 +129,11 @@ pub fn create() -> Arc<dyn Inode> {
             ("meminfo".into(), generated(meminfo)),
             ("uptime".into(), generated(uptime)),
             ("version".into(), generated(version)),
+            ("stat".into(), generated(system_stat)),
             ("cpuinfo".into(), generated(cpuinfo)),
             ("loadavg".into(), generated(|| format!("0.00 0.00 0.00 1/{} {}\n", process::count(), process::count()))),
             ("filesystems".into(), generated(|| "nodev\tramfs\nnodev\tproc\n".into())),
-            ("mounts".into(), generated(|| "ramfs / ramfs rw 0 0\nproc /proc proc rw 0 0\n".into())),
+            ("mounts".into(), generated(mounts)),
         ];
         for info in process::list() {
             entries.push((info.pid.to_string(), process_directory(info.pid)));
@@ -223,6 +224,27 @@ fn maps(process: &process::Process) -> String {
             flag(process::PROT_WRITE, 'w'),
             flag(process::PROT_EXEC, 'x')
         ));
+    }
+    text
+}
+
+/// CPU time totals, in 1/100 s: everything not spent in processes counts
+/// as idle.
+fn system_stat() -> String {
+    let total = time::uptime_nanos() / 10_000_000;
+    let busy: u64 = process::list().iter().map(|p| p.cpu_ms / 10).sum();
+    let idle = total.saturating_sub(busy);
+    format!(
+        "cpu  {busy} 0 0 {idle} 0 0 0 0 0 0\ncpu0 {busy} 0 0 {idle} 0 0 0 0 0 0\nbtime {}\nprocesses {}\nprocs_running 1\nprocs_blocked 0\n",
+        time::unix_time() - time::uptime_nanos() / 1_000_000_000,
+        process::count()
+    )
+}
+
+fn mounts() -> String {
+    let mut text = String::from("ramfs / ramfs rw 0 0\nproc /proc proc rw 0 0\n");
+    if super::lookup("/", "/disk", false).is_ok() {
+        text.push_str("/dev/sda1 /disk vfat rw 0 0\n");
     }
     text
 }

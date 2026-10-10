@@ -145,6 +145,33 @@ pub fn sigaltstack(new: u64, old: u64) -> Result<u64> {
     Ok(0)
 }
 
+const PR_SET_NAME: u64 = 15;
+const PR_GET_NAME: u64 = 16;
+
+/// `prctl`: only naming the process is supported.
+pub fn prctl(option: u64, argument: u64) -> Result<u64> {
+    let process = process::current();
+    match option {
+        PR_SET_NAME => {
+            let mut name = user::read_bytes(argument, 16)?;
+            name.truncate(name.iter().position(|&b| b == 0).unwrap_or(15));
+            let name = alloc::string::String::from_utf8_lossy(&name).into_owned();
+            task::set_name(&name);
+            *process.name.lock() = name;
+            Ok(0)
+        }
+        PR_GET_NAME => {
+            let mut name = [0u8; 16];
+            let current = process.name.lock().clone();
+            let len = current.len().min(15);
+            name[..len].copy_from_slice(&current.as_bytes()[..len]);
+            user::write_value(argument, &name)?;
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
 

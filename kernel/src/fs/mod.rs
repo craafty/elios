@@ -166,6 +166,14 @@ pub trait Inode: Send + Sync {
         self.unlink(old_name)
     }
 
+    /// Space on the file system this belongs to: (block size, total blocks,
+    /// free blocks, the `statfs` type magic number).
+    fn space(&self) -> (u64, u64, u64, u64) {
+        // The in-memory file systems share RAM.
+        let memory = crate::memory::frames::stats();
+        (4096, memory.managed_bytes / 4096, memory.free_bytes / 4096, 0x858458F6)
+    }
+
     /// Which file system this belongs to: entries can only be renamed
     /// within one. The in-memory file systems are all 0.
     fn filesystem(&self) -> usize {

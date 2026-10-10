@@ -189,6 +189,14 @@ impl Inode for Node {
         Arc::as_ptr(&self.volume) as usize
     }
 
+    fn space(&self) -> (u64, u64, u64, u64) {
+        const MSDOS_SUPER_MAGIC: u64 = 0x4D44;
+        let mut fs = self.volume.fs.lock();
+        let block = fs.cluster_size();
+        let free = fs.free_bytes().unwrap_or(0);
+        (block, fs.total_bytes() / block, free / block, MSDOS_SUPER_MAGIC)
+    }
+
     fn as_any(&self) -> Option<&dyn Any> {
         Some(self)
     }

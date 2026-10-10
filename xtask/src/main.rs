@@ -271,6 +271,7 @@ fn build_initrd() -> Result<PathBuf, String> {
     }
     symlink("/bin/eliutils", &sbin.join("init"))?;
     build_c_programs(&root.join("user/c"), &rootfs)?;
+    add_busybox(&rootfs)?;
 
     let mut archive = Vec::new();
     let mut inode = 1;
@@ -322,6 +323,45 @@ fn build_c_programs(source: &Path, rootfs: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// If the build machine has a static BusyBox, puts it in /usr/bin with a
+/// link for each of its commands that eliutils doesn't provide: an unmodified
+/// Linux program that brings vi, awk, sed, find, tar and many more.
+fn add_busybox(rootfs: &Path) -> Result<(), String> {
+    let candidates = ["/usr/bin/busybox", "/bin/busybox"];
+    let Some(source) = candidates.iter().map(Path::new).find(|path| path.exists()) else {
+        return Ok(());
+    };
+    let Ok(binary) = fs::read(source) else { return Ok(()) };
+    if !is_static_executable(&binary) {
+        eprintln!("xtask: {} is dynamically linked; skipping it", source.display());
+        return Ok(());
+    }
+    let output = Command::new(source).arg("--list").output().map_err(|e| format!("running busybox: {e}"))?;
+    let destination = rootfs.join("usr/bin");
+    fs::create_dir_all(&destination).map_err(|e| format!("creating {}: {e}", destination.display()))?;
+    fs::write(destination.join("busybox"), &binary).map_err(|e| format!("copying busybox: {e}"))?;
+    let ours: Vec<&str> = APPLETS.iter().map(|(name, _)| *name).collect();
+    for applet in String::from_utf8_lossy(&output.stdout).lines() {
+        let applet = applet.trim();
+        let taken = destination.join(applet).exists() || rootfs.join("bin").join(applet).exists();
+        if !applet.is_empty() && !ours.contains(&applet) && !taken && applet != "busybox" {
+            symlink("busybox", &destination.join(applet))?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether an ELF executable needs no dynamic linker (has no PT_INTERP).
+fn is_static_executable(binary: &[u8]) -> bool {
+    let read = |at: usize, len: usize| binary.get(at..at + len);
+    let (Some(offset), Some(size), Some(count)) = (read(32, 8), read(54, 2), read(56, 2)) else { return false };
+    let offset = u64::from_le_bytes(offset.try_into().unwrap()) as usize;
+    let size = u16::from_le_bytes(size.try_into().unwrap()) as usize;
+    let count = u16::from_le_bytes(count.try_into().unwrap()) as usize;
+    binary.starts_with(b"\x7fELF")
+        && (0..count).all(|index| read(offset + index * size, 4).is_some_and(|kind| kind != [3, 0, 0, 0]))
 }
 
 /// Copies the shared libraries (and dynamic linker) a host program uses into

@@ -152,6 +152,8 @@ pub struct FileSystem<D> {
     fat_cache: Option<(u64, [u8; SECTOR_SIZE])>,
     /// Where to start looking for free clusters.
     next_free: u32,
+    /// Free clusters, once counted (then kept up to date).
+    free_clusters: Option<u32>,
     /// Seconds since the Unix epoch, for timestamps.
     clock: fn() -> u64,
 }
@@ -204,6 +206,7 @@ impl<D: BlockDevice> FileSystem<D> {
             root_cluster,
             fat_cache: None,
             next_free: 2,
+            free_clusters: None,
             clock,
         })
     }
@@ -381,6 +384,9 @@ impl<D: BlockDevice> FileSystem<D> {
             if self.fat_entry(cluster)? == 0 {
                 self.set_fat_entry(cluster, END_OF_CHAIN)?;
                 self.next_free = cluster;
+                if let Some(free) = &mut self.free_clusters {
+                    *free -= 1;
+                }
                 return Ok(cluster);
             }
         }
@@ -396,6 +402,9 @@ impl<D: BlockDevice> FileSystem<D> {
     fn free_chain(&mut self, first: u32) -> Result<()> {
         for cluster in self.chain(first)? {
             self.set_fat_entry(cluster, 0)?;
+            if let Some(free) = &mut self.free_clusters {
+                *free += 1;
+            }
         }
         Ok(())
     }
@@ -714,14 +723,27 @@ impl<D: BlockDevice> FileSystem<D> {
     }
 
     /// Free space, in bytes (counts the FAT; takes a moment on big volumes).
+    /// Free space, in bytes. The first call counts free clusters in the FAT
+    /// (a moment on big volumes); after that the count is kept up to date.
     pub fn free_bytes(&mut self) -> Result<u64> {
-        let mut free = 0u64;
-        for cluster in 2..self.clusters + 2 {
-            if self.fat_entry(cluster)? == 0 {
-                free += 1;
+        let free = match self.free_clusters {
+            Some(free) => free,
+            None => {
+                let mut free = 0;
+                for cluster in 2..self.clusters + 2 {
+                    if self.fat_entry(cluster)? == 0 {
+                        free += 1;
+                    }
+                }
+                self.free_clusters = Some(free);
+                free
             }
-        }
-        Ok(free * self.cluster_bytes() as u64)
+        };
+        Ok(u64::from(free) * self.cluster_bytes() as u64)
+    }
+
+    pub fn cluster_size(&self) -> u64 {
+        self.cluster_bytes() as u64
     }
 
     pub fn total_bytes(&self) -> u64 {

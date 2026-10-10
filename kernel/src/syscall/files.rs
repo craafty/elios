@@ -373,6 +373,58 @@ pub fn ftruncate(fd: u64, len: u64) -> Result<u64> {
     file.inode.truncate(len).map(|_| 0)
 }
 
+/// `struct statfs` for an inode's file system.
+fn write_statfs(inode: &Arc<dyn Inode>, address: u64) -> Result<u64> {
+    let (block_size, blocks, free, magic) = inode.space();
+    // type, bsize, blocks, bfree, bavail, files, ffree, fsid (2 x i32),
+    // namelen, frsize, flags, spare[4].
+    let fields: [u64; 15] = [magic, block_size, blocks, free, free, 0, 0, 0, 255, block_size, 0, 0, 0, 0, 0];
+    user::write_value(address, &fields)?;
+    Ok(0)
+}
+
+pub fn statfs(path: u64, address: u64) -> Result<u64> {
+    let path = user::read_string(path)?;
+    let cwd = process::current().cwd.lock().clone();
+    write_statfs(&fs::lookup(&cwd, &path, true)?, address)
+}
+
+pub fn fstatfs(fd: u64, address: u64) -> Result<u64> {
+    write_statfs(&file(fd)?.inode, address)
+}
+
+/// `sendfile`: copies from one file to another inside the kernel.
+pub fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<u64> {
+    let output = file(out_fd)?;
+    let input = file(in_fd)?;
+    let mut position = if offset == 0 { None } else { Some(user::read_value::<u64>(offset)?) };
+    let mut buffer = alloc::vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    while total < count {
+        let chunk = ((count - total) as usize).min(buffer.len());
+        let read = match &mut position {
+            Some(position) => {
+                let read = input.inode.read_at(*position, &mut buffer[..chunk])?;
+                *position += read as u64;
+                read
+            }
+            None => input.read(&mut buffer[..chunk])?,
+        };
+        if read == 0 {
+            break;
+        }
+        let mut written = 0;
+        while written < read {
+            written += output.write(&buffer[written..read])?;
+        }
+        total += read as u64;
+    }
+    if let Some(position) = position {
+        user::write_value(offset, &position)?;
+    }
+    Ok(total)
+}
+
 /// `getdents64`: directory entries, packed as `struct linux_dirent64`. The
 /// file position counts entries, starting with `.` and `..`.
 pub fn get_directory_entries(fd: u64, buffer: u64, size: u64) -> Result<u64> {
