@@ -90,8 +90,9 @@ The exact machine state at kernel entry is documented in `bootinfo/src/lib.rs`.
       (W^X kernel image, RAM-only direct map, write-combining framebuffer,
       no identity map), guarded kernel stacks, bootloader memory reclaimed,
       kernel heap with size classes (`alloc`), early log replay
-- [ ] **Phase 4: Multitasking.** Threads, context switching, preemptive
-      scheduler, synchronization
+- [x] **Phase 4: Multitasking.** Kernel threads on guarded stacks,
+      assembly context switch, preemptive round-robin scheduler, sleep,
+      wait queues, join, stack reaping
 - [ ] **Phase 5: Userspace.** Ring 3, `syscall`/`sysret`, ELF process loading,
       per-process address spaces
 - [ ] **Phase 6: Storage.** ACPI parsing, PCI, a disk driver (AHCI/NVMe/virtio),

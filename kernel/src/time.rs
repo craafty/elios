@@ -53,11 +53,11 @@ pub fn init() {
 }
 
 fn on_tick(_frame: &mut InterruptFrame) {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::task::on_tick(now);
 }
 
-/// Timer ticks since the periodic timer started.
-#[allow(dead_code, reason = "for the scheduler (Phase 4)")]
+/// Timer ticks (milliseconds) since the periodic timer started.
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }

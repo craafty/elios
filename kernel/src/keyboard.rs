@@ -11,6 +11,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::arch::interrupts::{self, IRQ_BASE, InterruptFrame};
 use crate::arch::{apic, inb, outb};
 use crate::sync::ByteQueue;
+use crate::task::WaitQueue;
 
 const DATA: u16 = 0x60;
 const STATUS: u16 = 0x64;
@@ -33,6 +34,7 @@ const KEYBOARD_IRQ: u8 = 1;
 const KEYBOARD_VECTOR: u8 = IRQ_BASE + KEYBOARD_IRQ;
 
 static SCANCODES: ByteQueue<256> = ByteQueue::new();
+static INPUT: WaitQueue = WaitQueue::new();
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Configures the controller to interrupt on keypresses and routes its IRQ.
@@ -68,11 +70,17 @@ fn on_interrupt(_frame: &mut InterruptFrame) {
     if !SCANCODES.push(scancode) {
         DROPPED.fetch_add(1, Ordering::Relaxed);
     }
+    INPUT.wake_all();
 }
 
-/// The oldest scancode not yet processed.
+/// The oldest scancode not yet processed, if any.
 pub fn next_scancode() -> Option<u8> {
     SCANCODES.pop()
+}
+
+/// The next scancode, waiting for a keypress if necessary.
+pub fn read_scancode() -> u8 {
+    INPUT.wait_until(next_scancode)
 }
 
 /// Makes the controller act as if the keyboard sent `scancode`, interrupt

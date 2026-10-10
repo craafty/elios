@@ -229,6 +229,9 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut InterruptFrame) {
 
     if vector >= IRQ_BASE {
         apic::end_of_interrupt();
+        // The interrupt is fully handled, so this is a safe point to switch
+        // threads if the timer (or a wakeup) asked for it.
+        crate::task::preempt_point();
     }
 }
 

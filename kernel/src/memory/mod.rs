@@ -186,6 +186,7 @@ pub fn map_device(phys: u64, len: u64, cache: CacheType) -> *mut u8 {
 /// faults instead of corrupting whatever lies below.
 pub struct KernelStack {
     pub top: u64,
+    pages: u64,
 }
 
 pub fn allocate_kernel_stack(pages: u64) -> KernelStack {
@@ -199,7 +200,19 @@ pub fn allocate_kernel_stack(pages: u64) -> KernelStack {
                 .expect("mapping a kernel stack failed");
         }
     });
-    KernelStack { top: bottom + pages * PAGE_SIZE }
+    KernelStack { top: bottom + pages * PAGE_SIZE, pages }
+}
+
+/// Unmaps a stack and frees its memory. Its address range isn't reused, so
+/// stray pointers into it fault rather than hitting a newer stack.
+pub fn free_kernel_stack(stack: KernelStack) {
+    let bottom = stack.top - stack.pages * PAGE_SIZE;
+    with_kernel_table(|table| {
+        for page in 0..stack.pages {
+            let mapping = table.unmap(bottom + page * PAGE_SIZE).expect("kernel stack page not mapped");
+            frames::free(mapping.phys);
+        }
+    });
 }
 
 /// Frees the memory the bootloader and firmware were using. Call once the

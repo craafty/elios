@@ -22,6 +22,7 @@ mod logo;
 mod memory;
 mod serial;
 mod sync;
+mod task;
 mod time;
 
 use core::fmt::{self, Write as _};
@@ -31,10 +32,15 @@ use bootinfo::BootInfo;
 
 use crate::framebuffer::Framebuffer;
 use crate::keyboard::Key;
-use crate::memory::CacheType;
+use crate::memory::{CacheType, KernelStack};
+use crate::sync::SpinLock;
 
 /// The kernel's main stack, in pages.
 const KERNEL_STACK_PAGES: u64 = 16;
+
+/// Hands the stack `_start` switches to over to `kernel_main`, whose thread
+/// owns it.
+static BOOT_STACK: SpinLock<Option<KernelStack>> = SpinLock::new(None);
 
 /// Kernel entry point, jumped to by eliboot. See the `bootinfo` crate for the
 /// machine state at this point.
@@ -70,9 +76,11 @@ pub extern "sysv64" fn _start(boot_info: &'static BootInfo) -> ! {
 
     memory::init(boot_info);
     let stack = memory::allocate_kernel_stack(KERNEL_STACK_PAGES);
+    let top = stack.top;
+    *BOOT_STACK.lock() = Some(stack);
     // SAFETY: the stack was just mapped, and nothing on the current stack is
     // used again.
-    unsafe { arch::switch_stack(stack.top, kernel_main, core::ptr::from_ref(boot_info) as u64) }
+    unsafe { arch::switch_stack(top, kernel_main, core::ptr::from_ref(boot_info) as u64) }
 }
 
 /// The rest of startup, on the kernel's own stack and page tables.
@@ -80,6 +88,7 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
     // SAFETY: `_start` passes its `&'static BootInfo`.
     let boot_info = unsafe { &*(boot_info as *const BootInfo) };
     let reclaimed = memory::reclaim_boot_memory(boot_info);
+    task::init("kernel", BOOT_STACK.lock().take().expect("boot stack missing"));
 
     if let Some(info) = boot_info.framebuffer() {
         let pixels = memory::map_device(info.base, info.size, CacheType::WriteCombining);
@@ -117,30 +126,22 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
 
     #[cfg(not(test))]
     {
+        task::spawn("console", input_loop);
         info!("boot complete");
-        input_loop()
+        task::exit()
     }
 }
 
 /// Echoes what's typed until there's a shell to run.
 #[cfg_attr(test, allow(dead_code))]
-fn input_loop() -> ! {
+fn input_loop() {
     println!("\nType away! Ctrl+L clears the screen.\n");
     // Show the cursor, then prompt.
     print!("\x1B[?25h> ");
     let mut decoder = keyboard::Decoder::default();
     let mut line_length = 0;
     loop {
-        // Check for input with interrupts off, so a keypress can't arrive
-        // between finding the queue empty and going to sleep.
-        arch::disable_interrupts();
-        let Some(scancode) = keyboard::next_scancode() else {
-            arch::wait_for_interrupt();
-            continue;
-        };
-        arch::enable_interrupts();
-
-        match decoder.feed(scancode) {
+        match decoder.feed(keyboard::read_scancode()) {
             Some(Key::Char(c)) => {
                 print!("{c}");
                 line_length += 1;
