@@ -83,6 +83,10 @@ pub extern "sysv64" fn _start(boot_info: &'static BootInfo) -> ! {
         ),
         Err(error) => panic!("can't set up interrupts: {error}"),
     }
+    match acpi::power() {
+        Some(power) => debug!("acpi: power off via port {:#x}, S5 type {}", power.pm1a_control, power.sleep_type_a),
+        None => warn!("acpi: no power-off information"),
+    }
 
     memory::init(boot_info);
     let stack = memory::allocate_kernel_stack(KERNEL_STACK_PAGES);

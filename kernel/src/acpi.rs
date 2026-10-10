@@ -52,7 +52,12 @@ static MADT: Once<Madt> = Once::new();
 /// mappings are active: the tables can be anywhere in the low 4 GiB, which
 /// those cover.
 pub fn init(rsdp: u64) -> Result<&'static Madt, &'static str> {
-    MADT.set(find_madt(rsdp)?).map_err(|_| "ACPI initialized twice")
+    let tables = root_tables(rsdp)?;
+    if let Some(power) = find_table(&tables, b"FACP").and_then(parse_fadt) {
+        let _ = POWER.set(power);
+    }
+    let madt = find_table(&tables, b"APIC").ok_or("the ACPI tables have no MADT")?;
+    MADT.set(parse_madt(madt, read::<u32>(madt + 4))).map_err(|_| "ACPI initialized twice")
 }
 
 /// The MADT read by [`init`].
@@ -60,8 +65,31 @@ pub fn madt() -> Option<&'static Madt> {
     MADT.get()
 }
 
-/// Finds and parses the MADT, starting from the RSDP the bootloader found.
-fn find_madt(rsdp: u64) -> Result<Madt, &'static str> {
+/// How to power off and reset the machine, from the FADT and DSDT.
+#[derive(Debug, Clone, Copy)]
+pub struct Power {
+    /// The PM1 control ports (b may be absent, 0).
+    pub pm1a_control: u16,
+    pub pm1b_control: u16,
+    /// The S5 ("soft off") sleep type values for each.
+    pub sleep_type_a: u16,
+    pub sleep_type_b: u16,
+    /// For switching the chipset into ACPI mode, if the firmware hasn't.
+    pub smi_command: u16,
+    pub acpi_enable: u8,
+    /// The reset register, if it's an I/O port.
+    pub reset: Option<(u16, u8)>,
+}
+
+static POWER: Once<Power> = Once::new();
+
+pub fn power() -> Option<&'static Power> {
+    POWER.get()
+}
+
+/// The addresses of every table the RSDT or XSDT lists. (This runs before
+/// the heap exists, hence the fixed-size list.)
+fn root_tables(rsdp: u64) -> Result<ArrayVec<u64, 64>, &'static str> {
     if rsdp == 0 {
         return Err("the firmware provided no ACPI tables");
     }
@@ -79,18 +107,86 @@ fn find_madt(rsdp: u64) -> Result<Madt, &'static str> {
         return Err("the ACPI root table is corrupt");
     }
     let entries = (u64::from(root_length) - SDT_HEADER_SIZE) / entry_size;
+    let mut tables = ArrayVec::new();
     for index in 0..entries {
         let entry = root + SDT_HEADER_SIZE + index * entry_size;
-        let table = if entry_size == 8 { read::<u64>(entry) } else { u64::from(read::<u32>(entry)) };
-        if read::<[u8; 4]>(table) == *b"APIC" {
-            let length = read::<u32>(table + 4);
-            if !checksum_ok(table, length) {
-                return Err("the ACPI MADT is corrupt");
-            }
-            return Ok(parse_madt(table, length));
-        }
+        let _ = tables.push(if entry_size == 8 { read::<u64>(entry) } else { u64::from(read::<u32>(entry)) });
     }
-    Err("the ACPI tables have no MADT")
+    Ok(tables)
+}
+
+/// The table with this signature, if present and intact.
+fn find_table(tables: &[u64], signature: &[u8; 4]) -> Option<u64> {
+    tables
+        .iter()
+        .copied()
+        .find(|&table| read::<[u8; 4]>(table) == *signature && checksum_ok(table, read::<u32>(table + 4)))
+}
+
+/// The power management details from the FADT ("FACP") and the DSDT it
+/// points to.
+fn parse_fadt(fadt: u64) -> Option<Power> {
+    let length = read::<u32>(fadt + 4);
+    let dsdt = if length >= 148 && read::<u64>(fadt + 140) != 0 {
+        read::<u64>(fadt + 140)
+    } else {
+        u64::from(read::<u32>(fadt + 40))
+    };
+    let (sleep_type_a, sleep_type_b) = find_s5(dsdt)?;
+    // The reset register (ACPI 2.0+): a generic address; only I/O port
+    // ones (address space 1) are used.
+    let flags = if length >= 116 { read::<u32>(fadt + 112) } else { 0 };
+    let reset = (length >= 129 && flags & (1 << 10) != 0 && read::<u8>(fadt + 116) == 1)
+        .then(|| (read::<u64>(fadt + 120) as u16, read::<u8>(fadt + 128)));
+    Some(Power {
+        pm1a_control: read::<u32>(fadt + 64) as u16,
+        pm1b_control: read::<u32>(fadt + 68) as u16,
+        sleep_type_a,
+        sleep_type_b,
+        smi_command: read::<u32>(fadt + 48) as u16,
+        acpi_enable: read::<u8>(fadt + 52),
+        reset,
+    })
+}
+
+/// Finds the `\_S5` object in the DSDT's AML bytecode and reads its sleep
+/// type values. A full AML interpreter isn't needed for this one object: it
+/// is always `Name (_S5, Package () { a, b, ... })`.
+fn find_s5(dsdt: u64) -> Option<(u16, u16)> {
+    if read::<[u8; 4]>(dsdt) != *b"DSDT" {
+        return None;
+    }
+    let length = read::<u32>(dsdt + 4) as u64;
+    // SAFETY: the DSDT is ACPI memory, in the direct map.
+    let aml = unsafe {
+        core::slice::from_raw_parts(memory::phys_to_virt(dsdt + SDT_HEADER_SIZE), (length - SDT_HEADER_SIZE) as usize)
+    };
+    let at = aml.windows(5).position(|w| &w[1..] == b"_S5_" && (w[0] == 0x08 || w[0] == b'\\'))?;
+    let mut cursor = at + 5;
+    if aml.get(cursor) != Some(&0x12) {
+        // PackageOp.
+        return None;
+    }
+    cursor += 1;
+    // PkgLength: the top two bits of the first byte count extra bytes.
+    cursor += 1 + usize::from(aml.get(cursor)? >> 6);
+    cursor += 1; // NumElements
+    let mut value = || -> Option<u16> {
+        let byte = *aml.get(cursor)?;
+        cursor += 1;
+        Some(match byte {
+            // BytePrefix, then the value.
+            0x0A => {
+                cursor += 1;
+                u16::from(*aml.get(cursor - 1)?)
+            }
+            // ZeroOp, OneOp, or a small constant written directly.
+            other => u16::from(other),
+        })
+    };
+    let a = value()?;
+    let b = value()?;
+    Some((a, b))
 }
 
 fn parse_madt(table: u64, length: u32) -> Madt {

@@ -25,6 +25,14 @@ pub unsafe fn outw(port: u16, value: u16) {
 
 /// # Safety
 /// Reading some I/O ports has side effects on the device.
+pub unsafe fn inw(port: u16) -> u16 {
+    let value: u16;
+    unsafe { asm!("in ax, dx", in("dx") port, out("ax") value, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
+/// # Safety
+/// Reading some I/O ports has side effects on the device.
 pub unsafe fn inb(port: u16) -> u8 {
     let value: u8;
     unsafe { asm!("in al, dx", in("dx") port, out("al") value, options(nomem, nostack, preserves_flags)) };
