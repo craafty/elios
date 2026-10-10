@@ -4,7 +4,7 @@
 
 use core::fmt::{self, Write as _};
 
-use crate::{console, serial};
+use crate::{console, serial, time};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Level {
@@ -39,10 +39,13 @@ pub fn _print(args: fmt::Arguments) {
 
 #[doc(hidden)]
 pub fn _log(level: Level, args: fmt::Arguments) {
+    let uptime = time::uptime_nanos();
+    let (seconds, micros) = (uptime / 1_000_000_000, uptime % 1_000_000_000 / 1000);
+    let line = format_args!("\x1B[90m{seconds:>4}.{micros:06}\x1B[0m {} {args}\n", level.tag());
     if level == Level::Debug {
-        serial::write_fmt(format_args!("{} {args}\n", level.tag()));
+        serial::write_fmt(line);
     } else {
-        _print(format_args!("{} {args}\n", level.tag()));
+        _print(line);
     }
 }
 

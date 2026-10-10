@@ -2,9 +2,15 @@
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+
+use crate::arch;
 
 /// A busy-waiting mutual exclusion lock.
+///
+/// Interrupts are disabled while the lock is held. Otherwise an interrupt
+/// handler that takes the same lock could interrupt the holder and spin
+/// forever waiting for it.
 pub struct SpinLock<T> {
     locked: AtomicBool,
     value: UnsafeCell<T>,
@@ -19,6 +25,8 @@ impl<T> SpinLock<T> {
     }
 
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
+        let interrupts_were_enabled = arch::interrupts_enabled();
+        arch::disable_interrupts();
         while self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             // Wait with plain loads so contended cores don't keep stealing
             // the cache line from each other.
@@ -26,20 +34,26 @@ impl<T> SpinLock<T> {
                 core::hint::spin_loop();
             }
         }
-        SpinLockGuard { lock: self }
+        SpinLockGuard { lock: self, interrupts_were_enabled }
     }
 
     /// Takes the lock only if it is free right now.
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
-        self.locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-            .then_some(SpinLockGuard { lock: self })
+        let interrupts_were_enabled = arch::interrupts_enabled();
+        arch::disable_interrupts();
+        if self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            return Some(SpinLockGuard { lock: self, interrupts_were_enabled });
+        }
+        if interrupts_were_enabled {
+            arch::enable_interrupts();
+        }
+        None
     }
 }
 
 pub struct SpinLockGuard<'a, T> {
     lock: &'a SpinLock<T>,
+    interrupts_were_enabled: bool,
 }
 
 impl<T> Deref for SpinLockGuard<'_, T> {
@@ -61,6 +75,9 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
+        if self.interrupts_were_enabled {
+            arch::enable_interrupts();
+        }
     }
 }
 
@@ -91,6 +108,44 @@ impl<T> TakeOnce<T> {
     }
 }
 
+/// A fixed-size byte queue for one producer and one consumer, without locks.
+/// Made for interrupt handlers handing data to the rest of the kernel.
+pub struct ByteQueue<const N: usize> {
+    bytes: [AtomicU8; N],
+    /// Total bytes ever pushed and popped; their difference is the length.
+    pushed: AtomicUsize,
+    popped: AtomicUsize,
+}
+
+impl<const N: usize> ByteQueue<N> {
+    pub const fn new() -> Self {
+        Self { bytes: [const { AtomicU8::new(0) }; N], pushed: AtomicUsize::new(0), popped: AtomicUsize::new(0) }
+    }
+
+    /// Adds a byte; returns false (dropping it) if the queue is full. Only
+    /// one context may push.
+    pub fn push(&self, byte: u8) -> bool {
+        let pushed = self.pushed.load(Ordering::Relaxed);
+        if pushed.wrapping_sub(self.popped.load(Ordering::Acquire)) == N {
+            return false;
+        }
+        self.bytes[pushed % N].store(byte, Ordering::Relaxed);
+        self.pushed.store(pushed.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Removes the oldest byte. Only one context may pop.
+    pub fn pop(&self) -> Option<u8> {
+        let popped = self.popped.load(Ordering::Relaxed);
+        if popped == self.pushed.load(Ordering::Acquire) {
+            return None;
+        }
+        let byte = self.bytes[popped % N].load(Ordering::Relaxed);
+        self.popped.store(popped.wrapping_add(1), Ordering::Release);
+        Some(byte)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +163,30 @@ mod tests {
             assert!(lock.try_lock().is_none());
             drop(guard);
             assert!(lock.try_lock().is_some());
+        }
+
+        fn spinlock_masks_interrupts_while_held() {
+            let lock = SpinLock::new(());
+            assert!(arch::interrupts_enabled());
+            let guard = lock.lock();
+            assert!(!arch::interrupts_enabled());
+            let nested = SpinLock::new(());
+            drop(nested.lock());
+            assert!(!arch::interrupts_enabled(), "inner guard re-enabled interrupts early");
+            drop(guard);
+            assert!(arch::interrupts_enabled());
+        }
+
+        fn byte_queue_is_first_in_first_out() {
+            let queue = ByteQueue::<2>::new();
+            assert!(queue.push(1));
+            assert!(queue.push(2));
+            assert!(!queue.push(3));
+            assert_eq!(queue.pop(), Some(1));
+            assert!(queue.push(4));
+            assert_eq!(queue.pop(), Some(2));
+            assert_eq!(queue.pop(), Some(4));
+            assert_eq!(queue.pop(), None);
         }
 
         fn take_once_hands_out_its_value_once() {

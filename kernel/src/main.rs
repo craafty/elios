@@ -9,13 +9,18 @@ mod log;
 #[macro_use]
 mod test;
 
+mod acpi;
 mod arch;
+mod collections;
 mod console;
 mod font;
 mod framebuffer;
+mod keyboard;
 mod logo;
+mod memory;
 mod serial;
 mod sync;
+mod time;
 
 use core::fmt::{self, Write as _};
 use core::panic::PanicInfo;
@@ -23,11 +28,13 @@ use core::panic::PanicInfo;
 use bootinfo::{BootInfo, MemoryKind};
 
 use crate::framebuffer::Framebuffer;
+use crate::keyboard::Key;
 
 /// Kernel entry point, jumped to by eliboot. See the `bootinfo` crate for the
 /// machine state at this point.
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn _start(boot_info: &'static BootInfo) -> ! {
+    time::mark_boot();
     serial::init();
     // Separate our output from the firmware's on the serial line.
     serial::write_fmt(format_args!("\n"));
@@ -35,6 +42,7 @@ pub extern "sysv64" fn _start(boot_info: &'static BootInfo) -> ! {
     if !boot_info.is_valid() {
         panic!("boot info has bad magic or version; was this kernel booted by eliboot?");
     }
+    memory::init(boot_info);
 
     if let Some(info) = boot_info.framebuffer() {
         // SAFETY: the bootloader maps the framebuffer in the direct map, and
@@ -53,13 +61,79 @@ pub extern "sysv64" fn _start(boot_info: &'static BootInfo) -> ! {
     }
     log_memory(boot_info);
 
+    arch::gdt::init();
+    arch::interrupts::init();
+    debug!("GDT, TSS and IDT loaded");
+
+    let madt = match acpi::find_madt(boot_info.rsdp) {
+        Ok(madt) => madt,
+        Err(error) => panic!("can't set up interrupts: {error}"),
+    };
+    info!(
+        "acpi: {} CPUs, {} I/O APICs, {} IRQ overrides",
+        madt.processors.len(),
+        madt.io_apics.len(),
+        madt.overrides.len()
+    );
+    if madt.legacy_pics {
+        arch::pic::disable();
+    }
+    arch::apic::init_local(&madt);
+    arch::apic::init_io(&madt);
+    time::init();
+    match keyboard::init() {
+        Ok(()) => info!("keyboard: PS/2 ready"),
+        Err(error) => warn!("keyboard: {error}"),
+    }
+    arch::enable_interrupts();
+
     #[cfg(test)]
     test::run(boot_info);
 
     #[cfg(not(test))]
     {
-        info!("boot complete; nothing more to do yet, halting");
-        arch::halt_forever()
+        info!("boot complete");
+        input_loop()
+    }
+}
+
+/// Echoes what's typed until there's a shell to run.
+#[cfg_attr(test, allow(dead_code))]
+fn input_loop() -> ! {
+    println!("\nType away! Ctrl+L clears the screen.\n");
+    // Show the cursor, then prompt.
+    print!("\x1B[?25h> ");
+    let mut decoder = keyboard::Decoder::default();
+    let mut line_length = 0;
+    loop {
+        // Check for input with interrupts off, so a keypress can't arrive
+        // between finding the queue empty and going to sleep.
+        arch::disable_interrupts();
+        let Some(scancode) = keyboard::next_scancode() else {
+            arch::wait_for_interrupt();
+            continue;
+        };
+        arch::enable_interrupts();
+
+        match decoder.feed(scancode) {
+            Some(Key::Char(c)) => {
+                print!("{c}");
+                line_length += 1;
+            }
+            Some(Key::Backspace) if line_length > 0 => {
+                print!("\x08 \x08");
+                line_length -= 1;
+            }
+            Some(Key::Enter) => {
+                print!("\n> ");
+                line_length = 0;
+            }
+            Some(Key::Ctrl('l')) => {
+                print!("\x1B[2J\x1B[H> ");
+                line_length = 0;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -149,23 +223,14 @@ mod tests {
         }
 
         fn sizes_display_in_sensible_units() {
-            use core::fmt::Write as _;
-            struct Buf([u8; 32], usize);
-            impl fmt::Write for Buf {
-                fn write_str(&mut self, s: &str) -> fmt::Result {
-                    self.0[self.1..self.1 + s.len()].copy_from_slice(s.as_bytes());
-                    self.1 += s.len();
-                    Ok(())
-                }
-            }
             let show = |bytes| {
-                let mut buf = Buf([0; 32], 0);
-                write!(buf, "{}", Size(bytes)).unwrap();
-                buf
+                let mut text = crate::test::StrBuf::<32>::new();
+                write!(text, "{}", Size(bytes)).unwrap();
+                text
             };
-            assert_eq!(&show(512).0[..9], b"512 bytes");
-            assert_eq!(&show(4096).0[..5], b"4 KiB");
-            assert_eq!(&show(206 << 20).0[..7], b"206 MiB");
+            assert_eq!(show(512).as_str(), "512 bytes");
+            assert_eq!(show(4096).as_str(), "4 KiB");
+            assert_eq!(show(206 << 20).as_str(), "206 MiB");
         }
     }
 }

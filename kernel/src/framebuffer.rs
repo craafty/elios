@@ -62,14 +62,14 @@ impl Framebuffer {
         }
     }
 
-    /// Copies already-encoded pixels into row `y`, starting at the left edge.
-    pub fn write_row(&mut self, y: usize, pixels: &[u32]) {
-        assert!(y < self.height);
-        let len = pixels.len().min(self.width);
-        // SAFETY: row `y` exists and we write at most `width` pixels into it.
-        // Video memory only needs to be written, never read back, so a plain
-        // copy is fine.
-        unsafe { core::ptr::copy_nonoverlapping(pixels.as_ptr(), self.pixels.add(y * self.stride), len) };
+    /// Copies already-encoded pixels into row `y`, starting at column `x`.
+    /// Pixels past the right edge are dropped.
+    pub fn write_span(&mut self, x: usize, y: usize, pixels: &[u32]) {
+        assert!(x < self.width && y < self.height);
+        let len = pixels.len().min(self.width - x);
+        // SAFETY: the span lies within row `y`. Video memory only needs to be
+        // written, never read back, so a plain copy is fine.
+        unsafe { core::ptr::copy_nonoverlapping(pixels.as_ptr(), self.pixels.add(y * self.stride + x), len) };
     }
 
     #[cfg(test)]

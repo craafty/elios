@@ -6,6 +6,7 @@
 //! kernel without a central list. `cargo xtask test` boots the test kernel in
 //! QEMU, which runs every test and exits with the result.
 
+use core::fmt;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use bootinfo::BootInfo;
@@ -87,6 +88,32 @@ pub fn run(boot_info: &'static BootInfo) -> ! {
 pub fn on_panic() -> ! {
     println!("\x1B[91mFAILED\x1B[0m");
     exit_qemu(ExitCode::Failure)
+}
+
+/// A fixed-capacity string, for checking formatted output in tests.
+pub struct StrBuf<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StrBuf<N> {
+    pub fn new() -> Self {
+        Self { bytes: [0; N], len: 0 }
+    }
+
+    pub fn as_str(&self) -> &str {
+        // Only whole `&str`s are ever appended.
+        core::str::from_utf8(&self.bytes[..self.len]).unwrap()
+    }
+}
+
+impl<const N: usize> fmt::Write for StrBuf<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len + s.len();
+        self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
 }
 
 /// Values for QEMU's `isa-debug-exit` device, which exits QEMU with status

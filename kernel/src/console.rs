@@ -107,6 +107,13 @@ pub struct Console<'a> {
     escape: EscapeState,
     params: [u16; MAX_PARAMS],
     param_count: usize,
+    /// Whether the current sequence is a private one (`ESC [ ?`).
+    private: bool,
+
+    cursor_visible: bool,
+    /// Where the cursor was last drawn in video memory. It's never drawn in
+    /// the shadow, so the shadow copy of that cell is what erases it.
+    cursor_drawn: Option<usize>,
 
     /// Pixel rows that differ from video memory, as `start..end`.
     dirty: Option<(usize, usize)>,
@@ -132,6 +139,9 @@ impl<'a> Console<'a> {
             escape: EscapeState::Ground,
             params: [0; MAX_PARAMS],
             param_count: 0,
+            private: false,
+            cursor_visible: false,
+            cursor_drawn: None,
             dirty: None,
             fb,
         };
@@ -174,12 +184,25 @@ impl<'a> Console<'a> {
         self.row = y.div_ceil(font::HEIGHT).min(self.rows - 1);
     }
 
-    /// Copies everything drawn since the last flush to the screen.
+    /// Copies everything drawn since the last flush to the screen, and
+    /// draws the cursor.
     pub fn flush(&mut self) {
+        if let Some(row) = self.cursor_drawn.take() {
+            self.mark_dirty(row * font::HEIGHT, (row + 1) * font::HEIGHT);
+        }
         if let Some((start, end)) = self.dirty.take() {
             for y in start..end {
-                self.fb.write_row(y, &self.shadow[y * self.width..(y + 1) * self.width]);
+                self.fb.write_span(0, y, &self.shadow[y * self.width..(y + 1) * self.width]);
             }
+        }
+        if self.cursor_visible {
+            // An underline in the bottom two pixel rows of the cursor's cell.
+            let column = self.column.min(self.columns - 1);
+            let underline = [self.foreground; font::WIDTH];
+            for y in (self.row + 1) * font::HEIGHT - 2..(self.row + 1) * font::HEIGHT {
+                self.fb.write_span(column * font::WIDTH, y, &underline);
+            }
+            self.cursor_drawn = Some(self.row);
         }
     }
 
@@ -199,6 +222,7 @@ impl<'a> Console<'a> {
                     '[' => {
                         self.params = [0; MAX_PARAMS];
                         self.param_count = 0;
+                        self.private = false;
                         EscapeState::Csi
                     }
                     '\x20'..='\x2F' => EscapeState::EscapeIntermediate,
@@ -218,6 +242,7 @@ impl<'a> Console<'a> {
                     *param = param.saturating_mul(10).saturating_add(c as u16 - u16::from(b'0'));
                 }
                 ';' => self.param_count = (self.param_count.max(1) + 1).min(MAX_PARAMS),
+                '?' if self.param_count == 0 => self.private = true,
                 '\x40'..='\x7E' => {
                     self.escape = EscapeState::Ground;
                     self.execute_csi(c);
@@ -298,6 +323,13 @@ impl<'a> Console<'a> {
     }
 
     fn execute_csi(&mut self, command: char) {
+        if self.private {
+            // DECTCEM: show or hide the cursor.
+            if matches!(command, 'h' | 'l') && self.param(0, 0) == 25 {
+                self.cursor_visible = command == 'h';
+            }
+            return;
+        }
         let n = self.param(0, 1);
         match command {
             'm' => self.select_graphic_rendition(),
@@ -496,6 +528,26 @@ mod tests {
                 for column in 1..COLUMNS {
                     assert!(shows_default(console, column, 0, ' '));
                 }
+            });
+        }
+
+        fn cursor_is_drawn_only_in_video_memory() {
+            with_test_console(|console| {
+                let underline_row = font::HEIGHT - 1;
+                console.write_str("\x1B[?25h").unwrap();
+                console.flush();
+                assert_eq!(console.fb.read_pixel(0, underline_row), FOREGROUND.0);
+                assert_eq!(console.shadow[underline_row * WIDTH], BACKGROUND.0);
+
+                // Moving on erases it from the old cell.
+                console.write_str("-").unwrap();
+                console.flush();
+                assert_eq!(console.fb.read_pixel(0, underline_row), BACKGROUND.0);
+                assert_eq!(console.fb.read_pixel(font::WIDTH, underline_row), FOREGROUND.0);
+
+                console.write_str("\x1B[?25l").unwrap();
+                console.flush();
+                assert_eq!(console.fb.read_pixel(font::WIDTH, underline_row), BACKGROUND.0);
             });
         }
 

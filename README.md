@@ -29,6 +29,7 @@ cargo xtask build --release   # just build
 
 Kernel and bootloader logs appear on the serial port, which is your terminal.
 The kernel also logs to the screen; `debug!` messages go to serial only.
+Once booted, eliOS echoes what you type (Ctrl+L clears the screen).
 
 ## Tests
 
@@ -82,8 +83,9 @@ The exact machine state at kernel entry is documented in `bootinfo/src/lib.rs`.
       handoff, serial output, framebuffer splash
 - [x] **Phase 1: Output and safety nets.** Custom bitmap font and framebuffer
       text console with ANSI colors, logging, in-QEMU test harness
-- [ ] **Phase 2: CPU and interrupts.** GDT/TSS, IDT and exception handlers,
-      Local APIC + I/O APIC, timer, keyboard
+- [x] **Phase 2: CPU and interrupts.** GDT/TSS with IST stacks, IDT with
+      custom entry stubs and exception reports, ACPI MADT, Local APIC + I/O
+      APIC, TSC/APIC timer calibration, PS/2 keyboard
 - [ ] **Phase 3: Memory.** Physical frame allocator, kernel-owned page tables
       (drop the identity map, reclaim bootloader memory), kernel heap (`alloc`)
 - [ ] **Phase 4: Multitasking.** Threads, context switching, preemptive
