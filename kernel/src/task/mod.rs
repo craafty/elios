@@ -19,13 +19,16 @@ mod wait;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 pub use self::wait::WaitQueue;
-use crate::arch;
+use crate::arch::fpu::{self, FpuState};
+use crate::arch::{self, syscall};
 use crate::memory::{self, KernelStack};
+use crate::process::Process;
 use crate::sync::SpinLock;
 use crate::time;
 
@@ -47,7 +50,6 @@ pub enum State {
 #[derive(Debug, Clone)]
 pub struct ThreadInfo {
     pub id: ThreadId,
-    pub name: String,
     pub state: State,
     /// Timer ticks (milliseconds) spent running.
     pub cpu_ticks: u64,
@@ -67,6 +69,36 @@ struct Thread {
     cpu_ticks: u64,
     /// Tick at which a sleeping thread wakes.
     wake_at: u64,
+    kernel_stack_top: u64,
+    /// The page tables to run with (CR3).
+    address_space: u64,
+    /// The user process this thread belongs to, if any.
+    process: Option<Arc<Process>>,
+    /// User register state the kernel doesn't touch, saved while switched
+    /// out.
+    fpu: Box<FpuState>,
+    fs_base: u64,
+}
+
+/// How to start a thread.
+pub struct Spawn {
+    pub name: String,
+    pub process: Option<Arc<Process>>,
+    pub address_space: u64,
+    pub fpu: FpuState,
+    pub fs_base: u64,
+}
+
+impl Spawn {
+    pub fn kernel(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            process: None,
+            address_space: memory::kernel_page_table_root(),
+            fpu: FpuState::initial(),
+            fs_base: 0,
+        }
+    }
 }
 
 struct Scheduler {
@@ -144,7 +176,7 @@ extern "sysv64" fn thread_start(entry: *mut Entry) -> ! {
 }
 
 /// Builds a thread whose first switch lands in `thread_trampoline`.
-fn create_thread(id: ThreadId, name: &str, entry: Entry) -> Box<Thread> {
+fn create_thread(id: ThreadId, options: Spawn, entry: Entry) -> Box<Thread> {
     let stack = memory::allocate_kernel_stack(STACK_PAGES);
     let entry = Box::into_raw(Box::new(entry));
     // The frame `switch_context` pops: r15, r14, r13, r12, rbx, rbp, then
@@ -154,7 +186,20 @@ fn create_thread(id: ThreadId, name: &str, entry: Entry) -> Box<Thread> {
     let rsp = stack.top - size_of_val(&frame) as u64;
     // SAFETY: the top of a freshly mapped stack that nothing else uses.
     unsafe { (rsp as *mut [u64; 7]).write(frame) };
-    Box::new(Thread { id, name: name.into(), state: State::Ready, rsp, stack: Some(stack), cpu_ticks: 0, wake_at: 0 })
+    Box::new(Thread {
+        id,
+        name: options.name,
+        state: State::Ready,
+        rsp,
+        kernel_stack_top: stack.top,
+        stack: Some(stack),
+        cpu_ticks: 0,
+        wake_at: 0,
+        address_space: options.address_space,
+        process: options.process,
+        fpu: Box::new(options.fpu),
+        fs_base: options.fs_base,
+    })
 }
 
 /// Turns the code that's running into the first thread (it owns
@@ -163,6 +208,7 @@ pub fn init(name: &str, boot_stack: KernelStack) {
     let main = ThreadId(1);
     let idle = ThreadId(2);
     let mut threads = BTreeMap::new();
+    syscall::set_kernel_stack(boot_stack.top);
     threads.insert(
         main,
         Box::new(Thread {
@@ -170,12 +216,17 @@ pub fn init(name: &str, boot_stack: KernelStack) {
             name: name.into(),
             state: State::Running,
             rsp: 0,
+            kernel_stack_top: boot_stack.top,
             stack: Some(boot_stack),
             cpu_ticks: 0,
             wake_at: 0,
+            address_space: memory::kernel_page_table_root(),
+            process: None,
+            fpu: Box::new(FpuState::initial()),
+            fs_base: 0,
         }),
     );
-    threads.insert(idle, create_thread(idle, "idle", Box::new(idle_loop)));
+    threads.insert(idle, create_thread(idle, Spawn::kernel("idle"), Box::new(idle_loop)));
     *SCHEDULER.lock() = Some(Scheduler {
         threads,
         ready: VecDeque::new(),
@@ -201,11 +252,17 @@ fn with<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {
 
 /// Starts a new kernel thread running `f`.
 pub fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> ThreadId {
+    spawn_with(Spawn::kernel(name), f)
+}
+
+/// Starts a thread with the given settings, such as a user process's
+/// address space.
+pub fn spawn_with(options: Spawn, f: impl FnOnce() + Send + 'static) -> ThreadId {
     let id = with(|s| {
         s.next_id += 1;
         ThreadId(s.next_id - 1)
     });
-    let thread = create_thread(id, name, Box::new(f));
+    let thread = create_thread(id, options, Box::new(f));
     with(|s| {
         s.threads.insert(id, thread);
         s.ready.push_back(id);
@@ -215,6 +272,40 @@ pub fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> ThreadId {
 
 pub fn current() -> ThreadId {
     with(|s| s.current)
+}
+
+/// The user process the running thread belongs to.
+pub fn current_process() -> Option<Arc<Process>> {
+    with(|s| s.threads[&s.current].process.clone())
+}
+
+/// Changes the running thread's page tables (for exec and exit) and
+/// switches to them.
+pub fn set_address_space(root: u64) {
+    with(|s| {
+        let current = s.current;
+        s.threads.get_mut(&current).unwrap().address_space = root;
+    });
+    // SAFETY: callers pass tables that share the kernel half.
+    unsafe { arch::set_page_table_root(root) };
+}
+
+/// Saves the running thread's FPU registers into `state` (to give a forked
+/// child the same registers).
+pub fn save_fpu(state: &mut FpuState) {
+    fpu::save(state);
+}
+
+/// Resets the running thread's FPU registers (for exec).
+pub fn reset_fpu() {
+    fpu::restore(&FpuState::initial());
+}
+
+pub fn set_name(name: &str) {
+    with(|s| {
+        let current = s.current;
+        s.threads.get_mut(&current).unwrap().name = name.into();
+    });
 }
 
 /// Lets other ready threads run before continuing.
@@ -258,6 +349,7 @@ pub fn exit() -> ! {
 }
 
 /// Waits for a thread to exit.
+#[cfg_attr(not(test), allow(dead_code, reason = "used by tests"))]
 pub fn join(id: ThreadId) {
     EXITED.wait_until(|| {
         let finished = with(|s| s.threads.get(&id).is_none_or(|thread| thread.state == State::Exited));
@@ -270,12 +362,7 @@ pub fn list() -> Vec<ThreadInfo> {
         s.threads
             .values()
             .filter(|thread| thread.state != State::Exited)
-            .map(|thread| ThreadInfo {
-                id: thread.id,
-                name: thread.name.clone(),
-                state: thread.state,
-                cpu_ticks: thread.cpu_ticks,
-            })
+            .map(|thread| ThreadInfo { id: thread.id, state: thread.state, cpu_ticks: thread.cpu_ticks })
             .collect()
     })
 }
@@ -292,16 +379,14 @@ fn block_current() {
 
 /// Makes a blocked thread ready again. Callable from interrupt handlers.
 fn wake(id: ThreadId) {
+    with(|s| s.make_ready(id, &[State::Blocked]));
+}
+
+/// Wakes a thread that's blocked or sleeping, so it notices a signal.
+pub fn interrupt(id: ThreadId) {
     with(|s| {
-        if let Some(thread) = s.threads.get_mut(&id)
-            && thread.state == State::Blocked
-        {
-            thread.state = State::Ready;
-            s.ready.push_back(id);
-            if s.current == s.idle {
-                NEED_RESCHEDULE.store(true, Ordering::Relaxed);
-            }
-        }
+        s.make_ready(id, &[State::Blocked, State::Sleeping]);
+        s.sleeping.retain(|&sleeper| sleeper != id);
     });
 }
 
@@ -356,15 +441,29 @@ fn schedule() {
 
         let next = s.ready.pop_front().unwrap_or(s.idle);
         s.slice_left = TIME_SLICE_TICKS;
-        let next_thread = s.threads.get_mut(&next).unwrap();
-        next_thread.state = State::Running;
-        let load_rsp = next_thread.rsp;
+        s.threads.get_mut(&next).unwrap().state = State::Running;
         if next == current {
             return None;
         }
         s.current = next;
-        let save_rsp = &raw mut s.threads.get_mut(&current).unwrap().rsp;
-        Some((save_rsp, load_rsp))
+
+        // Swap the user-visible state the switch itself doesn't cover.
+        let old = s.threads.get_mut(&current).unwrap();
+        fpu::save(&mut old.fpu);
+        old.fs_base = syscall::fs_base();
+        let old_address_space = old.address_space;
+        let save_rsp = &raw mut old.rsp;
+
+        let new = &s.threads[&next];
+        fpu::restore(&new.fpu);
+        syscall::set_fs_base(new.fs_base);
+        syscall::set_kernel_stack(new.kernel_stack_top);
+        if new.address_space != old_address_space {
+            // SAFETY: every address space shares the kernel half, where
+            // this code and the stacks live.
+            unsafe { arch::set_page_table_root(new.address_space) };
+        }
+        Some((save_rsp, new.rsp))
     });
 
     if let Some((save_rsp, load_rsp)) = switch {
@@ -376,6 +475,18 @@ fn schedule() {
 }
 
 impl Scheduler {
+    fn make_ready(&mut self, id: ThreadId, from: &[State]) {
+        if let Some(thread) = self.threads.get_mut(&id)
+            && from.contains(&thread.state)
+        {
+            thread.state = State::Ready;
+            self.ready.push_back(id);
+            if self.current == self.idle {
+                NEED_RESCHEDULE.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Frees threads that have exited, except the current one, whose stack
     /// is still in use.
     fn reap(&mut self) {
@@ -445,7 +556,7 @@ mod tests {
 
         fn yielding_threads_take_turns() {
             let order = Arc::new(SpinLock::new(Vec::new()));
-            let ids = [b'a', b'b'].map(|letter| {
+            let ids = (*b"ab").map(|letter| {
                 let order = order.clone();
                 spawn("taker", move || {
                     for _ in 0..3 {

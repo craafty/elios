@@ -24,11 +24,12 @@ use core::ptr;
 use bootinfo::{BootInfo, Framebuffer, HHDM_OFFSET, KERNEL_BASE, KERNEL_STACK_SIZE, MemoryRegion};
 
 use crate::elf::{Elf, PF_R, PF_W, PF_X, PT_LOAD};
-use crate::memory::{ELIOS_BOOT_INFO, ELIOS_KERNEL, ELIOS_KERNEL_STACK, MemoryMap, PAGE_SIZE};
+use crate::memory::{ELIOS_BOOT_INFO, ELIOS_INITRD, ELIOS_KERNEL, ELIOS_KERNEL_STACK, MemoryMap, PAGE_SIZE};
 use crate::paging::{NO_EXECUTE, PageTables, WRITABLE};
-use crate::uefi::{Error, Handle, Status, SystemTable};
+use crate::uefi::{Error, Handle, MemoryType, Status, SystemTable};
 
 const KERNEL_PATH: &str = "\\EFI\\eliOS\\kernel.elf";
+const INITRD_PATH: &str = "\\EFI\\eliOS\\initrd.cpio";
 
 #[unsafe(no_mangle)]
 extern "efiapi" fn efi_main(image: Handle, system_table: *mut SystemTable) -> Status {
@@ -74,9 +75,22 @@ fn boot(image: Handle) -> Result<Infallible, Error> {
 
     let mut page_tables = PageTables::new(no_execute)?;
 
-    let kernel_file = fs::read_file(image, KERNEL_PATH)?;
+    let kernel_file = fs::read_file(image, KERNEL_PATH, MemoryType::LOADER_DATA)?;
     println!("kernel:      {KERNEL_PATH} ({} KiB)", kernel_file.len() / 1024);
     let entry = load_kernel(kernel_file, &mut page_tables)?;
+
+    // The initrd is optional: without one the kernel boots to a prompt-less
+    // console, which is still useful for debugging.
+    let initrd = match fs::read_file(image, INITRD_PATH, ELIOS_INITRD) {
+        Ok(initrd) => {
+            println!("initrd:      {INITRD_PATH} ({} KiB)", initrd.len() / 1024);
+            Some(initrd)
+        }
+        Err(error) => {
+            println!("initrd:      none ({error})");
+            None
+        }
+    };
 
     let stack_pages = (KERNEL_STACK_SIZE / PAGE_SIZE) as usize;
     let stack = memory::allocate_pages(ELIOS_KERNEL_STACK, stack_pages)?;
@@ -133,6 +147,8 @@ fn boot(image: Handle) -> Result<Infallible, Error> {
             memory_region_count: region_count as u64,
             framebuffer: framebuffer.unwrap_or(Framebuffer::ABSENT),
             rsdp: rsdp.unwrap_or(0),
+            initrd: initrd.map_or(ptr::null(), |initrd| (HHDM_OFFSET + initrd.as_ptr() as u64) as *const u8),
+            initrd_size: initrd.map_or(0, |initrd| initrd.len() as u64),
         });
 
         if no_execute {

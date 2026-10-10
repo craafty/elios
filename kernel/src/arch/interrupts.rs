@@ -89,6 +89,12 @@ interrupt_stubs:
     .endr
 
 interrupt_common:
+    // Coming from user mode (the saved CS has privilege level 3), switch
+    // to the kernel's GS base, which points at this CPU's data.
+    testq $3, 24(%rsp)
+    jz 1f
+    swapgs
+1:
     pushq %rax
     pushq %rbx
     pushq %rcx
@@ -108,6 +114,12 @@ interrupt_common:
     cld
     movq %rsp, %rdi
     call interrupt_dispatch
+
+    // Restores the registers in an InterruptFrame at %rsp and returns to
+    // where it says. Also how system calls return, and how new user threads
+    // first enter user mode.
+    .global interrupt_return
+interrupt_return:
     popq %r15
     popq %r14
     popq %r13
@@ -125,6 +137,10 @@ interrupt_common:
     popq %rax
     // Drop the vector number and error code.
     addq $16, %rsp
+    testq $3, 8(%rsp)
+    jz 2f
+    swapgs
+2:
     iretq
     "#,
     options(att_syntax)
@@ -209,8 +225,14 @@ pub fn set_handler(vector: u8, handler: Handler) {
 #[unsafe(no_mangle)]
 extern "sysv64" fn interrupt_dispatch(frame: &mut InterruptFrame) {
     let vector = frame.vector as u8;
+    let from_user = frame.cs & 3 == 3;
     if vector < 32 {
-        handle_exception(frame);
+        if from_user {
+            crate::process::handle_user_exception(frame);
+            crate::process::before_return_to_user();
+        } else {
+            handle_exception(frame);
+        }
         return;
     }
 
@@ -222,6 +244,9 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut InterruptFrame) {
         handler(frame);
     } else if (PIC_BASE..IRQ_BASE).contains(&vector) || vector == SPURIOUS {
         // Spurious interrupts need no acknowledgment.
+        if from_user {
+            crate::process::before_return_to_user();
+        }
         return;
     } else {
         warn!("unexpected interrupt on vector {vector:#x}");
@@ -232,6 +257,9 @@ extern "sysv64" fn interrupt_dispatch(frame: &mut InterruptFrame) {
         // The interrupt is fully handled, so this is a safe point to switch
         // threads if the timer (or a wakeup) asked for it.
         crate::task::preempt_point();
+    }
+    if from_user {
+        crate::process::before_return_to_user();
     }
 }
 

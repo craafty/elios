@@ -146,6 +146,11 @@ impl<'a> Console<'a> {
         console
     }
 
+    /// Columns and rows of text.
+    pub fn size(&self) -> (usize, usize) {
+        (self.columns, self.rows)
+    }
+
     #[cfg(test)]
     pub fn cursor(&self) -> (usize, usize) {
         (self.column, self.row)

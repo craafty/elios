@@ -15,15 +15,23 @@ mod acpi;
 mod arch;
 mod collections;
 mod console;
+mod errno;
 mod font;
 mod framebuffer;
+mod fs;
 mod keyboard;
 mod logo;
 mod memory;
+mod power;
+mod process;
+mod random;
+mod rtc;
 mod serial;
 mod sync;
+mod syscall;
 mod task;
 mod time;
+mod tty;
 
 use core::fmt::{self, Write as _};
 use core::panic::PanicInfo;
@@ -31,7 +39,6 @@ use core::panic::PanicInfo;
 use bootinfo::BootInfo;
 
 use crate::framebuffer::Framebuffer;
-use crate::keyboard::Key;
 use crate::memory::{CacheType, KernelStack};
 use crate::sync::SpinLock;
 
@@ -62,7 +69,9 @@ pub extern "sysv64" fn _start(boot_info: &'static BootInfo) -> ! {
 
     arch::gdt::init();
     arch::interrupts::init();
-    debug!("GDT, TSS and IDT loaded");
+    arch::syscall::init();
+    arch::fpu::init();
+    debug!("GDT, TSS, IDT, system calls and FPU set up");
 
     match acpi::init(boot_info.rsdp) {
         Ok(madt) => info!(
@@ -119,6 +128,25 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
         Ok(()) => info!("keyboard: PS/2 ready"),
         Err(error) => warn!("keyboard: {error}"),
     }
+
+    let initrd = boot_info.initrd();
+    fs::init(initrd);
+    if let Some(initrd) = initrd {
+        // Unpacked; the original isn't needed any more.
+        let start = initrd.as_ptr() as u64 - boot_info.hhdm_offset;
+        memory::frames::reclaim(start, start + initrd.len() as u64);
+    }
+    if let Ok(name) = fs::lookup("/", "/etc/hostname", true) {
+        let mut buffer = [0; 64];
+        let len = name.read_at(0, &mut buffer).unwrap_or(0);
+        if let Ok(text) = core::str::from_utf8(&buffer[..len]) {
+            *syscall::HOSTNAME.lock() = alloc::string::String::from(text.trim());
+        }
+    }
+    if let Err(error) = serial::enable_input() {
+        warn!("serial: no input: {error}");
+    }
+    keyboard::start_terminal_input();
     arch::enable_interrupts();
 
     #[cfg(test)]
@@ -126,40 +154,11 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
 
     #[cfg(not(test))]
     {
-        task::spawn("console", input_loop);
-        info!("boot complete");
-        task::exit()
-    }
-}
-
-/// Echoes what's typed until there's a shell to run.
-#[cfg_attr(test, allow(dead_code))]
-fn input_loop() {
-    println!("\nType away! Ctrl+L clears the screen.\n");
-    // Show the cursor, then prompt.
-    print!("\x1B[?25h> ");
-    let mut decoder = keyboard::Decoder::default();
-    let mut line_length = 0;
-    loop {
-        match decoder.feed(keyboard::read_scancode()) {
-            Some(Key::Char(c)) => {
-                print!("{c}");
-                line_length += 1;
-            }
-            Some(Key::Backspace) if line_length > 0 => {
-                print!("\x08 \x08");
-                line_length -= 1;
-            }
-            Some(Key::Enter) => {
-                print!("\n> ");
-                line_length = 0;
-            }
-            Some(Key::Ctrl('l')) => {
-                print!("\x1B[2J\x1B[H> ");
-                line_length = 0;
-            }
-            _ => {}
+        match process::start_init("/sbin/init") {
+            Ok(_) => info!("boot complete, starting /sbin/init"),
+            Err(error) => error!("can't start /sbin/init: {error:?}; is the initrd missing?"),
         }
+        task::exit()
     }
 }
 

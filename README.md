@@ -27,9 +27,35 @@ cargo xtask test              # run the kernel's tests inside QEMU
 cargo xtask build --release   # just build
 ```
 
-Kernel and bootloader logs appear on the serial port, which is your terminal.
-The kernel also logs to the screen; `debug!` messages go to serial only.
-Once booted, eliOS echoes what you type (Ctrl+L clears the screen).
+eliOS boots to a shell. Type in the QEMU window, or in the terminal you ran
+`cargo xtask run` from: the serial port is a second console. Try `help`,
+`fetch`, `ls -l /bin`, `ps`, or `cat ~/README.txt` for a tour.
+
+Building user programs needs the `rust-src` component (installed by
+`rust-toolchain.toml`): their target, `x86_64-unknown-linux-none`, builds the
+standard library from source.
+
+## Userspace
+
+eliOS implements the **Linux x86_64 system call ABI**: the same call numbers,
+registers, structures and error codes. Its own programs are written against
+that ABI, so they are ordinary static Linux executables (they run on Linux
+too).
+
+- `user/eli` is **libeli**, eliOS's runtime for Rust programs: startup, a
+  memory allocator, and a small standard library (I/O, files, processes,
+  terminals, time).
+- `user/utils` is **eliutils**, one binary holding the shell, `init` and the
+  core commands. `/bin` has a link per command; the name it's run as picks
+  the command.
+- `rootfs/` is copied into the root file system. `cargo xtask build` packs it
+  with the programs into a cpio initrd, which eliboot loads and the kernel
+  unpacks into an in-memory file system.
+
+The shell (`sh`) has pipes, redirection (`<`, `>`, `>>`, `2>&1`), `;` `&&`
+`||`, background jobs, quoting, `$VARIABLES`, `~`, `*` wildcards, scripts,
+history (arrow keys) and Tab completion. Ctrl+C interrupts the foreground
+program: each pipeline runs in its own process group.
 
 ## Tests
 
@@ -63,7 +89,10 @@ turns the file into the kernel's glyph tables.
 | `kernel/`   | The kernel (`x86_64-unknown-none`), linked at `0xFFFFFFFF80000000` |
 | `kernel/font/` | The console font, as editable ASCII art                      |
 | `bootinfo/` | The boot protocol: the contract between eliboot and the kernel   |
-| `xtask/`    | Build tool: compiles everything, lays out the boot volume, runs QEMU |
+| `user/eli/` | libeli, the runtime for user programs                            |
+| `user/utils/` | eliutils: shell, init and commands                             |
+| `rootfs/`   | Files for the root file system (`/etc`, `/home`)                 |
+| `xtask/`    | Build tool: compiles everything, builds the initrd, runs QEMU    |
 
 ## How it boots
 
@@ -93,8 +122,12 @@ The exact machine state at kernel entry is documented in `bootinfo/src/lib.rs`.
 - [x] **Phase 4: Multitasking.** Kernel threads on guarded stacks,
       assembly context switch, preemptive round-robin scheduler, sleep,
       wait queues, join, stack reaping
-- [ ] **Phase 5: Userspace.** Ring 3, `syscall`/`sysret`, ELF process loading,
-      per-process address spaces
+- [x] **Phase 5: Userspace.** Ring 3 and `syscall`, per-process address
+      spaces with demand paging, ELF loading with the Linux initial stack,
+      fork/exec/wait/exit, signals (default actions), the Linux system call
+      ABI (~90 calls), VFS with an in-memory file system, cpio initrd, pipes,
+      a TTY with line editing and job control, libeli, and eliutils (shell,
+      init and ~40 commands)
 - [ ] **Phase 6: Storage.** ACPI parsing, PCI, a disk driver (AHCI/NVMe/virtio),
       VFS, a native eliOS file system plus FAT32/ext2 for interop
 - [ ] **Phase 7: Linux compatibility.** Linux syscall ABI: static binaries

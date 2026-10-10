@@ -1,0 +1,6 @@
+[package]
+name = "eli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

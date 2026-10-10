@@ -31,7 +31,7 @@
 pub const MAGIC: u64 = u64::from_le_bytes(*b"eliOSbi\0");
 
 /// Bumped on every incompatible change to the structures in this crate.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Where all of physical memory is mapped (the "higher half direct map").
 pub const HHDM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
@@ -59,6 +59,10 @@ pub struct BootInfo {
     pub framebuffer: Framebuffer,
     /// Physical address of the ACPI RSDP, or 0 if the firmware has none.
     pub rsdp: u64,
+    /// The initial RAM disk (a cpio archive), mapped in the direct map, or
+    /// null with size 0 if there is none.
+    pub initrd: *const u8,
+    pub initrd_size: u64,
 }
 
 impl BootInfo {
@@ -72,6 +76,12 @@ impl BootInfo {
         // SAFETY: the bootloader guarantees the pointer and count describe a
         // live array in memory tagged `MemoryKind::BootInfo`.
         unsafe { core::slice::from_raw_parts(self.memory_regions, self.memory_region_count as usize) }
+    }
+
+    pub fn initrd(&self) -> Option<&[u8]> {
+        // SAFETY: the bootloader guarantees the pointer and size describe
+        // memory tagged `MemoryKind::Initrd`.
+        (self.initrd_size > 0).then(|| unsafe { core::slice::from_raw_parts(self.initrd, self.initrd_size as usize) })
     }
 
     pub fn framebuffer(&self) -> Option<&Framebuffer> {
@@ -122,6 +132,8 @@ pub enum MemoryKind {
     Defective = 12,
     /// Non-volatile RAM.
     Persistent = 13,
+    /// The initial RAM disk. Free once the kernel has unpacked it.
+    Initrd = 14,
 }
 
 #[repr(C)]

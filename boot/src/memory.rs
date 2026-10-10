@@ -15,6 +15,7 @@ pub const ELIOS_KERNEL: MemoryType = MemoryType(0x8000_0000);
 pub const ELIOS_KERNEL_STACK: MemoryType = MemoryType(0x8000_0001);
 pub const ELIOS_PAGE_TABLES: MemoryType = MemoryType(0x8000_0002);
 pub const ELIOS_BOOT_INFO: MemoryType = MemoryType(0x8000_0003);
+pub const ELIOS_INITRD: MemoryType = MemoryType(0x8000_0004);
 
 /// Allocates `count` contiguous pages and returns their physical address
 /// (which is also their address in the firmware's identity mapping).
@@ -163,6 +164,7 @@ fn kind_of(ty: MemoryType) -> MemoryKind {
         ELIOS_KERNEL_STACK => MemoryKind::KernelStack,
         ELIOS_PAGE_TABLES => MemoryKind::PageTables,
         ELIOS_BOOT_INFO => MemoryKind::BootInfo,
+        ELIOS_INITRD => MemoryKind::Initrd,
         _ => MemoryKind::Reserved,
     }
 }

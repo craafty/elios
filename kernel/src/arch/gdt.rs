@@ -9,14 +9,13 @@
 //! code.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::sync::TakeOnce;
 
 pub const KERNEL_CODE: u16 = 0x08;
 pub const KERNEL_DATA: u16 = 0x10;
-#[allow(dead_code, reason = "used once userspace exists (Phase 5)")]
 pub const USER_DATA: u16 = 0x18 | 3;
-#[allow(dead_code, reason = "used once userspace exists (Phase 5)")]
 pub const USER_CODE: u16 = 0x20 | 3;
 pub const TSS: u16 = 0x28;
 
@@ -57,6 +56,9 @@ static TSS_STORAGE: TakeOnce<TaskStateSegment> = TakeOnce::new(TaskStateSegment 
     io_bitmap_offset: 0,
 });
 
+/// Where the TSS ended up, for updating the kernel stack pointer in it.
+static TSS_ADDRESS: AtomicU64 = AtomicU64::new(0);
+
 /// Null, kernel code/data, user data/code, and the TSS (which takes two
 /// slots).
 static GDT: TakeOnce<[u64; 7]> = TakeOnce::new([0; 7]);
@@ -96,6 +98,8 @@ pub fn init() {
         io_bitmap_offset: size_of::<TaskStateSegment>() as u16,
     };
 
+    TSS_ADDRESS.store(core::ptr::from_mut(tss) as u64, Ordering::Relaxed);
+
     let gdt = GDT.take().expect("GDT initialized twice");
     let (tss_low, tss_high) = tss_descriptor(core::ptr::from_ref(tss) as u64);
     *gdt = [
@@ -133,6 +137,15 @@ pub fn init() {
             scratch = out(reg) _,
         );
     }
+}
+
+/// Sets the stack the CPU switches to when an interrupt arrives in user
+/// mode. Called on every switch to a thread.
+pub fn set_kernel_stack(top: u64) {
+    let tss = TSS_ADDRESS.load(Ordering::Relaxed) as *mut TaskStateSegment;
+    // SAFETY: the TSS is 'static; the field is misaligned (it's packed),
+    // hence the unaligned write.
+    unsafe { (&raw mut (*tss).privilege_stacks).cast::<u64>().write_unaligned(top) };
 }
 
 /// The two 8-byte halves of a 64-bit TSS descriptor.

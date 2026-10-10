@@ -38,6 +38,11 @@ impl<T> SpinLock<T> {
         SpinLockGuard { lock: self, interrupts_were_enabled }
     }
 
+    /// Access through exclusive ownership needs no locking.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.value.get_mut()
+    }
+
     /// Takes the lock only if it is free right now.
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
         let interrupts_were_enabled = arch::interrupts_enabled();
@@ -70,6 +75,12 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: holding the guard means holding the lock.
         unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl<T: core::fmt::Display> core::fmt::Display for SpinLockGuard<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        (**self).fmt(f)
     }
 }
 

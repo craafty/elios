@@ -1,0 +1,452 @@
+//! The virtual file system.
+//!
+//! Everything a program can open is an [`Inode`]: files and directories in
+//! the in-memory file system, devices like the console, pipes. Paths are
+//! resolved from the root (or a process's working directory) one component
+//! at a time, following symbolic links.
+//!
+//! An [`OpenFile`] is what `open` creates: an inode plus a position and
+//! flags. File descriptors point at open files, and `dup` and `fork` share
+//! them, so the position is shared too, as on Linux.
+
+pub mod cpio;
+pub mod devfs;
+pub mod pipe;
+pub mod ramfs;
+
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use crate::errno::{Errno, Result};
+use crate::sync::{Once, SpinLock};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    Regular,
+    Directory,
+    Symlink,
+    CharDevice,
+    Fifo,
+}
+
+impl FileKind {
+    /// The file type bits of `st_mode`.
+    pub fn mode_bits(self) -> u32 {
+        match self {
+            FileKind::Regular => 0o100000,
+            FileKind::Directory => 0o040000,
+            FileKind::Symlink => 0o120000,
+            FileKind::CharDevice => 0o020000,
+            FileKind::Fifo => 0o010000,
+        }
+    }
+
+    /// The `d_type` value used by `getdents64`.
+    pub fn dirent_type(self) -> u8 {
+        match self {
+            FileKind::Fifo => 1,
+            FileKind::CharDevice => 2,
+            FileKind::Directory => 4,
+            FileKind::Regular => 8,
+            FileKind::Symlink => 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Metadata {
+    pub kind: FileKind,
+    pub inode: u64,
+    pub size: u64,
+    /// Permission bits (the low 12 bits of `st_mode`).
+    pub permissions: u32,
+    /// Seconds since the Unix epoch.
+    pub modified: u64,
+}
+
+/// A file system object. Every operation has a default that refuses it, so
+/// each kind of inode implements only what makes sense for it.
+pub trait Inode: Send + Sync {
+    fn metadata(&self) -> Metadata;
+
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize> {
+        Err(self.not_a_file())
+    }
+
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize> {
+        Err(self.not_a_file())
+    }
+
+    fn truncate(&self, _len: u64) -> Result<()> {
+        Err(self.not_a_file())
+    }
+
+    /// Whether reads and writes use the file position (pipes and terminals
+    /// don't).
+    fn seekable(&self) -> bool {
+        true
+    }
+
+    fn lookup(&self, _name: &str) -> Result<Arc<dyn Inode>> {
+        Err(Errno::ENOTDIR)
+    }
+
+    fn create(&self, _name: &str, _kind: FileKind) -> Result<Arc<dyn Inode>> {
+        Err(Errno::ENOTDIR)
+    }
+
+    /// Adds an existing inode under another name (hard link or rename).
+    fn link(&self, _name: &str, _inode: Arc<dyn Inode>) -> Result<()> {
+        Err(Errno::ENOTDIR)
+    }
+
+    fn unlink(&self, _name: &str) -> Result<()> {
+        Err(Errno::ENOTDIR)
+    }
+
+    /// Directory entries, not including `.` and `..`.
+    fn entries(&self) -> Result<Vec<(String, Arc<dyn Inode>)>> {
+        Err(Errno::ENOTDIR)
+    }
+
+    /// Where a symbolic link points.
+    fn read_link(&self) -> Result<String> {
+        Err(Errno::EINVAL)
+    }
+
+    fn ioctl(&self, _request: u64, _argument: u64) -> Result<u64> {
+        Err(Errno::ENOTTY)
+    }
+
+    /// Called when the last open file referring to this inode is closed.
+    fn on_close(&self, _flags: u32) {}
+
+    fn not_a_file(&self) -> Errno {
+        if self.metadata().kind == FileKind::Directory { Errno::EISDIR } else { Errno::EINVAL }
+    }
+}
+
+static ROOT: Once<Arc<dyn Inode>> = Once::new();
+
+/// Sets up the root file system: an in-memory directory tree, unpacked from
+/// the initrd (if there is one), with devices under /dev.
+pub fn init(initrd: Option<&[u8]>) {
+    let root: Arc<dyn Inode> = ramfs::Directory::new(0o755);
+    let _ = ROOT.set(root.clone());
+    if let Some(archive) = initrd {
+        match cpio::unpack(archive) {
+            Ok(count) => info!("fs: unpacked {count} files from the initrd"),
+            Err(error) => warn!("fs: initrd is damaged: {error}"),
+        }
+    }
+    let dev = match root.lookup("dev") {
+        Ok(dev) => dev,
+        Err(_) => root.create("dev", FileKind::Directory).expect("can't create /dev"),
+    };
+    devfs::populate(&dev);
+    for directory in ["tmp", "home"] {
+        if root.lookup(directory).is_err() {
+            let _ = root.create(directory, FileKind::Directory);
+        }
+    }
+}
+
+pub fn root() -> Arc<dyn Inode> {
+    ROOT.get().expect("file system not initialized").clone()
+}
+
+/// Makes `path` absolute (relative to `cwd`) and removes `.`, `..` and
+/// repeated slashes. Symbolic links are not involved.
+pub fn normalize(cwd: &str, path: &str) -> String {
+    let mut components: Vec<&str> = Vec::new();
+    let full = if path.starts_with('/') { [path, ""] } else { [cwd, path] };
+    for component in full.iter().flat_map(|part| part.split('/')) {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            name => components.push(name),
+        }
+    }
+    let mut result = String::new();
+    for component in &components {
+        result.push('/');
+        result.push_str(component);
+    }
+    if result.is_empty() {
+        result.push('/');
+    }
+    result
+}
+
+const MAX_SYMLINK_DEPTH: usize = 8;
+
+/// Finds the inode at `path`. A symbolic link as the last component is
+/// followed only if `follow` is set.
+pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<Arc<dyn Inode>> {
+    lookup_depth(cwd, path, follow, 0)
+}
+
+fn lookup_depth(cwd: &str, path: &str, follow: bool, depth: usize) -> Result<Arc<dyn Inode>> {
+    if path.is_empty() {
+        return Err(Errno::ENOENT);
+    }
+    let full = normalize(cwd, path);
+    let components: Vec<&str> = full.split('/').filter(|c| !c.is_empty()).collect();
+    let mut inode = root();
+    for (index, name) in components.iter().enumerate() {
+        let next = inode.lookup(name)?;
+        let last = index + 1 == components.len();
+        if next.metadata().kind == FileKind::Symlink && (follow || !last) {
+            if depth >= MAX_SYMLINK_DEPTH {
+                return Err(Errno::ELOOP);
+            }
+            // Resolve the target relative to the link's directory, then
+            // continue with the rest of the path from there.
+            let directory = format_path(&components[..index]);
+            let target = normalize(&directory, &next.read_link()?);
+            let rest = format_path(&components[index + 1..]);
+            let combined = if rest == "/" { target } else { target + &rest };
+            return lookup_depth("/", &combined, follow, depth + 1);
+        }
+        inode = next;
+    }
+    Ok(inode)
+}
+
+fn format_path(components: &[&str]) -> String {
+    normalize("/", &components.join("/"))
+}
+
+/// Finds the directory that would contain `path`, and the final name.
+pub fn lookup_parent(cwd: &str, path: &str) -> Result<(Arc<dyn Inode>, String)> {
+    let full = normalize(cwd, path);
+    let (directory, name) = full.rsplit_once('/').ok_or(Errno::EINVAL)?;
+    if name.is_empty() {
+        return Err(Errno::EEXIST);
+    }
+    let parent = lookup("/", if directory.is_empty() { "/" } else { directory }, true)?;
+    if parent.metadata().kind != FileKind::Directory {
+        return Err(Errno::ENOTDIR);
+    }
+    Ok((parent, name.to_string()))
+}
+
+// Open flags (Linux values).
+pub const O_ACCMODE: u32 = 0o3;
+pub const O_RDONLY: u32 = 0o0;
+pub const O_WRONLY: u32 = 0o1;
+pub const O_RDWR: u32 = 0o2;
+pub const O_CREAT: u32 = 0o100;
+pub const O_EXCL: u32 = 0o200;
+pub const O_TRUNC: u32 = 0o1000;
+pub const O_APPEND: u32 = 0o2000;
+pub const O_NONBLOCK: u32 = 0o4000;
+pub const O_DIRECTORY: u32 = 0o200000;
+pub const O_NOFOLLOW: u32 = 0o400000;
+pub const O_CLOEXEC: u32 = 0o2000000;
+
+/// An open file: an inode, a position, and how it was opened.
+pub struct OpenFile {
+    pub inode: Arc<dyn Inode>,
+    pub path: String,
+    position: SpinLock<u64>,
+    flags: SpinLock<u32>,
+}
+
+impl OpenFile {
+    pub fn new(inode: Arc<dyn Inode>, path: String, flags: u32) -> Arc<Self> {
+        Arc::new(Self { inode, path, position: SpinLock::new(0), flags: SpinLock::new(flags & !O_CLOEXEC) })
+    }
+
+    pub fn flags(&self) -> u32 {
+        *self.flags.lock()
+    }
+
+    pub fn set_status_flags(&self, flags: u32) {
+        let mut current = self.flags.lock();
+        *current = (*current & !(O_APPEND | O_NONBLOCK)) | (flags & (O_APPEND | O_NONBLOCK));
+    }
+
+    pub fn readable(&self) -> bool {
+        self.flags() & O_ACCMODE != O_WRONLY
+    }
+
+    pub fn writable(&self) -> bool {
+        self.flags() & O_ACCMODE != O_RDONLY
+    }
+
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        if !self.readable() {
+            return Err(Errno::EBADF);
+        }
+        if !self.inode.seekable() {
+            return self.inode.read_at(0, buf);
+        }
+        // The position lock isn't held across the read: reads may block,
+        // and a spinlock must never be held while sleeping.
+        let position = *self.position.lock();
+        let count = self.inode.read_at(position, buf)?;
+        *self.position.lock() = position + count as u64;
+        Ok(count)
+    }
+
+    pub fn write(&self, buf: &[u8]) -> Result<usize> {
+        if !self.writable() {
+            return Err(Errno::EBADF);
+        }
+        if !self.inode.seekable() {
+            return self.inode.write_at(0, buf);
+        }
+        let position = if self.flags() & O_APPEND != 0 { self.inode.metadata().size } else { *self.position.lock() };
+        let count = self.inode.write_at(position, buf)?;
+        *self.position.lock() = position + count as u64;
+        Ok(count)
+    }
+
+    pub fn seek(&self, offset: i64, whence: u32) -> Result<u64> {
+        if !self.inode.seekable() {
+            return Err(Errno::ESPIPE);
+        }
+        let mut position = self.position.lock();
+        let base = match whence {
+            0 => 0,
+            1 => *position as i64,
+            2 => self.inode.metadata().size as i64,
+            _ => return Err(Errno::EINVAL),
+        };
+        let target = base.checked_add(offset).filter(|&target| target >= 0).ok_or(Errno::EINVAL)?;
+        *position = target as u64;
+        Ok(*position)
+    }
+
+    pub fn position(&self) -> u64 {
+        *self.position.lock()
+    }
+
+    pub fn set_position(&self, position: u64) {
+        *self.position.lock() = position;
+    }
+}
+
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        self.inode.on_close(*self.flags.get_mut());
+    }
+}
+
+pub const MAX_FILES: usize = 256;
+
+#[derive(Clone)]
+struct Descriptor {
+    file: Arc<OpenFile>,
+    close_on_exec: bool,
+}
+
+/// A process's file descriptors.
+#[derive(Clone, Default)]
+pub struct FileTable {
+    slots: Vec<Option<Descriptor>>,
+}
+
+impl FileTable {
+    /// Stores `file` in the lowest free descriptor at or above `minimum`.
+    pub fn insert(&mut self, file: Arc<OpenFile>, close_on_exec: bool, minimum: usize) -> Result<usize> {
+        let fd =
+            (minimum..MAX_FILES).find(|&fd| self.slots.get(fd).is_none_or(Option::is_none)).ok_or(Errno::EMFILE)?;
+        self.place(fd, file, close_on_exec);
+        Ok(fd)
+    }
+
+    /// Stores `file` at `fd`, closing what was there.
+    pub fn place(&mut self, fd: usize, file: Arc<OpenFile>, close_on_exec: bool) {
+        if self.slots.len() <= fd {
+            self.slots.resize(fd + 1, None);
+        }
+        self.slots[fd] = Some(Descriptor { file, close_on_exec });
+    }
+
+    pub fn get(&self, fd: usize) -> Result<Arc<OpenFile>> {
+        self.slots.get(fd).and_then(Option::as_ref).map(|d| d.file.clone()).ok_or(Errno::EBADF)
+    }
+
+    pub fn close(&mut self, fd: usize) -> Result<()> {
+        self.slots.get_mut(fd).and_then(Option::take).map(|_| ()).ok_or(Errno::EBADF)
+    }
+
+    pub fn close_on_exec(&self, fd: usize) -> Result<bool> {
+        self.slots.get(fd).and_then(Option::as_ref).map(|d| d.close_on_exec).ok_or(Errno::EBADF)
+    }
+
+    pub fn set_close_on_exec(&mut self, fd: usize, value: bool) -> Result<()> {
+        let descriptor = self.slots.get_mut(fd).and_then(Option::as_mut).ok_or(Errno::EBADF)?;
+        descriptor.close_on_exec = value;
+        Ok(())
+    }
+
+    /// Closes the descriptors marked close-on-exec.
+    pub fn exec(&mut self) {
+        for slot in &mut self.slots {
+            if slot.as_ref().is_some_and(|d| d.close_on_exec) {
+                *slot = None;
+            }
+        }
+    }
+
+    pub fn close_all(&mut self) {
+        self.slots.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    crate::ktest! {
+        fn paths_are_normalized() {
+            assert_eq!(normalize("/home", "notes.txt"), "/home/notes.txt");
+            assert_eq!(normalize("/a/b", "../c/./d/"), "/a/c/d");
+            assert_eq!(normalize("/a", "/x//y/.."), "/x");
+            assert_eq!(normalize("/", ".."), "/");
+        }
+
+        fn files_can_be_created_written_and_read() {
+            let tmp = lookup("/", "/tmp", true).unwrap();
+            let file = tmp.create("vfs-test", FileKind::Regular).unwrap();
+            let open = OpenFile::new(file, "/tmp/vfs-test".into(), O_RDWR);
+            assert_eq!(open.write(b"hello, world"), Ok(12));
+            open.seek(7, 0).unwrap();
+            let mut buf = [0; 16];
+            assert_eq!(open.read(&mut buf), Ok(5));
+            assert_eq!(&buf[..5], b"world");
+            assert_eq!(lookup("/tmp", "vfs-test", true).unwrap().metadata().size, 12);
+            tmp.unlink("vfs-test").unwrap();
+            assert!(lookup("/", "/tmp/vfs-test", true).is_err());
+        }
+
+        fn symlinks_are_followed() {
+            let tmp = lookup("/", "/tmp", true).unwrap();
+            let target = tmp.create("link-target", FileKind::Directory).unwrap();
+            target.create("inside", FileKind::Regular).unwrap();
+            let link = tmp.create("link", FileKind::Symlink).unwrap();
+            link.write_at(0, b"link-target").unwrap();
+            assert_eq!(lookup("/", "/tmp/link/inside", true).unwrap().metadata().kind, FileKind::Regular);
+            assert_eq!(lookup("/", "/tmp/link", false).unwrap().metadata().kind, FileKind::Symlink);
+            assert_eq!(lookup("/", "/tmp/link", true).unwrap().metadata().kind, FileKind::Directory);
+        }
+
+        fn file_tables_hand_out_the_lowest_descriptor() {
+            let null = lookup("/", "/dev/null", true).unwrap();
+            let mut table = FileTable::default();
+            let file = OpenFile::new(null, "/dev/null".into(), O_RDWR);
+            assert_eq!(table.insert(file.clone(), false, 0), Ok(0));
+            assert_eq!(table.insert(file.clone(), true, 0), Ok(1));
+            table.close(0).unwrap();
+            assert_eq!(table.insert(file.clone(), false, 0), Ok(0));
+            table.exec();
+            assert_eq!(table.get(1).err(), Some(Errno::EBADF));
+        }
+    }
+}

@@ -18,6 +18,8 @@ pub const TICK_HZ: u64 = 1000;
 const CALIBRATION_PIT_TICKS: u16 = 59_659;
 
 static TSC_AT_BOOT: AtomicU64 = AtomicU64::new(0);
+/// Wall-clock time at boot, in seconds since the Unix epoch.
+static BOOT_UNIX_TIME: AtomicU64 = AtomicU64::new(0);
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
@@ -36,6 +38,7 @@ pub fn init() {
     let tsc_end = rdtsc();
     let apic_end = apic::timer_count();
 
+    BOOT_UNIX_TIME.store(crate::rtc::read_unix_time(), Ordering::Relaxed);
     let per_second = |elapsed: u64| elapsed * pit::FREQUENCY_HZ / u64::from(CALIBRATION_PIT_TICKS);
     let tsc_hz = per_second(tsc_end - tsc_start);
     let apic_hz = per_second(u64::from(apic_start - apic_end));
@@ -70,6 +73,16 @@ pub fn uptime_nanos() -> u64 {
     }
     let elapsed = rdtsc().saturating_sub(TSC_AT_BOOT.load(Ordering::Relaxed));
     (u128::from(elapsed) * 1_000_000_000 / u128::from(hz)) as u64
+}
+
+/// Wall-clock time in nanoseconds since the Unix epoch.
+pub fn unix_nanos() -> u64 {
+    BOOT_UNIX_TIME.load(Ordering::Relaxed) * 1_000_000_000 + uptime_nanos()
+}
+
+/// Wall-clock time in seconds since the Unix epoch.
+pub fn unix_time() -> u64 {
+    unix_nanos() / 1_000_000_000
 }
 
 /// Whether the TSC runs at a constant rate regardless of CPU power states.

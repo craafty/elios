@@ -3,8 +3,10 @@
 
 use core::fmt;
 
-use crate::arch::{inb, outb};
+use crate::arch::interrupts::{self, IRQ_BASE, InterruptFrame};
+use crate::arch::{apic, inb, outb};
 use crate::sync::SpinLock;
+use crate::tty;
 
 const COM1: u16 = 0x3F8;
 
@@ -69,6 +71,30 @@ static PORT: SpinLock<SerialPort> = SpinLock::new(SerialPort::new(COM1));
 
 pub fn init() {
     PORT.lock().init();
+}
+
+const SERIAL_IRQ: u8 = 4;
+const LINE_STATUS_DATA_READY: u8 = 1 << 0;
+
+/// Delivers bytes received on the serial port to the console terminal, so
+/// it can be used from a serial terminal (or a script) as well as the
+/// keyboard.
+pub fn enable_input() -> Result<(), &'static str> {
+    interrupts::set_handler(IRQ_BASE + SERIAL_IRQ, on_interrupt);
+    // SAFETY: enables only the "data received" interrupt.
+    unsafe { outb(COM1 + INTERRUPT_ENABLE, 0x01) };
+    apic::route_isa_irq(SERIAL_IRQ, IRQ_BASE + SERIAL_IRQ)
+}
+
+fn on_interrupt(_frame: &mut InterruptFrame) {
+    let mut bytes = [0; 16];
+    let mut count = 0;
+    // SAFETY: reading received bytes while the UART says it has some.
+    while count < bytes.len() && unsafe { inb(COM1 + LINE_STATUS) } & LINE_STATUS_DATA_READY != 0 {
+        bytes[count] = unsafe { inb(COM1 + DATA) };
+        count += 1;
+    }
+    tty::input(&bytes[..count]);
 }
 
 pub fn write_fmt(args: fmt::Arguments) {

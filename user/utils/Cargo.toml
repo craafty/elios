@@ -1,0 +1,7 @@
+[package]
+name = "eliutils"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+eli = { path = "../eli" }

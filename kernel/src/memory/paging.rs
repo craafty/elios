@@ -3,6 +3,8 @@
 //! Tables are reached through the direct map, so any page table can be
 //! edited, active or not.
 
+use alloc::vec::Vec;
+
 use super::{frames, phys_to_virt};
 use crate::arch;
 
@@ -177,6 +179,79 @@ impl PageTable {
         *entry = 0;
         arch::flush_tlb_page(virt);
         Some(mapping)
+    }
+
+    /// Changes the flags of the page mapping `virt`, keeping its address.
+    pub fn set_flags(&mut self, virt: u64, flags: u64) -> Option<()> {
+        let (entry, mapping) = self.leaf(virt)?;
+        let huge = if mapping.size == PageSize::Small { 0 } else { HUGE };
+        *entry = mapping.phys | flags | huge | PRESENT;
+        arch::flush_tlb_page(virt);
+        Some(())
+    }
+
+    /// Every page mapped in the lower (user) half, with its address.
+    pub fn user_pages(&self) -> Vec<(u64, Mapping)> {
+        let mut pages = Vec::new();
+        for (pml4_index, &pml4e) in entries(self.root)[..256].iter().enumerate() {
+            if pml4e & PRESENT == 0 {
+                continue;
+            }
+            for (pdpt_index, &pdpte) in entries(pml4e & ADDRESS_MASK).iter().enumerate() {
+                if pdpte & PRESENT == 0 || pdpte & HUGE != 0 {
+                    continue;
+                }
+                for (pd_index, &pde) in entries(pdpte & ADDRESS_MASK).iter().enumerate() {
+                    if pde & PRESENT == 0 || pde & HUGE != 0 {
+                        continue;
+                    }
+                    for (pt_index, &pte) in entries(pde & ADDRESS_MASK).iter().enumerate() {
+                        if pte & PRESENT != 0 {
+                            let virt = (pml4_index as u64) << 39
+                                | (pdpt_index as u64) << 30
+                                | (pd_index as u64) << 21
+                                | (pt_index as u64) << 12;
+                            let mapping =
+                                Mapping { phys: pte & ADDRESS_MASK, size: PageSize::Small, flags: pte & !ADDRESS_MASK };
+                            pages.push((virt, mapping));
+                        }
+                    }
+                }
+            }
+        }
+        pages
+    }
+
+    /// Frees the page tables of the lower half and the PML4 itself. The
+    /// pages they mapped must already have been dealt with.
+    pub fn free_user_tables(self) {
+        for &pml4e in &entries(self.root)[..256] {
+            if pml4e & PRESENT == 0 {
+                continue;
+            }
+            let pdpt = pml4e & ADDRESS_MASK;
+            for &pdpte in entries(pdpt).iter() {
+                if pdpte & PRESENT == 0 || pdpte & HUGE != 0 {
+                    continue;
+                }
+                let pd = pdpte & ADDRESS_MASK;
+                for &pde in entries(pd).iter() {
+                    if pde & PRESENT != 0 && pde & HUGE == 0 {
+                        frames::free(pde & ADDRESS_MASK);
+                    }
+                }
+                frames::free(pd);
+            }
+            frames::free(pdpt);
+        }
+        frames::free(self.root);
+    }
+
+    /// Copies the top-level entries for the kernel half from `kernel`, so
+    /// this address space shares all kernel mappings.
+    pub fn share_kernel_half(&mut self, kernel: u64) {
+        let source = *entries(kernel);
+        entries(self.root)[256..].copy_from_slice(&source[256..]);
     }
 
     /// The page containing `virt`, if mapped.

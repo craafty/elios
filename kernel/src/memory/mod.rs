@@ -45,6 +45,7 @@ const REGION_SIZE: u64 = 512 << 30;
 const KERNEL_HALF: u64 = 0xFFFF_8000_0000_0000;
 
 static DIRECT_MAP_OFFSET: AtomicU64 = AtomicU64::new(0);
+static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 static KERNEL_PAGE_TABLE: SpinLock<Option<PageTable>> = SpinLock::new(None);
 static NEXT_DEVICE: AtomicU64 = AtomicU64::new(DEVICE_START);
 static NEXT_STACK: AtomicU64 = AtomicU64::new(STACKS_START);
@@ -82,6 +83,7 @@ pub fn init(boot_info: &BootInfo) {
     // SAFETY: the new tables map the kernel image, the stack (direct map)
     // and every structure in use, all at their current addresses.
     unsafe { arch::set_page_table_root(table.root()) };
+    KERNEL_ROOT.store(table.root(), Ordering::Relaxed);
     *KERNEL_PAGE_TABLE.lock() = Some(table);
 }
 
@@ -257,9 +259,10 @@ pub fn translate(virt: u64) -> Option<paging::Mapping> {
     with_kernel_table(|table| table.translate(virt))
 }
 
-#[cfg(test)]
+/// Physical address of the kernel's PML4. Its upper half is shared by every
+/// address space.
 pub fn kernel_page_table_root() -> u64 {
-    with_kernel_table(|table| table.root())
+    KERNEL_ROOT.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]

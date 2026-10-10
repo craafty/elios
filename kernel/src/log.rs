@@ -71,6 +71,16 @@ impl Level {
     }
 }
 
+/// Writes program output to the screen and serial port. Unlike kernel
+/// messages, it isn't kept in the kernel log.
+pub fn write_terminal(text: &str) {
+    serial::write_fmt(format_args!("{text}"));
+    console::with(|console| {
+        let _ = console.write_str(text);
+        console.flush();
+    });
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     let _ = LOG.lock().write_fmt(args);

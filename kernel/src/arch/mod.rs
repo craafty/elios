@@ -2,10 +2,12 @@
 //! interrupt controllers.
 
 pub mod apic;
+pub mod fpu;
 pub mod gdt;
 pub mod interrupts;
 pub mod pic;
 pub mod pit;
+pub mod syscall;
 
 use core::arch::asm;
 
@@ -13,6 +15,12 @@ use core::arch::asm;
 /// Writing to an I/O port can reconfigure hardware arbitrarily.
 pub unsafe fn outb(port: u16, value: u8) {
     unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags)) };
+}
+
+/// # Safety
+/// Writing to an I/O port can reconfigure hardware arbitrarily.
+pub unsafe fn outw(port: u16, value: u16) {
+    unsafe { asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags)) };
 }
 
 /// # Safety
@@ -71,6 +79,22 @@ pub fn cpuid(leaf: u32, subleaf: u32) -> [u32; 4] {
         );
     }
     [eax, rbx as u32, ecx, edx]
+}
+
+/// A hardware random number, if the CPU has a generator (RDRAND).
+pub fn hardware_random() -> Option<u64> {
+    if cpuid(1, 0)[2] & (1 << 30) == 0 {
+        return None;
+    }
+    for _ in 0..10 {
+        let (value, ok): (u64, u8);
+        // SAFETY: the CPU supports rdrand (checked above).
+        unsafe { asm!("rdrand {}", "setc {}", out(reg) value, out(reg_byte) ok, options(nomem, nostack)) };
+        if ok == 1 {
+            return Some(value);
+        }
+    }
+    None
 }
 
 /// The CPU's timestamp counter.

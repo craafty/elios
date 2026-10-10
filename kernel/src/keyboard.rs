@@ -11,7 +11,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::arch::interrupts::{self, IRQ_BASE, InterruptFrame};
 use crate::arch::{apic, inb, outb};
 use crate::sync::ByteQueue;
-use crate::task::WaitQueue;
+use crate::task::{self, WaitQueue};
+use crate::tty;
 
 const DATA: u16 = 0x60;
 const STATUS: u16 = 0x64;
@@ -81,6 +82,40 @@ pub fn next_scancode() -> Option<u8> {
 /// The next scancode, waiting for a keypress if necessary.
 pub fn read_scancode() -> u8 {
     INPUT.wait_until(next_scancode)
+}
+
+/// Starts the thread that turns keypresses into terminal input: the bytes
+/// a terminal would send for each key.
+pub fn start_terminal_input() {
+    task::spawn("keyboard", || {
+        let mut decoder = Decoder::default();
+        loop {
+            let Some(key) = decoder.feed(read_scancode()) else { continue };
+            let mut utf8 = [0; 4];
+            let bytes: &[u8] = match key {
+                Key::Char(c) => c.encode_utf8(&mut utf8).as_bytes(),
+                Key::Ctrl(c) => {
+                    utf8[0] = c as u8 - b'a' + 1;
+                    &utf8[..1]
+                }
+                Key::Enter => b"\r",
+                Key::Backspace => b"\x7f",
+                Key::Tab => b"\t",
+                Key::Escape => b"\x1b",
+                Key::Up => b"\x1b[A",
+                Key::Down => b"\x1b[B",
+                Key::Right => b"\x1b[C",
+                Key::Left => b"\x1b[D",
+                Key::Home => b"\x1b[H",
+                Key::End => b"\x1b[F",
+                Key::Delete => b"\x1b[3~",
+                Key::PageUp => b"\x1b[5~",
+                Key::PageDown => b"\x1b[6~",
+                Key::Function(_) => continue,
+            };
+            tty::input(bytes);
+        }
+    });
 }
 
 /// Makes the controller act as if the keyboard sent `scancode`, interrupt
