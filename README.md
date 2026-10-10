@@ -46,6 +46,7 @@ ls -l /bin /usr/bin           # eliOS's commands, and Linux programs
 ps; free; uptime; date; df -h
 seq 100 | grep 7 | wc -l      # pipes
 ctest                         # glibc's view of eliOS: a C library self-test
+threadtest                    # pthreads: mutexes, condition variables, signals
 hello-dynamic                 # a dynamically linked Linux program
 strace hello-c                # watch a program's system calls
 vi poem.txt                   # BusyBox vi (if busybox-static was installed)
@@ -185,6 +186,7 @@ glyph and rebuild.
       handlers, poll/select, /proc, strace, BusyBox
 - [x] **Storage:** PCI, AHCI, NVMe, partitions, FAT32, bootable disk images
 - [x] **Hardware support:** ACPI power off and reset, KVM
-- [ ] **Next:** multiple CPUs (SMP), threads in user programs, USB
-      (keyboards on machines without PS/2 emulation), networking with an own
-      TCP/IP stack, and a graphical desktop
+- [x] **Threads:** `clone`, futexes, per-thread signals; glibc's pthreads
+- [ ] **Next:** multiple CPUs (SMP), USB (keyboards on machines without
+      PS/2 emulation), networking with an own TCP/IP stack, and a graphical
+      desktop

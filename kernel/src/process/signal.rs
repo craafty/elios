@@ -6,10 +6,15 @@
 //! libraries understand it) and enters the handler. The handler returns to a
 //! "restorer" the C library supplies, which calls `rt_sigreturn`; that
 //! reloads the saved registers from the frame.
+//!
+//! As in POSIX, handlers belong to the process, but each thread has its own
+//! mask. A signal sent to the process is taken by whichever thread doesn't
+//! block it; one sent to a thread (`tgkill`, or a fault) waits for that
+//! thread.
 
 use alloc::vec::Vec;
 
-use super::{Process, user};
+use super::{Process, UserThread, user};
 use crate::arch::fpu::{self, FpuState};
 use crate::arch::interrupts::InterruptFrame;
 use crate::errno::{Errno, Result};
@@ -56,27 +61,47 @@ pub struct SigAction {
     pub mask: u64,
 }
 
-/// A process's signal state.
+/// A process's signal state, shared by its threads.
 #[derive(Clone)]
 pub struct Signals {
+    /// Signals sent to the process as a whole.
+    pending: u64,
+    pub actions: [SigAction; SIGNAL_COUNT],
+}
+
+/// A thread's own signal state.
+#[derive(Clone, Default)]
+pub struct ThreadSignals {
+    /// Signals sent to this thread in particular.
     pending: u64,
     blocked: u64,
-    pub actions: [SigAction; SIGNAL_COUNT],
     /// The alternate signal stack (base, size), if one is set.
     alternate_stack: Option<(u64, u64)>,
     /// For a signal raised by a CPU fault: the faulting address.
     fault_address: u64,
 }
 
+impl ThreadSignals {
+    /// The state of a forked child's thread: the same mask and alternate
+    /// stack.
+    pub fn for_child(&self) -> Self {
+        Self { pending: 0, fault_address: 0, ..self.clone() }
+    }
+
+    /// A new thread in the same process: only the mask carries over.
+    pub fn for_new_thread(&self) -> Self {
+        Self { blocked: self.blocked, ..Self::default() }
+    }
+
+    /// After `exec`: the alternate stack was in the old program's memory.
+    pub fn exec(&mut self) {
+        self.alternate_stack = None;
+    }
+}
+
 impl Signals {
     pub const fn new() -> Self {
-        Self {
-            pending: 0,
-            blocked: 0,
-            actions: [SigAction { handler: SIG_DFL, flags: 0, restorer: 0, mask: 0 }; SIGNAL_COUNT],
-            alternate_stack: None,
-            fault_address: 0,
-        }
+        Self { pending: 0, actions: [SigAction { handler: SIG_DFL, flags: 0, restorer: 0, mask: 0 }; SIGNAL_COUNT] }
     }
 
     /// The state a forked child starts with: everything but pending signals.
@@ -85,14 +110,13 @@ impl Signals {
     }
 
     /// After `exec`: handlers point into the old program, so they go back to
-    /// the default (ignored signals stay ignored). The mask is kept.
+    /// the default (ignored signals stay ignored).
     pub fn exec(&mut self) {
         for action in &mut self.actions {
             if action.handler != SIG_IGN {
                 *action = SigAction::default();
             }
         }
-        self.alternate_stack = None;
     }
 
     fn ignored(&self, signal: u32) -> bool {
@@ -103,12 +127,13 @@ impl Signals {
             _ => false,
         }
     }
+}
 
-    /// Pending signals that can be acted on now.
-    fn deliverable(&self) -> u64 {
-        let unblockable = bit(SIGKILL) | bit(SIGSTOP);
-        self.pending & (!self.blocked | unblockable)
-    }
+const UNBLOCKABLE: u64 = 1 << (SIGKILL - 1) | 1 << (SIGSTOP - 1);
+
+/// Pending signals that `thread` can act on now.
+fn deliverable(process: &Signals, thread: &ThreadSignals) -> u64 {
+    (process.pending | thread.pending) & (!thread.blocked | UNBLOCKABLE)
 }
 
 /// A signal's bit in a signal set: as in Linux, signal n is bit n - 1.
@@ -122,31 +147,51 @@ fn ignored_by_default(signal: u32) -> bool {
     matches!(signal, SIGCHLD | SIGCONT | SIGURG | SIGWINCH | SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
 }
 
-/// Marks a signal pending and, if it will do something, wakes the process
-/// so it notices.
+fn valid(signal: u32) -> bool {
+    signal != 0 && (signal as usize) < SIGNAL_COUNT
+}
+
+/// Sends a signal to a process: marks it pending and wakes a thread that
+/// will act on it.
 pub fn send(process: &Process, signal: u32) {
-    if signal == 0 || signal as usize >= SIGNAL_COUNT || process.status.lock().is_some() {
+    if !valid(signal) || process.status.lock().is_some() {
         return;
     }
-    let wake = {
+    {
         let mut signals = process.signals.lock();
         if signals.ignored(signal) {
             return;
         }
         signals.pending |= bit(signal);
-        signals.deliverable() & bit(signal) != 0
-    };
-    if wake && let Some(thread) = *process.thread.lock() {
-        task::interrupt(thread);
+    }
+    let threads = process.threads.lock().clone();
+    let taker = threads.iter().find(|thread| thread.signals.lock().blocked & bit(signal) & !UNBLOCKABLE == 0);
+    if let Some(thread) = taker {
+        task::interrupt(thread.id);
     }
 }
 
-/// Raises a signal for a CPU fault in the running process. Unlike other
+/// Sends a signal to one thread (`tgkill`).
+pub fn send_to_thread(thread: &UserThread, signal: u32) {
+    if !valid(signal) || thread.process.signals.lock().ignored(signal) {
+        return;
+    }
+    let wake = {
+        let mut signals = thread.signals.lock();
+        signals.pending |= bit(signal);
+        signals.blocked & bit(signal) & !UNBLOCKABLE == 0
+    };
+    if wake {
+        task::interrupt(thread.id);
+    }
+}
+
+/// Raises a signal for a CPU fault in the running thread. Unlike other
 /// signals it can't be ignored or blocked: if it isn't handled, the process
 /// ends.
-pub fn raise_fault(process: &Process, signal: u32, address: u64) -> bool {
-    let mut signals = process.signals.lock();
-    let action = signals.actions[signal as usize];
+pub fn raise_fault(thread: &UserThread, signal: u32, address: u64) -> bool {
+    let action = thread.process.signals.lock().actions[signal as usize];
+    let mut signals = thread.signals.lock();
     let handled = action.handler != SIG_DFL && action.handler != SIG_IGN && signals.blocked & bit(signal) == 0;
     if handled {
         signals.pending |= bit(signal);
@@ -155,34 +200,48 @@ pub fn raise_fault(process: &Process, signal: u32, address: u64) -> bool {
     handled
 }
 
-/// Whether the running process has a signal that should interrupt a
-/// blocking system call.
+/// Whether the running thread should stop a blocking system call: a signal
+/// needs handling, or the thread is being ended.
 pub fn pending() -> bool {
-    task::current_process().is_some_and(|process| process.signals.lock().deliverable() != 0)
+    task::current_user_thread().is_some_and(|thread| {
+        super::must_end(&thread) || deliverable(&thread.process.signals.lock(), &thread.signals.lock()) != 0
+    })
 }
 
 /// Acts on pending signals before returning to user mode: ends the process
 /// for signals with a fatal default action, or sets up `frame` to run a
 /// handler. `syscall` is the number of the system call being returned from,
 /// if any, so calls interrupted by a handler with `SA_RESTART` can resume.
-pub fn deliver(process: &Process, frame: &mut InterruptFrame, syscall: Option<u64>) {
+/// Also ends the thread if the process is exiting or another thread is
+/// running `execve`.
+pub fn deliver(thread: &UserThread, frame: &mut InterruptFrame, syscall: Option<u64>) {
+    if super::must_end(thread) {
+        crate::arch::enable_interrupts();
+        super::exit_thread(0);
+    }
     let (signal, action) = {
-        let mut signals = process.signals.lock();
+        let mut process = thread.process.signals.lock();
+        let mut signals = thread.signals.lock();
         // Pending signals that are ignored by now are dropped.
-        let ignored = (1..SIGNAL_COUNT as u32).filter(|&s| signals.ignored(s)).fold(0, |m, s| m | bit(s));
+        let ignored = (1..SIGNAL_COUNT as u32).filter(|&s| process.ignored(s)).fold(0, |m, s| m | bit(s));
+        process.pending &= !ignored;
         signals.pending &= !ignored;
-        let deliverable = signals.deliverable();
+        let deliverable = deliverable(&process, &signals);
         if deliverable == 0 {
             return;
         }
         let signal = deliverable.trailing_zeros() + 1;
-        signals.pending &= !bit(signal);
-        (signal, signals.actions[signal as usize])
+        if signals.pending & bit(signal) != 0 {
+            signals.pending &= !bit(signal);
+        } else {
+            process.pending &= !bit(signal);
+        }
+        (signal, process.actions[signal as usize])
     };
 
     if action.handler == SIG_DFL || signal == SIGKILL {
         crate::arch::enable_interrupts();
-        super::exit(super::signal_status(signal));
+        super::exit_group(super::signal_status(signal));
     }
 
     if let Some(number) = syscall
@@ -195,10 +254,10 @@ pub fn deliver(process: &Process, frame: &mut InterruptFrame, syscall: Option<u6
         frame.rip -= 2;
     }
 
-    if push_frame(process, frame, signal, &action).is_err() {
+    if push_frame(thread, frame, signal, &action).is_err() {
         // No usable stack for the handler: nothing to do but end it.
         crate::arch::enable_interrupts();
-        super::exit(super::signal_status(SIGSEGV));
+        super::exit_group(super::signal_status(SIGSEGV));
     }
 }
 
@@ -231,9 +290,9 @@ fn context_registers(frame: &InterruptFrame) -> [u64; 18] {
     ]
 }
 
-fn push_frame(process: &Process, frame: &mut InterruptFrame, signal: u32, action: &SigAction) -> Result<()> {
+fn push_frame(thread: &UserThread, frame: &mut InterruptFrame, signal: u32, action: &SigAction) -> Result<()> {
     let (blocked, alternate, fault_address) = {
-        let signals = process.signals.lock();
+        let signals = thread.signals.lock();
         (signals.blocked, signals.alternate_stack, signals.fault_address)
     };
     let on_alternate = alternate.is_some_and(|(base, size)| (base..base + size).contains(&frame.rsp));
@@ -290,14 +349,14 @@ fn push_frame(process: &Process, frame: &mut InterruptFrame, signal: u32, action
     bytes.resize(frame_size as usize, 0);
     user::write_bytes(frame_address, &bytes)?;
 
+    if action.flags & SA_RESETHAND != 0 {
+        thread.process.signals.lock().actions[signal as usize] = SigAction::default();
+    }
     {
-        let mut signals = process.signals.lock();
-        signals.blocked |= action.mask;
+        let mut signals = thread.signals.lock();
+        signals.blocked |= action.mask & !UNBLOCKABLE;
         if action.flags & SA_NODEFER == 0 {
             signals.blocked |= bit(signal);
-        }
-        if action.flags & SA_RESETHAND != 0 {
-            signals.actions[signal as usize] = SigAction::default();
         }
         signals.fault_address = 0;
     }
@@ -322,7 +381,7 @@ const USER_FLAGS: u64 = 0x0001 | 0x0004 | 0x0010 | 0x0040 | 0x0080 | 0x0100 | 0x
 /// `rt_sigreturn`: restores the registers saved when a handler was entered.
 /// The handler's `ret` popped the restorer address, so the stack pointer is
 /// at the ucontext.
-pub fn sigreturn(process: &Process, frame: &mut InterruptFrame) -> Result<u64> {
+pub fn sigreturn(thread: &UserThread, frame: &mut InterruptFrame) -> Result<u64> {
     let context = frame.rsp;
     let registers = user::read_bytes(context + 40, 256)?;
     let word = |index: usize| u64::from_le_bytes(registers[index * 8..index * 8 + 8].try_into().unwrap());
@@ -350,7 +409,7 @@ pub fn sigreturn(process: &Process, frame: &mut InterruptFrame) -> Result<u64> {
     let fpu_state = word(23);
 
     let mask: u64 = user::read_value(context + 40 + 256)?;
-    process.signals.lock().blocked = mask & !(bit(SIGKILL) | bit(SIGSTOP));
+    thread.signals.lock().blocked = mask & !UNBLOCKABLE;
 
     if fpu_state != 0 {
         let saved = user::read_bytes(fpu_state, size_of::<FpuState>())?;
@@ -367,11 +426,11 @@ const SIG_UNBLOCK: u64 = 1;
 const SIG_SETMASK: u64 = 2;
 
 /// `rt_sigprocmask`.
-pub fn set_mask(process: &Process, how: u64, set: Option<u64>) -> Result<u64> {
-    let mut signals = process.signals.lock();
+pub fn set_mask(thread: &UserThread, how: u64, set: Option<u64>) -> Result<u64> {
+    let mut signals = thread.signals.lock();
     let old = signals.blocked;
     if let Some(set) = set {
-        let set = set & !(bit(SIGKILL) | bit(SIGSTOP));
+        let set = set & !UNBLOCKABLE;
         signals.blocked = match how {
             SIG_BLOCK => old | set,
             SIG_UNBLOCK => old & !set,
@@ -385,8 +444,8 @@ pub fn set_mask(process: &Process, how: u64, set: Option<u64>) -> Result<u64> {
 const SS_DISABLE: u64 = 2;
 
 /// `sigaltstack`: returns the old stack as (sp, flags, size).
-pub fn set_alternate_stack(process: &Process, new: Option<(u64, u64, u64)>) -> Result<(u64, u64, u64)> {
-    let mut signals = process.signals.lock();
+pub fn set_alternate_stack(thread: &UserThread, new: Option<(u64, u64, u64)>) -> Result<(u64, u64, u64)> {
+    let mut signals = thread.signals.lock();
     let old = match signals.alternate_stack {
         Some((base, size)) => (base, 0, size),
         None => (0, SS_DISABLE, 0),
@@ -405,11 +464,11 @@ pub fn set_alternate_stack(process: &Process, new: Option<(u64, u64, u64)>) -> R
 
 /// Starts the handler for a fault signal raised by user code, or ends the
 /// process if it has none.
-pub fn fault(process: &Process, frame: &mut InterruptFrame, signal: u32, address: u64) {
-    if raise_fault(process, signal, address) {
-        deliver(process, frame, None);
+pub fn fault(thread: &UserThread, frame: &mut InterruptFrame, signal: u32, address: u64) {
+    if raise_fault(thread, signal, address) {
+        deliver(thread, frame, None);
     } else {
         crate::arch::enable_interrupts();
-        super::exit(super::signal_status(signal));
+        super::exit_group(super::signal_status(signal));
     }
 }

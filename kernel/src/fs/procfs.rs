@@ -190,9 +190,10 @@ fn status(pid: Pid) -> String {
         _ => "S (sleeping)",
     };
     format!(
-        "Name:\t{}\nState:\t{state}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{}\nThreads:\t1\nVmRSS:\t{} kB\n",
+        "Name:\t{}\nState:\t{state}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{}\nThreads:\t{}\nVmRSS:\t{} kB\n",
         info.name,
         info.parent,
+        info.threads,
         info.memory / 1024
     )
 }

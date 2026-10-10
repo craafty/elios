@@ -5,33 +5,37 @@ use crate::arch::syscall;
 use crate::errno::{Errno, Result};
 use crate::fs::{self, FileKind};
 use crate::memory::PAGE_SIZE;
-use crate::process::{self, PROT_EXEC, PROT_READ, PROT_WRITE, Pid, SIGKILL, SigAction, USER_END, signal, user};
-use crate::task;
+use crate::process::{self, CloneArgs, PROT_EXEC, PROT_READ, PROT_WRITE, Pid, SIGKILL, SigAction, USER_END};
+use crate::process::{futex, signal, user};
+use crate::{task, time};
 
 pub fn fork(frame: &InterruptFrame) -> Result<u64> {
     process::fork(frame).map(u64::from)
 }
 
-const CLONE_VM: u64 = 0x100;
-const CLONE_THREAD: u64 = 0x10000;
-const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+/// `clone(flags, stack, parent_tid, child_tid, tls)`. The low byte of the
+/// flags is the signal to send the parent on exit, which isn't needed:
+/// SIGCHLD is ignored unless handled, and nothing else is sent.
+pub fn clone(frame: &InterruptFrame, flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) -> Result<u64> {
+    let args = CloneArgs { flags: flags & !0xFF, stack, parent_tid, child_tid, tls };
+    process::clone(frame, &args).map(u64::from)
+}
 
-/// `clone` for the case programs use to fork (glibc's `fork` calls it).
-/// Shared-memory clones (threads) aren't supported yet.
-pub fn clone(frame: &InterruptFrame, flags: u64, child_tid: u64) -> Result<u64> {
-    if flags & (CLONE_VM | CLONE_THREAD) != 0 {
-        return Err(Errno::ENOSYS);
+const CLONE_PIDFD: u64 = 0x1000;
+
+/// `clone3(args, size)`, where `args` is a `struct clone_args`.
+pub fn clone3(frame: &InterruptFrame, address: u64, size: u64) -> Result<u64> {
+    if size < 64 {
+        return Err(Errno::EINVAL);
     }
-    let pid = process::fork(frame)?;
-    if flags & CLONE_CHILD_SETTID != 0 && child_tid != 0 {
-        // The child's copy of memory holds the variable; write it there.
-        if let Some(child) = process::find(pid)
-            && let Some(space) = child.space.lock().as_mut()
-        {
-            space.write(child_tid, &pid.to_le_bytes())?;
-        }
+    let [flags, _pidfd, child_tid, parent_tid, _exit_signal, stack, stack_size, tls]: [u64; 8] =
+        user::read_value(address)?;
+    if flags & CLONE_PIDFD != 0 {
+        return Err(Errno::EINVAL);
     }
-    Ok(u64::from(pid))
+    // clone3 gives the stack as a range; the stack pointer starts at its top.
+    let stack = if stack == 0 { 0 } else { stack + stack_size };
+    process::clone(frame, &CloneArgs { flags, stack, parent_tid, child_tid, tls }).map(u64::from)
 }
 
 pub fn exec(frame: &mut InterruptFrame, path: u64, arguments: u64, environment: u64) -> Result<u64> {
@@ -42,8 +46,14 @@ pub fn exec(frame: &mut InterruptFrame, path: u64, arguments: u64, environment: 
     Ok(0)
 }
 
+/// `exit`: ends the calling thread.
 pub fn exit(code: u64) -> ! {
-    process::exit(process::exit_status(code as i32))
+    process::exit_thread(process::exit_status(code as i32))
+}
+
+/// `exit_group`: ends the whole process.
+pub fn exit_group(code: u64) -> ! {
+    process::exit_group(process::exit_status(code as i32))
 }
 
 const WNOHANG: u64 = 1;
@@ -66,6 +76,80 @@ pub fn kill(pid: u64, signal: u64) -> Result<u64> {
 
 pub fn getpid() -> Result<u64> {
     Ok(u64::from(process::current().pid))
+}
+
+pub fn gettid() -> Result<u64> {
+    Ok(u64::from(process::current_thread().tid()))
+}
+
+/// `set_tid_address`: where to clear (and wake) when the thread exits.
+pub fn set_tid_address(address: u64) -> Result<u64> {
+    let thread = process::current_thread();
+    thread.set_clear_child_tid(address);
+    Ok(u64::from(thread.tid()))
+}
+
+pub fn tgkill(process: u64, tid: u64, signal: u64) -> Result<u64> {
+    process::kill_thread(Some(process as Pid), tid as Pid, signal as u32).map(|_| 0)
+}
+
+pub fn tkill(tid: u64, signal: u64) -> Result<u64> {
+    process::kill_thread(None, tid as Pid, signal as u32).map(|_| 0)
+}
+
+const FUTEX_WAIT: u64 = 0;
+const FUTEX_WAKE: u64 = 1;
+const FUTEX_REQUEUE: u64 = 3;
+const FUTEX_CMP_REQUEUE: u64 = 4;
+const FUTEX_WAIT_BITSET: u64 = 9;
+const FUTEX_WAKE_BITSET: u64 = 10;
+const FUTEX_PRIVATE_FLAG: u64 = 128;
+const FUTEX_CLOCK_REALTIME: u64 = 256;
+
+/// `futex(address, op, value, timeout, address2, value3)`. Every futex is
+/// private to its process, so the private flag changes nothing.
+pub fn futex(address: u64, op: u64, value: u64, timeout: u64, address2: u64, value3: u64) -> Result<u64> {
+    let pid = process::current().pid;
+    let value = value as u32;
+    match op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME) {
+        FUTEX_WAIT => {
+            let deadline = deadline(timeout, None)?;
+            futex::wait(pid, address, value, u32::MAX, deadline).map(|_| 0)
+        }
+        FUTEX_WAIT_BITSET => {
+            let clock = if op & FUTEX_CLOCK_REALTIME != 0 { CLOCK_REALTIME } else { CLOCK_MONOTONIC };
+            let deadline = deadline(timeout, Some(clock))?;
+            futex::wait(pid, address, value, value3 as u32, deadline).map(|_| 0)
+        }
+        FUTEX_WAKE => futex::wake(pid, address, value, u32::MAX),
+        FUTEX_WAKE_BITSET => futex::wake(pid, address, value, value3 as u32),
+        // For the requeue operations, the timeout argument is a count.
+        FUTEX_REQUEUE => futex::requeue(pid, address, address2, value, timeout as u32, None),
+        FUTEX_CMP_REQUEUE => futex::requeue(pid, address, address2, value, timeout as u32, Some(value3 as u32)),
+        _ => Err(Errno::ENOSYS),
+    }
+}
+
+const CLOCK_REALTIME: u64 = 0;
+const CLOCK_MONOTONIC: u64 = 1;
+
+/// The timer tick at which a timeout given as a `struct timespec` at
+/// `address` (none if 0) expires: relative to now, or a time on `clock`.
+fn deadline(address: u64, clock: Option<u64>) -> Result<Option<u64>> {
+    if address == 0 {
+        return Ok(None);
+    }
+    let [seconds, nanoseconds]: [i64; 2] = user::read_value(address)?;
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
+        return Err(Errno::EINVAL);
+    }
+    let requested = seconds as u64 * 1_000_000_000 + nanoseconds as u64;
+    let remaining = match clock {
+        None => requested,
+        Some(CLOCK_REALTIME) => requested.saturating_sub(time::unix_nanos()),
+        Some(_) => requested.saturating_sub(time::uptime_nanos()),
+    };
+    Ok(Some(time::ticks() + remaining.div_ceil(1_000_000)))
 }
 
 pub fn getppid() -> Result<u64> {
@@ -119,7 +203,7 @@ pub fn sigaction(signal: u64, action: u64, old_action: u64) -> Result<u64> {
 
 pub fn sigprocmask(how: u64, set: u64, old_set: u64) -> Result<u64> {
     let set = if set == 0 { None } else { Some(user::read_value::<u64>(set)?) };
-    let old = signal::set_mask(&process::current(), how, set)?;
+    let old = signal::set_mask(&process::current_thread(), how, set)?;
     if old_set != 0 {
         user::write_value(old_set, &old)?;
     }
@@ -127,7 +211,7 @@ pub fn sigprocmask(how: u64, set: u64, old_set: u64) -> Result<u64> {
 }
 
 pub fn sigreturn(frame: &mut InterruptFrame) -> Result<u64> {
-    signal::sigreturn(&process::current(), frame)
+    signal::sigreturn(&process::current_thread(), frame)
 }
 
 /// `sigaltstack`, with `stack_t` as (sp, flags, size).
@@ -138,7 +222,7 @@ pub fn sigaltstack(new: u64, old: u64) -> Result<u64> {
         let [base, flags, size]: [u64; 3] = user::read_value(new)?;
         Some((base, flags & 0xFFFF_FFFF, size))
     };
-    let (base, flags, size) = signal::set_alternate_stack(&process::current(), new)?;
+    let (base, flags, size) = signal::set_alternate_stack(&process::current_thread(), new)?;
     if old != 0 {
         user::write_value(old, &[base, flags, size])?;
     }
@@ -297,14 +381,36 @@ pub fn sched_yield() -> Result<u64> {
     Ok(0)
 }
 
-/// `nanosleep` and `clock_nanosleep`: sleeps for a `struct timespec`.
-pub fn nanosleep(request: u64) -> Result<u64> {
-    let [seconds, nanoseconds]: [i64; 2] = user::read_value(request)?;
-    if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
+/// `sched_getaffinity`: the CPUs the process may run on, as a bit mask.
+pub fn sched_getaffinity(len: u64, mask: u64) -> Result<u64> {
+    if len < 8 {
         return Err(Errno::EINVAL);
     }
-    let ms = seconds as u64 * 1000 + (nanoseconds as u64).div_ceil(1_000_000);
-    task::sleep_ms(ms);
+    user::write_value(mask, &1u64)?;
+    Ok(8)
+}
+
+/// `nanosleep`: sleeps for a `struct timespec`.
+pub fn nanosleep(request: u64) -> Result<u64> {
+    sleep_until(deadline(request, None)?.ok_or(Errno::EFAULT)?)
+}
+
+const TIMER_ABSTIME: u64 = 1;
+
+/// `clock_nanosleep`: sleeps for a time, or until a time on `clock`.
+pub fn clock_nanosleep(clock: u64, flags: u64, request: u64) -> Result<u64> {
+    if !matches!(clock, CLOCK_REALTIME | CLOCK_MONOTONIC | 7) {
+        return Err(Errno::EINVAL);
+    }
+    let clock = (flags & TIMER_ABSTIME != 0).then_some(clock);
+    sleep_until(deadline(request, clock)?.ok_or(Errno::EFAULT)?)
+}
+
+fn sleep_until(deadline: u64) -> Result<u64> {
+    let now = time::ticks();
+    if deadline > now {
+        task::sleep_ms(deadline - now);
+    }
     if process::signal_pending() {
         return Err(Errno::EINTR);
     }

@@ -1,12 +1,14 @@
-//! User processes: creation (`fork`, `exec`), termination, waiting, and
-//! signals.
+//! User processes: creation (`fork`, `clone`, `exec`), threads,
+//! termination, waiting, and signals.
 //!
-//! A process is an address space, open files, a working directory and one
-//! thread. Signals are minimal for now: each is either ignored or ends the
-//! process (handlers come later), which covers Ctrl+C and `kill`.
+//! A process is an address space, open files, a working directory, signal
+//! handlers, and one or more threads. Each thread is a scheduler thread
+//! (see `task`) plus a [`UserThread`] record: its id as programs see it, its
+//! signal mask and the like. The process ends when its last thread does.
 
 mod address_space;
 pub mod elf;
+pub mod futex;
 pub mod signal;
 pub mod user;
 
@@ -15,13 +17,15 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub use self::address_space::{AddressSpace, PROT_EXEC, PROT_READ, PROT_WRITE, USER_END};
 #[cfg(test)]
 use self::signal::SIGTERM;
 use self::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
-pub use self::signal::{SIGINT, SIGKILL, SIGNAL_COUNT, SIGPIPE, SigAction, Signals, pending as signal_pending};
+pub use self::signal::{
+    SIGINT, SIGKILL, SIGNAL_COUNT, SIGPIPE, SigAction, Signals, ThreadSignals, pending as signal_pending,
+};
 use crate::arch::fpu::FpuState;
 use crate::arch::interrupts::{self, InterruptFrame};
 use crate::arch::syscall;
@@ -50,10 +54,51 @@ pub struct Process {
     /// Set (as a wait status) once the process has exited.
     status: SpinLock<Option<i32>>,
     pub signals: SpinLock<Signals>,
-    thread: SpinLock<Option<ThreadId>>,
+    /// The running threads. Each also refers back to the process; the last
+    /// one to exit ends it.
+    pub threads: SpinLock<Vec<Arc<UserThread>>>,
+    /// Woken when one of the threads exits.
+    thread_exits: WaitQueue,
+    /// Set when threads should end (see [`Ending`]).
+    ending: SpinLock<Option<Ending>>,
     /// Whether to print every system call (see `strace`). Inherited by
     /// children and kept across `exec`.
     pub trace: AtomicBool,
+}
+
+/// Why a process's threads are ending.
+#[derive(Debug, Clone, Copy)]
+enum Ending {
+    /// The whole process is exiting, with this wait status (`exit_group`,
+    /// or a fatal signal).
+    Exit(i32),
+    /// This thread is running `execve`; every other thread ends.
+    Exec(ThreadId),
+}
+
+/// One thread of a user process.
+pub struct UserThread {
+    /// The scheduler's thread.
+    pub id: ThreadId,
+    /// The id programs see (`gettid`). The first thread's is the pid; the
+    /// others' come from the same numbering.
+    tid: AtomicU32,
+    pub process: Arc<Process>,
+    pub signals: SpinLock<ThreadSignals>,
+    /// Set by `set_tid_address` or `CLONE_CHILD_CLEARTID`: when the thread
+    /// exits, the kernel stores 0 here and wakes a futex waiter, which is
+    /// how `pthread_join` learns a thread has finished.
+    clear_child_tid: AtomicU64,
+}
+
+impl UserThread {
+    pub fn tid(&self) -> Pid {
+        self.tid.load(Ordering::Relaxed)
+    }
+
+    pub fn set_clear_child_tid(&self, address: u64) {
+        self.clear_child_tid.store(address, Ordering::Relaxed);
+    }
 }
 
 impl Process {
@@ -91,7 +136,9 @@ fn create(parent: Pid, group: Option<Pid>, name: &str, cwd: String, files: FileT
         cwd: SpinLock::new(cwd),
         status: SpinLock::new(None),
         signals: SpinLock::new(Signals::new()),
-        thread: SpinLock::new(None),
+        threads: SpinLock::new(Vec::new()),
+        thread_exits: WaitQueue::new(),
+        ending: SpinLock::new(None),
         trace: AtomicBool::new(false),
     });
     PROCESSES.lock().insert(pid, process.clone());
@@ -107,17 +154,46 @@ pub fn find(pid: Pid) -> Option<Arc<Process>> {
     PROCESSES.lock().get(&pid).cloned()
 }
 
-/// Starts a thread that enters user mode with `frame`.
-fn start_thread(process: &Arc<Process>, frame: InterruptFrame, fpu: FpuState, fs_base: u64) {
+/// The running user thread.
+pub fn current_thread() -> Arc<UserThread> {
+    task::current_user_thread().expect("not running in a user process")
+}
+
+/// How a new thread starts out.
+struct NewThread {
+    tid: Pid,
+    signals: ThreadSignals,
+    frame: InterruptFrame,
+    fpu: FpuState,
+    fs_base: u64,
+    clear_child_tid: u64,
+}
+
+/// Adds a thread to `process` that enters user mode with `new.frame`.
+fn start_thread(process: &Arc<Process>, new: NewThread) {
     let address_space = process.space.lock().as_ref().expect("process without memory").root();
-    let options =
-        Spawn { name: process.name.lock().clone(), process: Some(process.clone()), address_space, fpu, fs_base };
-    let thread = task::spawn_with(options, move || {
+    let thread = Arc::new(UserThread {
+        id: task::new_id(),
+        tid: AtomicU32::new(new.tid),
+        process: process.clone(),
+        signals: SpinLock::new(new.signals),
+        clear_child_tid: AtomicU64::new(new.clear_child_tid),
+    });
+    process.threads.lock().push(thread.clone());
+    let options = Spawn {
+        id: thread.id,
+        name: process.name.lock().clone(),
+        user: Some(thread),
+        address_space,
+        fpu: new.fpu,
+        fs_base: new.fs_base,
+    };
+    let frame = new.frame;
+    task::spawn_with(options, move || {
         // SAFETY: the frame was built for this process's address space,
         // which the scheduler has made active.
         unsafe { syscall::enter_user(&frame) }
     });
-    *process.thread.lock() = Some(thread);
 }
 
 /// What it takes to run a program file.
@@ -199,7 +275,12 @@ pub fn start(path: &str, arguments: Vec<String>) -> Result<Pid> {
     *process.executable.lock() = image.path;
     *process.arguments.lock() = image.arguments;
     *process.space.lock() = Some(image.space);
-    start_thread(&process, syscall::user_frame(image.entry, image.stack_pointer), FpuState::initial(), 0);
+    let frame = syscall::user_frame(image.entry, image.stack_pointer);
+    let signals = ThreadSignals::default();
+    start_thread(
+        &process,
+        NewThread { tid: process.pid, signals, frame, fpu: FpuState::initial(), fs_base: 0, clear_child_tid: 0 },
+    );
     Ok(process.pid)
 }
 
@@ -207,11 +288,79 @@ fn default_environment() -> Vec<String> {
     ["PATH=/bin:/usr/bin", "HOME=/home", "TERM=linux", "SHELL=/bin/sh", "USER=root"].map(String::from).to_vec()
 }
 
+// `clone` flags (Linux values).
+pub const CLONE_VM: u64 = 0x100;
+pub const CLONE_SIGHAND: u64 = 0x800;
+pub const CLONE_THREAD: u64 = 0x1_0000;
+pub const CLONE_SETTLS: u64 = 0x8_0000;
+pub const CLONE_PARENT_SETTID: u64 = 0x10_0000;
+pub const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
+pub const CLONE_CHILD_SETTID: u64 = 0x100_0000;
+
+/// The arguments of `clone` and `clone3` that eliOS uses.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CloneArgs {
+    pub flags: u64,
+    /// The new thread's stack pointer, or 0 to keep the caller's.
+    pub stack: u64,
+    pub parent_tid: u64,
+    pub child_tid: u64,
+    pub tls: u64,
+}
+
 /// `fork`: a copy of the running process, continuing from the same system
 /// call but seeing 0 as its result.
 pub fn fork(frame: &InterruptFrame) -> Result<Pid> {
-    let parent = current();
-    let space = parent.space.lock().as_ref().ok_or(Errno::EFAULT)?.duplicate()?;
+    clone(frame, &CloneArgs::default())
+}
+
+/// `clone`: a new thread in this process (`CLONE_THREAD`), or a new
+/// process. A new process always gets a copy of the caller's memory, even
+/// with `CLONE_VM`: memory isn't shared between processes, and the programs
+/// that ask for it (`vfork`, glibc's `posix_spawn`) work with a copy.
+pub fn clone(frame: &InterruptFrame, args: &CloneArgs) -> Result<Pid> {
+    let me = current_thread();
+    let flags = args.flags;
+    let mut child_frame = *frame;
+    child_frame.rax = 0;
+    if args.stack != 0 {
+        child_frame.rsp = args.stack;
+    }
+    let mut fpu = FpuState::initial();
+    task::save_fpu(&mut fpu);
+    let fs_base = if flags & CLONE_SETTLS != 0 {
+        if args.tls >= USER_END {
+            return Err(Errno::EPERM);
+        }
+        args.tls
+    } else {
+        syscall::fs_base()
+    };
+    let clear_child_tid = if flags & CLONE_CHILD_CLEARTID != 0 { args.child_tid } else { 0 };
+
+    if flags & CLONE_THREAD != 0 {
+        if flags & (CLONE_VM | CLONE_SIGHAND) != CLONE_VM | CLONE_SIGHAND {
+            return Err(Errno::EINVAL);
+        }
+        let process = me.process.clone();
+        if process.ending.lock().is_some() {
+            return Err(Errno::EAGAIN);
+        }
+        let tid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        // Memory is shared, so both ids land in the same place.
+        if flags & CLONE_PARENT_SETTID != 0 {
+            user::write_value(args.parent_tid, &tid)?;
+        }
+        if flags & CLONE_CHILD_SETTID != 0 {
+            user::write_value(args.child_tid, &tid)?;
+        }
+        let signals = me.signals.lock().for_new_thread();
+        start_thread(&process, NewThread { tid, signals, frame: child_frame, fpu, fs_base, clear_child_tid });
+        return Ok(tid);
+    }
+
+    let parent = &me.process;
+    let mut space = parent.space.lock().as_ref().ok_or(Errno::EFAULT)?.duplicate()?;
     let name = parent.name.lock().clone();
     let cwd = parent.cwd.lock().clone();
     let files = parent.files.lock().clone();
@@ -220,29 +369,36 @@ pub fn fork(frame: &InterruptFrame) -> Result<Pid> {
     *child.executable.lock() = parent.executable.lock().clone();
     *child.arguments.lock() = parent.arguments.lock().clone();
     child.trace.store(parent.trace.load(Ordering::Relaxed), Ordering::Relaxed);
+    if flags & CLONE_PARENT_SETTID != 0 {
+        user::write_value(args.parent_tid, &child.pid)?;
+    }
+    if flags & CLONE_CHILD_SETTID != 0 {
+        space.write(args.child_tid, &child.pid.to_le_bytes())?;
+    }
     *child.space.lock() = Some(space);
-
-    let mut child_frame = *frame;
-    child_frame.rax = 0;
-    let mut fpu = FpuState::initial();
-    task::save_fpu(&mut fpu);
-    start_thread(&child, child_frame, fpu, syscall::fs_base());
+    let signals = me.signals.lock().for_child();
+    start_thread(&child, NewThread { tid: child.pid, signals, frame: child_frame, fpu, fs_base, clear_child_tid });
     Ok(child.pid)
 }
 
 /// `execve`: replaces the running program. On success the system call
 /// "returns" into the new program, so `frame` is rewritten to start it.
 pub fn exec(frame: &mut InterruptFrame, path: &str, arguments: Vec<String>, environment: Vec<String>) -> Result<()> {
-    let process = current();
+    let thread = current_thread();
+    let process = &thread.process;
     let cwd = process.cwd.lock().clone();
     let image = load_image(&cwd, path, arguments, &environment)?;
+    end_other_threads(&thread)?;
 
     // From here on, nothing can fail: the old program is gone.
     task::set_address_space(image.space.root());
     let old = process.space.lock().replace(image.space);
     drop(old);
+    // The survivor becomes the main thread, if it wasn't.
+    thread.tid.store(process.pid, Ordering::Relaxed);
     process.files.lock().exec();
     process.signals.lock().exec();
+    thread.signals.lock().exec();
     let name = base_name(&image.path).to_string();
     task::set_name(&name);
     *process.name.lock() = name;
@@ -254,12 +410,97 @@ pub fn exec(frame: &mut InterruptFrame, path: &str, arguments: Vec<String>, envi
     Ok(())
 }
 
-/// Ends the running process with a wait status (see [`exit_status`] and
-/// [`signal_status`]).
-pub fn exit(status: i32) -> ! {
-    let process = current();
-    process.files.lock().close_all();
+/// For `execve`: ends every thread of the process but `thread`, and waits
+/// until they're gone.
+fn end_other_threads(thread: &UserThread) -> Result<()> {
+    let process = &thread.process;
+    {
+        let mut ending = process.ending.lock();
+        if ending.is_some() {
+            // The process is exiting, or another thread got here first.
+            return Err(Errno::EINTR);
+        }
+        *ending = Some(Ending::Exec(thread.id));
+    }
+    interrupt_threads(process, thread.id);
+    let outcome = process.thread_exits.wait_until(|| match *process.ending.lock() {
+        // exit_group in another thread overrules us.
+        Some(Ending::Exit(_)) => Some(Err(Errno::EINTR)),
+        _ => (process.threads.lock().len() == 1).then_some(Ok(())),
+    });
+    if outcome.is_ok() {
+        *process.ending.lock() = None;
+    }
+    outcome
+}
+
+/// Wakes every thread of `process` but `except` from blocking calls, so
+/// they notice they should end.
+fn interrupt_threads(process: &Process, except: ThreadId) {
+    for thread in process.threads.lock().iter().filter(|thread| thread.id != except) {
+        task::interrupt(thread.id);
+    }
+}
+
+/// Whether `thread` should end: its process is exiting, or another thread
+/// is running `execve`.
+fn must_end(thread: &UserThread) -> bool {
+    match *thread.process.ending.lock() {
+        Some(Ending::Exit(_)) => true,
+        Some(Ending::Exec(survivor)) => survivor != thread.id,
+        None => false,
+    }
+}
+
+/// `exit_group`: ends the running process, every thread of it, with a wait
+/// status (see [`exit_status`] and [`signal_status`]).
+pub fn exit_group(status: i32) -> ! {
+    let thread = current_thread();
+    {
+        let mut ending = thread.process.ending.lock();
+        // The first exit_group decides the status.
+        if !matches!(*ending, Some(Ending::Exit(_))) {
+            *ending = Some(Ending::Exit(status));
+        }
+    }
+    interrupt_threads(&thread.process, thread.id);
+    drop(thread);
+    exit_thread(status)
+}
+
+/// `exit`: ends the running thread. The last thread to exit ends the
+/// process, with `status` unless `exit_group` set one.
+pub fn exit_thread(status: i32) -> ! {
+    let thread = current_thread();
+    let process = thread.process.clone();
+    let clear_child_tid = thread.clear_child_tid.swap(0, Ordering::Relaxed);
+    if clear_child_tid != 0 && user::write_value(clear_child_tid, &0u32).is_ok() {
+        let _ = futex::wake(process.pid, clear_child_tid, 1, u32::MAX);
+    }
+    // Other threads may free the memory once this one is off the list.
     task::set_address_space(memory::kernel_page_table_root());
+    let last = {
+        let mut threads = process.threads.lock();
+        threads.retain(|other| !Arc::ptr_eq(other, &thread));
+        threads.is_empty()
+    };
+    drop(thread);
+    process.thread_exits.wake_all();
+    if last {
+        let status = match *process.ending.lock() {
+            Some(Ending::Exit(status)) => status,
+            _ => status,
+        };
+        end_process(&process, status);
+    }
+    drop(process);
+    task::exit()
+}
+
+/// Releases a process whose threads have all exited, and makes it a zombie
+/// for its parent to collect.
+fn end_process(process: &Process, status: i32) {
+    process.files.lock().close_all();
     let space = process.space.lock().take();
     drop(space);
 
@@ -273,7 +514,6 @@ pub fn exit(status: i32) -> ! {
         panic!("init exited (wait status {status:#x})");
     }
     CHILD_EVENTS.wake_all();
-    task::exit()
 }
 
 /// The wait status of a process that called `exit(code)`.
@@ -336,10 +576,28 @@ pub fn send_signal(process: &Process, signal: u32) {
     signal::send(process, signal);
 }
 
+/// Sends a signal to the running thread (for faults like `SIGPIPE` that
+/// a system call raises).
 pub fn send_signal_to_self(signal: u32) {
-    if let Some(process) = task::current_process() {
-        send_signal(&process, signal);
+    if let Some(thread) = task::current_user_thread() {
+        signal::send_to_thread(&thread, signal);
     }
+}
+
+/// `tgkill`: sends a signal to one thread. A `process` of `None` (from
+/// `tkill`) matches any.
+pub fn kill_thread(process: Option<Pid>, tid: Pid, signal: u32) -> Result<()> {
+    if signal as usize >= SIGNAL_COUNT {
+        return Err(Errno::EINVAL);
+    }
+    let processes: Vec<Arc<Process>> = PROCESSES.lock().values().cloned().collect();
+    let thread = processes
+        .iter()
+        .filter(|candidate| process.is_none_or(|pid| candidate.pid == pid))
+        .find_map(|candidate| candidate.threads.lock().iter().find(|thread| thread.tid() == tid).cloned())
+        .ok_or(Errno::ESRCH)?;
+    signal::send_to_thread(&thread, signal);
+    Ok(())
 }
 
 /// Sends `signal` to every process in a group.
@@ -382,17 +640,20 @@ pub fn kill(pid: i64, signal: u32) -> Result<()> {
 /// user mode: acts on pending signals and switches threads if one is due.
 /// `syscall` is the number of the system call returning, if any.
 pub fn before_return_to_user(frame: &mut InterruptFrame, syscall: Option<u64>) {
-    if let Some(process) = task::current_process() {
-        signal::deliver(&process, frame, syscall);
-    }
+    // Switch first, so whatever happened while this thread waited its turn
+    // (a signal, another thread's exit_group) is acted on before it runs.
     task::preempt_point();
+    if let Some(thread) = task::current_user_thread() {
+        signal::deliver(&thread, frame, syscall);
+    }
 }
 
 /// Handles a CPU exception raised by user code: page faults inside the
 /// program's areas are resolved; anything else raises the matching signal,
 /// as on Linux, which ends the process unless it handles it.
 pub fn handle_user_exception(frame: &mut InterruptFrame) {
-    let process = current();
+    let thread = current_thread();
+    let process = &thread.process;
     let vector = frame.vector as u8;
     let (signal, description, address) = if vector == interrupts::PAGE_FAULT {
         let address = crate::arch::read_cr2();
@@ -422,10 +683,10 @@ pub fn handle_user_exception(frame: &mut InterruptFrame) {
         };
         (signal, description.into(), frame.rip)
     };
-    if !signal::raise_fault(&process, signal, address) {
+    if !signal::raise_fault(&thread, signal, address) {
         warn!("{} (pid {}): {description} at {:#x}", process.name.lock(), process.pid, frame.rip);
     }
-    signal::fault(&process, frame, signal, address);
+    signal::fault(&thread, frame, signal, address);
 }
 
 /// A snapshot of a process, for `ps`.
@@ -436,6 +697,7 @@ pub struct ProcessInfo {
     pub state: char,
     pub cpu_ms: u64,
     pub memory: u64,
+    pub threads: usize,
 }
 
 pub fn list() -> Vec<ProcessInfo> {
@@ -444,24 +706,23 @@ pub fn list() -> Vec<ProcessInfo> {
     processes
         .iter()
         .map(|process| {
-            let thread_id = *process.thread.lock();
-            let thread = threads.iter().find(|t| Some(t.id) == thread_id);
+            let ids: Vec<ThreadId> = process.threads.lock().iter().map(|thread| thread.id).collect();
+            let mine = || threads.iter().filter(|thread| ids.contains(&thread.id));
             let state = if process.status.lock().is_some() {
                 'Z'
+            } else if mine().any(|thread| matches!(thread.state, task::State::Running | task::State::Ready)) {
+                'R'
             } else {
-                match thread.map(|t| t.state) {
-                    Some(task::State::Running) => 'R',
-                    Some(task::State::Ready) => 'R',
-                    _ => 'S',
-                }
+                'S'
             };
             ProcessInfo {
                 pid: process.pid,
                 parent: process.parent(),
                 name: process.name.lock().clone(),
                 state,
-                cpu_ms: thread.map_or(0, |t| t.cpu_ticks),
+                cpu_ms: mine().map(|thread| thread.cpu_ticks).sum(),
                 memory: process.space.lock().as_ref().map_or(0, AddressSpace::resident_bytes),
+                threads: ids.len(),
             }
         })
         .collect()
@@ -521,7 +782,7 @@ mod tests {
 
         fn linux_c_programs_pass_their_self_tests() {
             // Built by the host's C compiler, if there was one.
-            for program in ["ctest", "sigtest", "hello-c", "hello-dynamic"] {
+            for program in ["ctest", "sigtest", "threadtest", "hello-c", "hello-dynamic"] {
                 let path = alloc::format!("/usr/bin/{program}");
                 if fs::lookup("/", &path, true).is_err() {
                     continue;

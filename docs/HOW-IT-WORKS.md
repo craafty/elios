@@ -729,7 +729,7 @@ with the standard MXCSR value).
 `process/`.
 
 A process is: an address space, a file descriptor table, a working
-directory, signal state, a process group, and (for now) one thread.
+directory, signal handlers, a process group, and one or more threads.
 
 ### Address spaces (`process/address_space.rs`)
 
@@ -811,6 +811,62 @@ start.
 Wait statuses use Linux's encoding: exit code in bits 8-15, or the signal
 number in the low 7 bits.
 
+### Threads (`process/mod.rs`, `process/futex.rs`)
+
+A thread in a user program is a scheduler thread (section 10) plus a
+`UserThread` record: the thread id programs see, its signal mask and
+pending signals, its alternate signal stack, and the "clear child tid"
+address described below. The process keeps a list of its threads; each
+thread points back at its process. Address space, files, working directory
+and signal handlers belong to the process, so threads share them by
+construction. FPU registers and the FS base (thread-local storage) were
+already per scheduler thread.
+
+**Creating threads.** glibc's `pthread_create` calls `clone` (or `clone3`,
+tried first) with `CLONE_VM | CLONE_THREAD | CLONE_SIGHAND | CLONE_SETTLS |
+CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID` and a stack it allocated. The
+new thread starts from a copy of the caller's system call frame, with rax =
+0, the given stack pointer and the given FS base. Thread ids come from the
+same counter as process ids, as on Linux, and the first thread's id is the
+pid, so `getpid` and `gettid` agree in single-threaded programs.
+
+`clone` without `CLONE_THREAD` makes a new process, and does so by copying
+memory even if `CLONE_VM` asks for sharing. Sharing an address space
+between *processes* would complicate exit and exec (whose memory is it?),
+and the programs that ask for it (`vfork`, glibc's `posix_spawn`) only use
+the shared memory in ways a copy also satisfies.
+
+**Futexes.** Every glibc synchronization primitive (mutexes, condition
+variables, semaphores, `pthread_join`, `pthread_once`) is an atomic variable
+in user memory; the kernel is only asked to sleep (`FUTEX_WAIT`: "if the
+variable still holds this value") or to wake sleepers (`FUTEX_WAKE`). The
+check and the enqueue happen under one lock, so a wake that follows a
+change to the variable can't be missed. Waiters live in one list keyed by
+(process, address), and each has its own wait queue, so waking *n* threads
+wakes exactly those. The `_BITSET` variants (used by condition variables)
+and `REQUEUE`/`CMP_REQUEUE` are supported, with relative or absolute
+timeouts on either clock.
+
+**Joining.** `CLONE_CHILD_CLEARTID` (and `set_tid_address`) give the kernel
+an address in the thread's descriptor. When the thread exits, the kernel
+stores 0 there and wakes one futex waiter at that address. That's all
+`pthread_join` needs: it waits on the thread id field until it's 0.
+
+**Ending threads.** `exit` (the system call) ends one thread;
+`exit_group` (what C's `exit()` calls) ends them all, and so does a fatal
+signal. A process-wide "ending" state records which: the status for
+`exit_group`, or for `execve`, the thread that survives. Every other thread
+is interrupted out of whatever it's blocked in (blocking calls treat this
+like a pending signal) and ends itself on its way back to user mode. The
+last thread to leave tears the process down, so nothing is freed while a
+thread could still be using it. Before leaving the list, each thread
+switches to the kernel's page tables, so the last thread can free the
+address space without anyone running on it.
+
+`execve` in a threaded process first loads the new program (so failures
+leave the process intact), then ends the other threads and waits until
+they're gone. The survivor takes the pid as its thread id.
+
 ### Process groups
 
 Each pipeline the shell runs is a process group, and the terminal knows
@@ -826,8 +882,13 @@ kernel panics if it does, because nothing could ever reap orphans again).
 
 `process/signal.rs`.
 
-Each process has a pending set, a blocked mask, a `sigaction` per signal,
-and an optional alternate stack. Signal sets use Linux's numbering, where
+Handlers (a `sigaction` per signal) belong to the process; each thread has
+its own blocked mask, alternate stack, and set of signals sent to it in
+particular. Signals sent to the process as a whole (`kill`, Ctrl+C) wait in
+a process-wide pending set and are taken by whichever thread doesn't block
+them; signals sent to one thread (`tgkill`, which `pthread_kill` and
+`raise` use) and CPU faults wait for that thread. Signal sets use Linux's
+numbering, where
 signal *n* is bit *n - 1* (the obvious `1 << n` overflows for signal 64, a
 bug that was found by `yes | head`'s SIGPIPE).
 
@@ -835,9 +896,10 @@ bug that was found by `yes | head`'s SIGPIPE).
 interrupts the target thread if it's sleeping or blocked. Blocking system
 calls check for pending signals in their wait conditions and return `EINTR`.
 
-**Delivery** happens just before returning to user mode. A signal with the
-default action either does nothing (SIGCHLD, SIGWINCH, ...) or ends the
-process. A signal with a handler gets a **signal frame**:
+**Delivery** happens just before returning to user mode, after any pending
+thread switch (so a thread that waited for the CPU acts on what arrived
+meanwhile). A signal with the default action either does nothing (SIGCHLD,
+SIGWINCH, ...) or ends the whole process, every thread of it. A signal with a handler gets a **signal frame**:
 
 1. The FPU state is saved on the user stack (64-byte aligned).
 2. An `rt_sigframe` is built below it, laid out exactly as Linux's: the
@@ -1242,8 +1304,13 @@ expose bugs that debug builds hide.
 Current limits, roughly in order of how much they'd matter to a user:
 
 - **One CPU.** Other cores are left idle.
-- **No threads in user programs** (`clone` with shared memory), so programs
-  using pthreads won't run.
+- **eliOS's own Rust programs are single-threaded**: libeli has no thread
+  API yet (C programs have pthreads).
+- **The kernel can fault on user memory another thread unmapped**: system
+  calls check user memory before using it, so a thread that unmaps a buffer
+  while another thread's system call is using it makes the kernel fault
+  (and panic). Linux avoids this with "exception tables" that turn such
+  faults into errors; eliOS will need the same.
 - **USB:** keyboards only through firmware PS/2 emulation; no USB storage.
 - **No networking.**
 - **No graphical desktop** (planned, deliberately postponed).

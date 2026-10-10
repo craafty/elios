@@ -322,7 +322,7 @@ fn build_c_programs(source: &Path, rootfs: &Path) -> Result<(), String> {
             command.arg("-static");
         }
         let status = command
-            .args(["-O2", "-s", "-o"])
+            .args(["-O2", "-s", "-pthread", "-o"])
             .arg(&output)
             .arg(&file)
             .status()

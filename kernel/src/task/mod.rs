@@ -22,13 +22,13 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub use self::wait::WaitQueue;
 use crate::arch::fpu::{self, FpuState};
 use crate::arch::{self, syscall};
 use crate::memory::{self, KernelStack};
-use crate::process::Process;
+use crate::process::{Process, UserThread};
 use crate::sync::SpinLock;
 use crate::time;
 
@@ -72,8 +72,8 @@ struct Thread {
     kernel_stack_top: u64,
     /// The page tables to run with (CR3).
     address_space: u64,
-    /// The user process this thread belongs to, if any.
-    process: Option<Arc<Process>>,
+    /// The user thread this is, if it runs a program.
+    user: Option<Arc<UserThread>>,
     /// User register state the kernel doesn't touch, saved while switched
     /// out.
     fpu: Box<FpuState>,
@@ -82,8 +82,10 @@ struct Thread {
 
 /// How to start a thread.
 pub struct Spawn {
+    /// From [`new_id`].
+    pub id: ThreadId,
     pub name: String,
-    pub process: Option<Arc<Process>>,
+    pub user: Option<Arc<UserThread>>,
     pub address_space: u64,
     pub fpu: FpuState,
     pub fs_base: u64,
@@ -92,8 +94,9 @@ pub struct Spawn {
 impl Spawn {
     pub fn kernel(name: &str) -> Self {
         Self {
+            id: new_id(),
             name: name.into(),
-            process: None,
+            user: None,
             address_space: memory::kernel_page_table_root(),
             fpu: FpuState::initial(),
             fs_base: 0,
@@ -111,7 +114,6 @@ struct Scheduler {
     /// Runs when nothing else can; never in the ready queue.
     idle: ThreadId,
     slice_left: u64,
-    next_id: u64,
 }
 
 static SCHEDULER: SpinLock<Option<Scheduler>> = SpinLock::new(None);
@@ -119,6 +121,14 @@ static SCHEDULER: SpinLock<Option<Scheduler>> = SpinLock::new(None);
 static NEED_RESCHEDULE: AtomicBool = AtomicBool::new(false);
 /// Woken whenever any thread exits; joiners wait here.
 static EXITED: WaitQueue = WaitQueue::new();
+/// Thread ids 1 and 2 are the boot and idle threads.
+static NEXT_ID: AtomicU64 = AtomicU64::new(3);
+
+/// A fresh thread id. Allocated ahead of [`spawn_with`] so a user thread's
+/// records can name the thread before it starts.
+pub fn new_id() -> ThreadId {
+    ThreadId(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+}
 
 global_asm!(
     r#"
@@ -176,7 +186,7 @@ extern "sysv64" fn thread_start(entry: *mut Entry) -> ! {
 }
 
 /// Builds a thread whose first switch lands in `thread_trampoline`.
-fn create_thread(id: ThreadId, options: Spawn, entry: Entry) -> Box<Thread> {
+fn create_thread(options: Spawn, entry: Entry) -> Box<Thread> {
     let stack = memory::allocate_kernel_stack(STACK_PAGES);
     let entry = Box::into_raw(Box::new(entry));
     // The frame `switch_context` pops: r15, r14, r13, r12, rbx, rbp, then
@@ -187,7 +197,7 @@ fn create_thread(id: ThreadId, options: Spawn, entry: Entry) -> Box<Thread> {
     // SAFETY: the top of a freshly mapped stack that nothing else uses.
     unsafe { (rsp as *mut [u64; 7]).write(frame) };
     Box::new(Thread {
-        id,
+        id: options.id,
         name: options.name,
         state: State::Ready,
         rsp,
@@ -196,7 +206,7 @@ fn create_thread(id: ThreadId, options: Spawn, entry: Entry) -> Box<Thread> {
         cpu_ticks: 0,
         wake_at: 0,
         address_space: options.address_space,
-        process: options.process,
+        user: options.user,
         fpu: Box::new(options.fpu),
         fs_base: options.fs_base,
     })
@@ -221,12 +231,12 @@ pub fn init(name: &str, boot_stack: KernelStack) {
             cpu_ticks: 0,
             wake_at: 0,
             address_space: memory::kernel_page_table_root(),
-            process: None,
+            user: None,
             fpu: Box::new(FpuState::initial()),
             fs_base: 0,
         }),
     );
-    threads.insert(idle, create_thread(idle, Spawn::kernel("idle"), Box::new(idle_loop)));
+    threads.insert(idle, create_thread(Spawn { id: idle, ..Spawn::kernel("idle") }, Box::new(idle_loop)));
     *SCHEDULER.lock() = Some(Scheduler {
         threads,
         ready: VecDeque::new(),
@@ -234,7 +244,6 @@ pub fn init(name: &str, boot_stack: KernelStack) {
         current: main,
         idle,
         slice_left: TIME_SLICE_TICKS,
-        next_id: 3,
     });
 }
 
@@ -258,11 +267,8 @@ pub fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> ThreadId {
 /// Starts a thread with the given settings, such as a user process's
 /// address space.
 pub fn spawn_with(options: Spawn, f: impl FnOnce() + Send + 'static) -> ThreadId {
-    let id = with(|s| {
-        s.next_id += 1;
-        ThreadId(s.next_id - 1)
-    });
-    let thread = create_thread(id, options, Box::new(f));
+    let id = options.id;
+    let thread = create_thread(options, Box::new(f));
     with(|s| {
         s.threads.insert(id, thread);
         s.ready.push_back(id);
@@ -276,7 +282,12 @@ pub fn current() -> ThreadId {
 
 /// The user process the running thread belongs to.
 pub fn current_process() -> Option<Arc<Process>> {
-    with(|s| s.threads[&s.current].process.clone())
+    with(|s| s.threads[&s.current].user.as_ref().map(|thread| thread.process.clone()))
+}
+
+/// The user thread that's running, if it is one.
+pub fn current_user_thread() -> Option<Arc<UserThread>> {
+    with(|s| s.threads[&s.current].user.clone())
 }
 
 /// Changes the running thread's page tables (for exec and exit) and
