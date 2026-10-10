@@ -15,6 +15,7 @@ mod acpi;
 mod arch;
 mod collections;
 mod console;
+mod drivers;
 mod errno;
 mod font;
 mod framebuffer;
@@ -143,6 +144,7 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
             *syscall::HOSTNAME.lock() = alloc::string::String::from(text.trim());
         }
     }
+    mount_disk(drivers::init());
     if let Err(error) = serial::enable_input() {
         warn!("serial: no input: {error}");
     }
@@ -159,6 +161,28 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
             Err(error) => error!("can't start /sbin/init: {error:?}; is the initrd missing?"),
         }
         task::exit()
+    }
+}
+
+/// Mounts the first FAT32 partition found (the boot disk's EFI partition,
+/// normally) at /disk.
+fn mount_disk(disks: alloc::vec::Vec<alloc::sync::Arc<dyn drivers::block::Disk>>) {
+    use drivers::block::{PartitionKind, partitions};
+    let candidates = disks.iter().flat_map(partitions).filter(|p| p.kind != PartitionKind::Other);
+    for partition in candidates {
+        let name = alloc::string::String::from(partition.disk.name());
+        match fs::fatfs::mount(partition) {
+            Ok((root, total, free)) => {
+                if fs::root().link("disk", root).is_ok() {
+                    info!("disk: {name} mounted at /disk ({} free of {})", Size(free), Size(total));
+                }
+                return;
+            }
+            Err(error) => warn!("disk: {name}: can't mount: {error:?}"),
+        }
+    }
+    if !disks.is_empty() {
+        warn!("disk: no FAT32 partition to mount");
     }
 }
 

@@ -93,6 +93,58 @@ impl<T> Drop for SpinLockGuard<'_, T> {
     }
 }
 
+/// A lock that puts waiting threads to sleep instead of spinning, with
+/// interrupts left enabled. For holding across slow operations like disk
+/// I/O; needs the scheduler running.
+pub struct Mutex<T> {
+    locked: AtomicBool,
+    waiters: crate::task::WaitQueue,
+    value: UnsafeCell<T>,
+}
+
+// SAFETY: the lock ensures only one thread accesses the value at a time.
+unsafe impl<T: Send> Sync for Mutex<T> {}
+
+impl<T> Mutex<T> {
+    pub const fn new(value: T) -> Self {
+        Self { locked: AtomicBool::new(false), waiters: crate::task::WaitQueue::new(), value: UnsafeCell::new(value) }
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        self.waiters.wait_until(|| {
+            self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok().then_some(())
+        });
+        MutexGuard { mutex: self }
+    }
+}
+
+pub struct MutexGuard<'a, T> {
+    mutex: &'a Mutex<T>,
+}
+
+impl<T> Deref for MutexGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: holding the guard means holding the lock.
+        unsafe { &*self.mutex.value.get() }
+    }
+}
+
+impl<T> DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: holding the guard means holding the lock.
+        unsafe { &mut *self.mutex.value.get() }
+    }
+}
+
+impl<T> Drop for MutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.mutex.locked.store(false, Ordering::Release);
+        self.mutex.waiters.wake_all();
+    }
+}
+
 /// A static whose contents can be borrowed mutably exactly once, giving out a
 /// `&'static mut` without `static mut`.
 pub struct TakeOnce<T> {

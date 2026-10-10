@@ -166,7 +166,6 @@ pub fn allocate_zeroed() -> Option<u64> {
 
 /// Allocates `count` physically contiguous frames, starting on a multiple of
 /// `align` frames. For devices that need contiguous memory.
-#[allow(dead_code, reason = "for device drivers (DMA buffers)")]
 pub fn allocate_contiguous(count: usize, align: usize) -> Option<u64> {
     with(|frames| frames.allocate_contiguous(count, align.max(1)))
 }

@@ -338,19 +338,7 @@ pub fn rename_at(old_dirfd: u64, old_path: u64, new_dirfd: u64, new_path: u64) -
     let new_path = user::read_string(new_path)?;
     let (old_parent, old_name) = fs::lookup_parent(&base_directory(old_dirfd)?, &old_path)?;
     let (new_parent, new_name) = fs::lookup_parent(&base_directory(new_dirfd)?, &new_path)?;
-    let inode = old_parent.lookup(&old_name)?;
-    if let Ok(existing) = new_parent.lookup(&new_name) {
-        if Arc::ptr_eq(&existing, &inode) {
-            return Ok(0);
-        }
-        if existing.metadata().kind == FileKind::Directory && !existing.entries()?.is_empty() {
-            return Err(Errno::ENOTEMPTY);
-        }
-        new_parent.unlink(&new_name)?;
-    }
-    new_parent.link(&new_name, inode)?;
-    old_parent.unlink(&old_name)?;
-    Ok(0)
+    old_parent.rename(&old_name, &new_parent, &new_name).map(|_| 0)
 }
 
 pub fn symlink_at(target: u64, dirfd: u64, path: u64) -> Result<u64> {

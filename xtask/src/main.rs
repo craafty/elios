@@ -1,5 +1,7 @@
 //! Build and run eliOS. Invoked as `cargo xtask <command>`.
 
+mod image;
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,15 +13,17 @@ const USAGE: &str = "\
 usage: cargo xtask <command> [options] [-- <extra qemu args>]
 
 commands:
-  build        build eliboot and the kernel, and lay out the boot volume
-  run          build, then boot eliOS in QEMU
+  build        build everything and update the disk image (target/eliOS.img)
+  run          build, then boot the disk image in QEMU
   test         boot a test build of the kernel in QEMU and run its tests
+  image        build a fresh disk image (for a USB stick or another VM)
 
 options:
   --release    build with optimizations
   --headless   no QEMU window; serial output only (run; test is always headless)
   --gdb        wait for a debugger on localhost:1234 (run, test)
   --trace      log interrupts and CPU resets to target/qemu.log (run, test)
+  --fresh      start from an empty disk image instead of updating it (run)
 ";
 
 const BOOTLOADER_TARGET: &str = "x86_64-unknown-uefi";
@@ -53,6 +57,7 @@ struct Options {
     headless: bool,
     gdb: bool,
     trace: bool,
+    fresh: bool,
     qemu_args: Vec<String>,
 }
 
@@ -66,8 +71,12 @@ fn main() -> ExitCode {
 
     let result = match command.as_deref() {
         Some("build") => build(&options).map(|_| ()),
-        Some("run") => build(&options).and_then(|esp| run(&esp, &options)),
+        Some("run") => build(&options).and_then(|disk| run(&disk, &options)),
         Some("test") => test(&options),
+        Some("image") => {
+            let options = Options { fresh: true, ..options };
+            build(&options).map(|disk| eprintln!("xtask: wrote {}", disk.display()))
+        }
         Some("help" | "-h" | "--help") => {
             print!("{USAGE}");
             Ok(())
@@ -93,6 +102,7 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options, Stri
             "--headless" => options.headless = true,
             "--gdb" => options.gdb = true,
             "--trace" => options.trace = true,
+            "--fresh" => options.fresh = true,
             "--" => options.qemu_args.extend(args.by_ref()),
             _ => return Err(format!("unknown option `{arg}`\n\n{USAGE}")),
         }
@@ -108,22 +118,22 @@ fn profile(release: bool) -> &'static str {
     if release { "release" } else { "debug" }
 }
 
-/// Builds everything and lays out the boot volume. Returns its directory.
+/// Builds everything and puts it on the disk image. Returns the image.
 fn build(options: &Options) -> Result<PathBuf, String> {
     let bootloader = build_bootloader(options.release)?;
     cargo(&["build", "--package", "elikernel", "--target", KERNEL_TARGET], options.release, &[])?;
     let kernel = workspace_root().join("target").join(KERNEL_TARGET).join(profile(options.release)).join("elikernel");
     let initrd = build_initrd()?;
-    make_boot_volume("esp", &bootloader, &kernel, &initrd)
+    make_disk_image("eliOS.img", &bootloader, &kernel, &initrd, options.fresh)
 }
 
 fn test(options: &Options) -> Result<(), String> {
     let bootloader = build_bootloader(options.release)?;
     let kernel = build_test_kernel(options.release)?;
     let initrd = build_initrd()?;
-    let esp = make_boot_volume("esp-test", &bootloader, &kernel, &initrd)?;
+    let disk = make_disk_image("eliOS-test.img", &bootloader, &kernel, &initrd, true)?;
 
-    let mut qemu = qemu_command(&esp, options)?;
+    let mut qemu = qemu_command(&disk, options)?;
     qemu.args(["-display", "none", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     let status = run_with_timeout(qemu, TEST_TIMEOUT)?;
     match status.code() {
@@ -200,20 +210,23 @@ fn cargo(args: &[&str], release: bool, environment: &[(&str, &str)]) -> Result<S
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Copies the bootloader, kernel and initrd into an EFI system partition
-/// layout under `target/<name>`.
-fn make_boot_volume(name: &str, bootloader: &Path, kernel: &Path, initrd: &Path) -> Result<PathBuf, String> {
-    let esp = workspace_root().join("target").join(name);
+/// Puts the bootloader, kernel and initrd on the disk image `target/<name>`.
+fn make_disk_image(
+    name: &str,
+    bootloader: &Path,
+    kernel: &Path,
+    initrd: &Path,
+    fresh: bool,
+) -> Result<PathBuf, String> {
+    let read = |path: &Path| fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()));
     let files = [
-        (bootloader, esp.join("EFI/BOOT/BOOTX64.EFI")),
-        (kernel, esp.join("EFI/eliOS/kernel.elf")),
-        (initrd, esp.join("EFI/eliOS/initrd.cpio")),
+        ("EFI/BOOT/BOOTX64.EFI", read(bootloader)?),
+        ("EFI/eliOS/kernel.elf", read(kernel)?),
+        ("EFI/eliOS/initrd.cpio", read(initrd)?),
     ];
-    for (from, to) in &files {
-        fs::create_dir_all(to.parent().unwrap()).map_err(|e| format!("creating {}: {e}", to.display()))?;
-        fs::copy(from, to).map_err(|e| format!("copying {} to {}: {e}", from.display(), to.display()))?;
-    }
-    Ok(esp)
+    let disk = workspace_root().join("target").join(name);
+    image::build(&disk, &files, fresh)?;
+    Ok(disk)
 }
 
 /// Builds the user programs (always optimized and without debug info: they
@@ -396,8 +409,8 @@ fn cpio_entry(archive: &mut Vec<u8>, inode: u32, name: &str, mode: u32, data: &[
     archive.resize(archive.len().next_multiple_of(4), 0);
 }
 
-fn run(esp: &Path, options: &Options) -> Result<(), String> {
-    let mut qemu = qemu_command(esp, options)?;
+fn run(disk: &Path, options: &Options) -> Result<(), String> {
+    let mut qemu = qemu_command(disk, options)?;
     if options.headless {
         qemu.args(["-display", "none"]);
     }
@@ -409,16 +422,16 @@ fn run(esp: &Path, options: &Options) -> Result<(), String> {
 }
 
 /// The QEMU invocation shared by `run` and `test`.
-fn qemu_command(esp: &Path, options: &Options) -> Result<Command, String> {
+fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
     let firmware = find_ovmf()?;
     let mut qemu = Command::new("qemu-system-x86_64");
     qemu.args(["-machine", "q35", "-m", "256M", "-nic", "none"])
         .arg("-bios")
         .arg(&firmware)
-        // Exposes the directory to the guest as a FAT disk, so there's no
-        // image to rebuild while iterating.
+        // On the q35 machine the disk is attached to an AHCI (SATA)
+        // controller, as on a real PC.
         .arg("-drive")
-        .arg(format!("format=raw,file=fat:rw:{}", esp.display()))
+        .arg(format!("format=raw,file={}", disk.display()))
         .args(["-serial", "stdio"])
         // A triple fault should stop the machine, not quietly reboot it.
         .arg("-no-reboot");

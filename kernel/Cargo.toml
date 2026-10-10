@@ -12,3 +12,4 @@ harness = false
 
 [dependencies]
 bootinfo = { path = "../bootinfo" }
+fat = { path = "../fat" }

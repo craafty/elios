@@ -11,6 +11,7 @@
 
 pub mod cpio;
 pub mod devfs;
+pub mod fatfs;
 pub mod pipe;
 pub mod procfs;
 pub mod ramfs;
@@ -143,6 +144,38 @@ pub trait Inode: Send + Sync {
 
     /// Called when the last open file referring to this inode is closed.
     fn on_close(&self, _flags: u32) {}
+
+    /// Moves entry `old_name` of this directory to `new_name` in
+    /// `new_parent`, replacing what's there. The default works for
+    /// file systems that can link any inode into any directory.
+    fn rename(&self, old_name: &str, new_parent: &Arc<dyn Inode>, new_name: &str) -> Result<()> {
+        if self.filesystem() != new_parent.filesystem() {
+            return Err(Errno::EXDEV);
+        }
+        let inode = self.lookup(old_name)?;
+        if let Ok(existing) = new_parent.lookup(new_name) {
+            if Arc::ptr_eq(&existing, &inode) {
+                return Ok(());
+            }
+            if existing.metadata().kind == FileKind::Directory && !existing.entries()?.is_empty() {
+                return Err(Errno::ENOTEMPTY);
+            }
+            new_parent.unlink(new_name)?;
+        }
+        new_parent.link(new_name, inode)?;
+        self.unlink(old_name)
+    }
+
+    /// Which file system this belongs to: entries can only be renamed
+    /// within one. The in-memory file systems are all 0.
+    fn filesystem(&self) -> usize {
+        0
+    }
+
+    /// For file systems that need to recognize their own inodes.
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        None
+    }
 
     fn not_a_file(&self) -> Errno {
         if self.metadata().kind == FileKind::Directory { Errno::EISDIR } else { Errno::EINVAL }

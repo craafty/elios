@@ -379,7 +379,16 @@ fn mv(arguments: &[String]) -> i32 {
     };
     let mut status = 0;
     for &source in sources {
-        if let Err(error) = fs::rename(source, &destination(source, target)) {
+        let destination = destination(source, target);
+        let result = match fs::rename(source, &destination) {
+            // Different file systems (say, the disk and memory): copy, then
+            // delete the original.
+            Err(eli::Error::CROSS_DEVICE) => {
+                fs::copy(source, &destination).and_then(|_| fs::remove_file(source)).map(|_| ())
+            }
+            result => result,
+        };
+        if let Err(error) = result {
             status = report("mv", source, error);
         }
     }

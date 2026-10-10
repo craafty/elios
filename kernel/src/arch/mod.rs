@@ -31,6 +31,20 @@ pub unsafe fn inb(port: u16) -> u8 {
     value
 }
 
+/// # Safety
+/// Writing to an I/O port can reconfigure hardware arbitrarily.
+pub unsafe fn outl(port: u16, value: u32) {
+    unsafe { asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags)) };
+}
+
+/// # Safety
+/// Reading some I/O ports has side effects on the device.
+pub unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    unsafe { asm!("in eax, dx", in("dx") port, out("eax") value, options(nomem, nostack, preserves_flags)) };
+    value
+}
+
 /// A short delay for old devices that need time between port accesses.
 pub fn io_wait() {
     // SAFETY: port 0x80 is the POST code port; writing it is harmless.

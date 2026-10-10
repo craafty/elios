@@ -25,7 +25,28 @@ cargo xtask run --gdb         # wait for gdb on :1234
 cargo xtask run --trace       # log interrupts/resets to target/qemu.log
 cargo xtask test              # run the kernel's tests inside QEMU
 cargo xtask build --release   # just build
+cargo xtask image             # a fresh bootable disk image
 ```
+
+Everything is built into a disk image, `target/eliOS.img`: a GPT disk with
+one EFI System Partition (FAT32) holding eliboot, the kernel and the initrd.
+`run` updates the boot files on the existing image and keeps everything else,
+so files you save under `/disk` are still there next time (`--fresh` starts
+over).
+
+### Real hardware
+
+The image boots on UEFI PCs (with Secure Boot off). Write it to a USB stick,
+replacing everything on it:
+
+```sh
+cargo xtask image --release
+sudo dd if=target/eliOS.img of=/dev/sdX bs=4M conv=fsync   # sdX = the stick
+```
+
+Real machines vary far more than QEMU; eliOS needs a PS/2 keyboard (or
+firmware that emulates one for USB keyboards) and an AHCI (SATA) controller
+for disk access. It boots and runs from memory without one.
 
 eliOS boots to a shell. Type in the QEMU window, or in the terminal you ran
 `cargo xtask run` from: the serial port is a second console. Try `help`,
@@ -99,6 +120,7 @@ turns the file into the kernel's glyph tables.
 | `kernel/`   | The kernel (`x86_64-unknown-none`), linked at `0xFFFFFFFF80000000` |
 | `kernel/font/` | The console font, as editable ASCII art                      |
 | `bootinfo/` | The boot protocol: the contract between eliboot and the kernel   |
+| `fat/`      | FAT32 file systems, shared by the kernel and the image builder   |
 | `user/eli/` | libeli, the runtime for user programs                            |
 | `user/utils/` | eliutils: shell, init and commands                             |
 | `rootfs/`   | Files for the root file system (`/etc`, `/home`)                 |
@@ -142,7 +164,8 @@ The exact machine state at kernel entry is documented in `bootinfo/src/lib.rs`.
       and dynamically linked (via glibc's own ld.so); signal handlers with
       Linux's signal frame, masks, SA_RESTART and alternate stacks; poll and
       select; /proc; strace
-- [ ] **Phase 7: Storage.** PCI, a disk driver (AHCI/NVMe/virtio), a native
-      eliOS file system plus FAT32 for interop
-- [ ] **Phase 8+:** SMP, networking (own TCP/IP stack), GUI and compositor,
-      real-hardware support (custom GPT/FAT image builder for USB boot)
+- [x] **Phase 7: Storage.** PCI, an AHCI (SATA) driver, GPT/MBR partitions,
+      a FAT32 file system with long names (shared with the image builder),
+      the boot disk mounted at /disk, bootable GPT disk images
+- [ ] **Next:** SMP, threads in user programs, networking (own TCP/IP
+      stack), USB, a GUI and compositor
