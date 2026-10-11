@@ -5,8 +5,8 @@ use core::ptr;
 
 use crate::memory::{self, PAGE_SIZE};
 use crate::uefi::{
-    self, Error, FILE_INFO, FILE_MODE_READ, File, FileInfo, Handle, LOADED_IMAGE_PROTOCOL, LoadedImage, MemoryType,
-    SIMPLE_FILE_SYSTEM_PROTOCOL, SimpleFileSystem,
+    self, DEVICE_PATH_PROTOCOL, Error, FILE_INFO, FILE_MODE_READ, File, FileInfo, Handle, LOADED_IMAGE_PROTOCOL,
+    LoadedImage, MemoryType, SIMPLE_FILE_SYSTEM_PROTOCOL, SimpleFileSystem,
 };
 
 /// Reads a whole file into freshly allocated pages of memory type
@@ -78,5 +78,43 @@ unsafe fn read_all(file: *mut File, memory: MemoryType) -> Result<&'static [u8],
             return Err(Error::new("file was shorter than reported"));
         }
         Ok(core::slice::from_raw_parts(buffer, size))
+    }
+}
+
+/// The GPT unique GUID of the partition eliboot was loaded from, from the
+/// device path of its volume (the "hard drive" node of a GPT partition).
+pub fn boot_partition(image: Handle) -> Option<[u8; 16]> {
+    const MEDIA: u8 = 4;
+    const HARD_DRIVE: u8 = 1;
+    const END: u8 = 0x7F;
+    const SIGNATURE_GUID: u8 = 2;
+    let bs = uefi::boot_services();
+    // SAFETY: firmware calls with valid out-pointers; the device path is a
+    // list of nodes, each giving its own length, ending with an end node.
+    unsafe {
+        let mut loaded_image: *mut LoadedImage = ptr::null_mut();
+        (bs.handle_protocol)(image, &LOADED_IMAGE_PROTOCOL, (&raw mut loaded_image).cast::<*mut c_void>())
+            .check("")
+            .ok()?;
+        let mut node: *const u8 = ptr::null();
+        (bs.handle_protocol)(
+            (*loaded_image).device_handle,
+            &DEVICE_PATH_PROTOCOL,
+            (&raw mut node).cast::<*mut c_void>(),
+        )
+        .check("")
+        .ok()?;
+        for _ in 0..64 {
+            let (kind, subtype) = (*node, *node.add(1));
+            let length = usize::from(u16::from_le_bytes([*node.add(2), *node.add(3)]));
+            if kind == END || length < 4 {
+                return None;
+            }
+            if kind == MEDIA && subtype == HARD_DRIVE && length >= 42 && *node.add(41) == SIGNATURE_GUID {
+                return Some(core::ptr::read_unaligned(node.add(24).cast::<[u8; 16]>()));
+            }
+            node = node.add(length);
+        }
+        None
     }
 }

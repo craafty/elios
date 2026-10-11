@@ -216,9 +216,16 @@ struct Stat {
 fn write_stat(inode: &Arc<dyn Inode>, address: u64) -> Result<u64> {
     let metadata = inode.metadata();
     let time = [metadata.modified as i64, 0];
+    // Each file system gets its own device number, so programs that tell
+    // files apart by (device, inode) don't confuse two file systems' inodes.
+    let device = match inode.filesystem() {
+        0 => 1,
+        filesystem => (filesystem as u64 >> 4) & 0xFFFF_FFFF,
+    };
     let stat = Stat {
-        device: 1,
+        device,
         inode: metadata.inode,
+        rdev: metadata.rdev,
         links: u64::from(metadata.links),
         mode: metadata.kind.mode_bits() | metadata.permissions,
         uid: metadata.uid,

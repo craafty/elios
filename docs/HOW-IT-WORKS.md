@@ -243,9 +243,18 @@ so the kernel's entry point is an ordinary `extern "sysv64" fn(&BootInfo)`.
 `BootInfo` is the contract between eliboot and the kernel: a `#[repr(C)]`
 struct with a magic number and version (so a mismatched kernel and
 bootloader fail clearly), the direct map offset, the page table root, the
-memory map, the framebuffer, the RSDP and the initrd. All pointers in it are
-direct-map addresses, so they stay valid after the kernel drops the identity
-map. The crate's documentation specifies the machine state at entry
+memory map, the framebuffer, the RSDP, the initrd, the kernel command
+line, the GUID of the partition eliboot was loaded from, and the address of
+the firmware's runtime services. All pointers in it are direct-map
+addresses, so they stay valid after the kernel drops the identity map.
+
+The **command line** is one line of text from `\EFI\eliOS\cmdline.txt`, if
+it exists: `root=PARTUUID=<guid>` there makes an installed system's ext2
+partition the root (section 16). The **boot partition** comes from the
+firmware's device path for eliboot's volume (its "hard drive" node carries
+the GPT partition GUID), so the kernel mounts the partition it actually
+booted from at `/disk`, not just the first FAT partition it sees (which,
+on a PC with Windows, would be Windows's). The crate's documentation specifies the machine state at entry
 precisely; it's the one place both sides agree on.
 
 ## 4. Kernel startup, step by step
@@ -271,12 +280,15 @@ precisely; it's the one place both sides agree on.
     then replay everything logged so far onto it.
 11. **Interrupt controllers** (legacy PIC off, local APIC, I/O APIC), then
     **timers**, then the **keyboard**.
-12. **File systems:** unpack the initrd, set up `/dev` and `/proc`, free the
-    initrd's memory.
-13. **Drivers:** start the network stack's thread; PCI scan; AHCI and NVMe
-    disks, the network card, USB controllers (waiting briefly for devices
-    present at boot); mount the boot disk at `/disk`; wait up to three
-    seconds for DHCP.
+12. **Drivers:** start the network stack's thread; PCI scan; AHCI and NVMe
+    disks (each registered under a Linux-style name), the network card, USB
+    controllers (waiting briefly for devices present at boot).
+13. **File systems:** mount the root: the ext2 partition the command line
+    names (waiting up to ten seconds for it to appear), or else the initrd
+    unpacked into memory; free the initrd's memory; mount `/dev`, `/proc`
+    and `/sys` (and, on a disk root, fresh in-memory `/tmp` and `/run`);
+    mount the boot partition at `/disk`; wait up to three seconds for DHCP.
+    Drivers come first now because the root may be on a disk.
 14. **Serial input and the keyboard thread**, then enable interrupts.
 15. **Start `/sbin/init`** and let the boot thread exit.
 
@@ -1245,9 +1257,18 @@ devices, pipes, the terminal, and `/proc`'s generated files. Every inode
 reports an owner, a group and permission bits; who may do what with them
 is section 14.
 
-There's no mount table: mounting means linking another file system's root
-into a directory (`/proc`, `/disk`). `..` is resolved lexically (by
-normalizing the path string), which avoids needing parent pointers.
+**Mounts** (`mount.rs`): a table lists which file system covers which
+directory, identifying the directory by (file system, inode number) so it's
+recognized however the path was spelled. Path lookup checks each directory
+it reaches against the table and continues in the mounted root. The root is
+itself a mount: an in-memory tree for the live system, an ext2 partition
+for an installed one. A mounted disk file system provides a `Volume` (sync,
+unmount, read-only switch); unmounting fails with `EBUSY` while any of its
+files or directories are in use (each volume knows its live nodes). Before
+power-off or reboot, every volume is written back and marked cleanly
+unmounted. `..` is resolved lexically (by normalizing the path string),
+which avoids needing parent pointers, and makes `..` at a mount point's
+root step back into the parent file system for free.
 
 **Path resolution** walks one component at a time and follows symbolic
 links (relative to the link's directory, up to 8 deep, then `ELOOP`).
@@ -1277,10 +1298,22 @@ why symlinks were implemented early.
 
 ### /dev and /proc
 
-`/dev` has `null`, `zero`, `random`, `urandom`, `console` and `tty`.
+`/dev` has `null`, `zero`, `random`, `urandom`, `console` and `tty`, and a
+**block device file** per disk and partition (`sda`, `sda1`, `nvme0n1p2`),
+named as on Linux. Reading and writing one reads and writes sectors
+directly (partial sectors are read, changed and written back), owned by
+root and the `disk` group, mode 0660. They answer Linux's block ioctls:
+`BLKGETSIZE64` (size), `BLKSSZGET` (sector size) and `BLKRRPART`, which
+rereads the partition table after a tool changed it and replaces the
+partition files (refused while one is mounted).
+
+`/sys/block` describes each disk as Linux does: `size`, `removable`,
+`device/model`, and per partition `partition`, `start`, `size` and its GPT
+`uuid`. `lsblk` and the installer read it.
 
 `/proc` follows Linux's layout because programs read it: `meminfo`,
-`uptime`, `cpuinfo`, `stat`, `mounts`, `version`, `loadavg`, and per
+`uptime`, `cpuinfo`, `stat`, `mounts`, `partitions`, `filesystems`,
+`version`, `loadavg`, and per
 process `exe`, `cwd`, `cmdline`, `status`, `stat`, `maps` and `fd/`. Files are
 generated when first read and the result is kept for that open file. A bug
 showed why: `cat /proc/self/maps` reads in chunks, and `cat`'s own
@@ -1426,9 +1459,19 @@ Only 512-byte sectors are supported (most drives default to them).
 
 ### Partitions and the block layer (`drivers/block.rs`)
 
-Disks implement a small `Disk` trait (read and write whole sectors).
-Partition tables are read from GPT, falling back to MBR. The first FAT32 or
-EFI System Partition found is mounted at `/disk`.
+Disks implement a small `Disk` trait (read and write whole sectors, plus a
+name and model) and are registered as they're found, which creates their
+device files. They're named as on Linux: SATA (and USB) disks `sda`, `sdb`,
+...; NVMe `nvme0n1`; partitions add a number (`sda1`), with a `p` when the
+disk's name ends in a digit (`nvme0n1p1`). Device numbers (major 8 for
+`sd`, 259 for NVMe) match Linux's too, since `ls -l` and /proc/partitions
+show them.
+
+Partition tables are read from GPT, falling back to MBR. Each partition
+keeps its GPT unique GUID (how the boot partition and an installed root are
+found) and its type: EFI System, eliOS root (eliOS's own type GUID,
+`E1105A00-7E1D-4F0C-8C5B-30E1105A0002`, so an eliOS root is never mistaken
+for a Linux one), or other.
 
 ### FAT32 (`fat/`)
 
@@ -1466,6 +1509,68 @@ by its entry's position on disk, so the same file is always the same node
 however it's reached. Deleting a file marks any open node for it as deleted,
 because its clusters may be reused. FAT has no permissions, symlinks or hard
 links.
+
+### ext2 (`ext2/`)
+
+Installed systems keep their files on **ext2**, because a root file system
+needs what FAT can't store: owners, permissions, symbolic and hard links.
+ext2 was chosen over designing a new format because it's simple enough to
+implement completely (no journal, no extents), it's Linux's classic file
+system (so an eliOS disk can be read, and checked, on Linux), and Linux's
+own tools make an exacting test oracle. Like FAT, it's a separate `no_std`
+crate shared by the kernel and userland (`mkfs` and the installer).
+
+The layout: the volume is split into **block groups**, each with a bitmap
+of free blocks, a bitmap of free inodes and an inode table; some groups
+keep backups of the **superblock** (the volume's geometry and counters)
+and of the group descriptor table (where each group's bitmaps and table
+are). An **inode** holds a file's type, permissions, owner, size, times,
+link count and where its data is: 12 direct block numbers, then single,
+double and triple **indirect** blocks (blocks of block numbers); 0 is a
+hole that reads as zeros. A **directory** is a file of variable-length
+records (inode, record length, name length, type, name); deleting merges a
+record into the previous one, adding splits one with room to spare.
+
+Implementation choices:
+
+- **Supported features:** revision 1 with `filetype`, `sparse_super` and
+  `large_file`, 1-4 KiB blocks, 128- or 256-byte inodes. Volumes from
+  Linux's `mke2fs -t ext2` also have `resize_inode`, `dir_index` and
+  `ext_attr`, which are safe to leave alone: hashed directories are read as
+  plain ones and lose their index flag when changed (exactly what Linux's
+  own ext2 driver does). Journals needing replay, extents and checksums
+  are refused or mounted read-only.
+- **Caching and consistency:** metadata blocks (bitmaps, inode tables,
+  directories, indirect blocks) go through a cache of up to 2048 blocks;
+  every operation writes its changes back before returning, so the disk is
+  never more than one operation behind (no write-back cache to lose in a
+  crash). File data bypasses the cache and moves in runs of up to 64
+  contiguous blocks per device request.
+- **Allocation:** a file's blocks are taken starting just after its
+  previous block (so files stay contiguous); new directories go to the
+  group with the most free inodes (spreading the tree out), new files to
+  their directory's group.
+- **Clean flag:** mounting writable marks the volume "not clean";
+  unmounting (and shutting down) marks it clean, so a crash is noticed the
+  way Linux notices it.
+- **Formatting** follows mke2fs's choices: 4 KiB blocks from 512 MiB up,
+  256-byte inodes, one inode per 16 KiB (64 KiB on big disks), a 16 KiB
+  `lost+found`, inode tables zeroed.
+
+It's tested on the host (`cargo test -p ext2`): every volume the tests
+produce, after creating thousands of entries, indirect blocks, truncation,
+hard links, renames across directories, symbolic links and filling the disk,
+is checked by Linux's `e2fsck -fn`, and a test makes sure that check really
+catches damage. Volumes made by Linux's mke2fs (with a hashed directory
+index built by `e2fsck -D`) are mounted, changed, and checked again.
+
+**In the VFS** (`fs/ext2fs.rs`), each inode is one node with a cached copy
+of the inode, so `stat` and path lookups don't wait for the volume's lock;
+anything that changes an inode refreshes its node. Unix lets a file be
+deleted while open: its last name goes, but its data stays until the last
+user closes it. The node's destructor notices an inode with no names and
+queues it, and the next operation on the volume frees it (the destructor
+can run where the volume can't be locked).
 
 ## 19. Networking
 

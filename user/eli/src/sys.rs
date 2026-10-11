@@ -65,6 +65,7 @@ pub const SETGROUPS: usize = 116;
 pub const SETRESUID: usize = 117;
 pub const SETRESGID: usize = 119;
 pub const SYNC: usize = 162;
+pub const STATFS: usize = 137;
 pub const MOUNT: usize = 165;
 pub const UMOUNT2: usize = 166;
 pub const SETHOSTNAME: usize = 170;

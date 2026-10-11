@@ -52,6 +52,7 @@ hello-dynamic                 # a dynamically linked Linux program
 strace hello-c                # watch a program's system calls
 vi poem.txt                   # BusyBox vi (if busybox-static was installed)
 cp notes.txt /disk/           # /disk is the boot disk: files there persist
+lsblk; df                     # disks, partitions, and free space
 ifconfig; ping -c 3 10.0.2.2  # the network (QEMU's virtual router)
 wget -O - http://example.com/ # the internet, if the host has it
 nettest                       # sockets through glibc: TCP, UDP, poll...
@@ -71,6 +72,7 @@ cargo xtask run --gdb         # wait for a debugger on localhost:1234
 cargo xtask run --trace       # log interrupts and CPU resets to target/qemu.log
 cargo xtask run --cpus 8      # more (or fewer) CPUs; the default is 4
 cargo xtask run --forward 8080:80  # reach port 80 in eliOS at localhost:8080
+cargo xtask run --second-disk # an empty 2 GiB disk to format, mount, install to
 cargo xtask test              # boot a test kernel and run its tests
 cargo xtask image             # a fresh bootable disk image, target/eliOS.img
 ```
@@ -117,8 +119,10 @@ may work too, but QEMU is the one eliOS is tested on.
 - **Processes:** preemptive round-robin scheduling on every CPU; user
   processes with threads, `fork`, `exec` (ELF, `#!` scripts, dynamic
   linkers), `wait`, process groups, and Linux-style signals with handlers.
-- **Files:** a VFS over an in-memory file system, a FAT32 driver for disks,
-  `/dev`, `/proc`, pipes, and a terminal with line editing and job control.
+- **Files:** a VFS with mount points over an in-memory file system, FAT32
+  and ext2 drivers for disks, `/dev` (with disk and partition device
+  files), `/proc`, `/sys`, pipes, and a terminal with line editing and job
+  control.
 - **Users:** Unix users and groups with real, effective and saved ids,
   owners and permission bits on every file, the sticky bit, umask, and
   setuid programs, all with Linux's rules.
@@ -170,7 +174,8 @@ crate::ktest! {
 
 They range from data structures to running real programs: a three-process
 pipeline, the C library self-test, and reading and writing the disk. The FAT
-crate also has host unit tests (`cargo test -p fat`).
+and ext2 crates also have host unit tests (`cargo test -p fat -p ext2`); the
+ext2 tests check every volume they make with Linux's `e2fsck`.
 
 ### The font
 
@@ -186,6 +191,7 @@ glyph and rebuild.
 | `kernel/`       | The kernel                                                   |
 | `kernel/font/`  | The console font                                             |
 | `fat/`          | FAT32, shared by the kernel and the disk image builder       |
+| `ext2/`         | ext2, shared by the kernel, `mkfs` and the installer         |
 | `user/eli/`     | libeli, the runtime for eliOS's Rust programs                |
 | `user/utils/`   | eliutils: shell, init, editor and commands                   |
 | `user/c/`       | C test programs built with the host's toolchain              |
@@ -204,7 +210,8 @@ glyph and rebuild.
       pipes, terminal, shell and commands
 - [x] **Linux compatibility:** glibc programs (static and dynamic), signal
       handlers, poll/select, /proc, strace, BusyBox
-- [x] **Storage:** PCI, AHCI, NVMe, partitions, FAT32, bootable disk images
+- [x] **Storage:** PCI, AHCI, NVMe, partitions, FAT32, ext2, mount points,
+      device files, bootable disk images
 - [x] **Hardware support:** ACPI power off and reset, KVM
 - [x] **Threads:** `clone`, futexes, per-thread signals; glibc's pthreads
 - [x] **Multiple CPUs:** startup through a real-mode trampoline, per-CPU

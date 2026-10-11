@@ -119,7 +119,13 @@ pub fn reboot(magic: u64, command: u64) -> Result<u64> {
     if magic as u32 as u64 != REBOOT_MAGIC1 {
         return Err(Errno::EINVAL);
     }
-    match command as u32 as u64 {
+    let command = command as u32 as u64;
+    if ![REBOOT_CMD_RESTART, REBOOT_CMD_POWER_OFF, REBOOT_CMD_HALT].contains(&command) {
+        return Err(Errno::EINVAL);
+    }
+    // Disks are left consistent and marked cleanly unmounted.
+    crate::fs::mount::shut_down();
+    match command {
         REBOOT_CMD_RESTART => power::restart(),
         REBOOT_CMD_POWER_OFF | REBOOT_CMD_HALT => power::power_off(),
         _ => Err(Errno::EINVAL),

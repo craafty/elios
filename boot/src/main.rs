@@ -30,6 +30,9 @@ use crate::uefi::{Error, Handle, MemoryType, Status, SystemTable};
 
 const KERNEL_PATH: &str = "\\EFI\\eliOS\\kernel.elf";
 const INITRD_PATH: &str = "\\EFI\\eliOS\\initrd.cpio";
+/// Options for the kernel (like `root=PARTUUID=...` on an installed system),
+/// one line of text; optional.
+const COMMAND_LINE_PATH: &str = "\\EFI\\eliOS\\cmdline.txt";
 
 #[unsafe(no_mangle)]
 extern "efiapi" fn efi_main(image: Handle, system_table: *mut SystemTable) -> Status {
@@ -92,6 +95,17 @@ fn boot(image: Handle) -> Result<Infallible, Error> {
         }
     };
 
+    let mut command_line = [0u8; bootinfo::COMMAND_LINE_SIZE];
+    let mut command_line_len = 0;
+    if let Ok(text) = fs::read_file(image, COMMAND_LINE_PATH, MemoryType::LOADER_DATA) {
+        let text = core::str::from_utf8(text).unwrap_or("").lines().next().unwrap_or("").trim();
+        command_line_len = text.len().min(command_line.len());
+        command_line[..command_line_len].copy_from_slice(&text.as_bytes()[..command_line_len]);
+        println!("options:     {}", &text[..command_line_len]);
+    }
+    let boot_partition = fs::boot_partition(image).unwrap_or([0; 16]);
+    let runtime_services = uefi::system_table().map_or(0, |table| table.runtime_services as u64);
+
     let stack_pages = (KERNEL_STACK_SIZE / PAGE_SIZE) as usize;
     let stack = memory::allocate_pages(ELIOS_KERNEL_STACK, stack_pages)?;
     let stack_top = HHDM_OFFSET + stack + KERNEL_STACK_SIZE;
@@ -149,6 +163,10 @@ fn boot(image: Handle) -> Result<Infallible, Error> {
             rsdp: rsdp.unwrap_or(0),
             initrd: initrd.map_or(ptr::null(), |initrd| (HHDM_OFFSET + initrd.as_ptr() as u64) as *const u8),
             initrd_size: initrd.map_or(0, |initrd| initrd.len() as u64),
+            command_line,
+            command_line_len: command_line_len as u64,
+            boot_partition,
+            runtime_services,
         });
 
         if no_execute {

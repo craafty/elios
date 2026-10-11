@@ -8,6 +8,7 @@ use crate::sys::{self, AT_FDCWD, Error, Result};
 
 const O_RDONLY: usize = 0;
 const O_WRONLY: usize = 1;
+const O_RDWR: usize = 2;
 const O_CREAT: usize = 0o100;
 const O_TRUNC: usize = 0o1000;
 const O_APPEND: usize = 0o2000;
@@ -51,8 +52,77 @@ impl File {
         Self::open_with(path, O_WRONLY | O_CREAT | O_APPEND)
     }
 
+    /// Opens for reading and writing, without creating or emptying it (for
+    /// a disk, say).
+    pub fn open_read_write(path: &str) -> Result<Self> {
+        Self::open_with(path, O_RDWR)
+    }
+
     pub fn fd(&self) -> i32 {
         self.fd
+    }
+
+    /// Reads at a position, without moving the file's own (`pread`).
+    pub fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
+        // SAFETY: the buffer is valid for its length.
+        unsafe {
+            sys::call(
+                sys::PREAD64,
+                [self.fd as usize, buffer.as_mut_ptr() as usize, buffer.len(), offset as usize, 0, 0],
+            )
+        }
+    }
+
+    /// Writes at a position (`pwrite`).
+    pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
+        // SAFETY: the buffer is valid for its length.
+        unsafe {
+            sys::call(sys::PWRITE64, [self.fd as usize, data.as_ptr() as usize, data.len(), offset as usize, 0, 0])
+        }
+    }
+
+    /// Reads exactly `buffer.len()` bytes at `offset`, or fails.
+    pub fn read_exact_at(&self, mut offset: u64, mut buffer: &mut [u8]) -> Result<()> {
+        while !buffer.is_empty() {
+            match self.read_at(offset, buffer)? {
+                0 => return Err(Error(5)),
+                count => {
+                    offset += count as u64;
+                    buffer = &mut buffer[count..];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes all of `data` at `offset`.
+    pub fn write_all_at(&self, mut offset: u64, mut data: &[u8]) -> Result<()> {
+        while !data.is_empty() {
+            match self.write_at(offset, data)? {
+                0 => return Err(Error(28)),
+                count => {
+                    offset += count as u64;
+                    data = &data[count..];
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The size of a disk or partition, in bytes (`BLKGETSIZE64`).
+    pub fn device_size(&self) -> Result<u64> {
+        const BLKGETSIZE64: usize = 0x8008_1272;
+        let mut size = 0u64;
+        // SAFETY: room for the size.
+        unsafe { sys::call(sys::IOCTL, [self.fd as usize, BLKGETSIZE64, &raw mut size as usize, 0, 0, 0]) }?;
+        Ok(size)
+    }
+
+    /// Asks the kernel to reread a disk's partition table (`BLKRRPART`).
+    pub fn reread_partitions(&self) -> Result<()> {
+        const BLKRRPART: usize = 0x125F;
+        // SAFETY: takes no pointers.
+        unsafe { sys::call(sys::IOCTL, [self.fd as usize, BLKRRPART, 0, 0, 0, 0]) }.map(|_| ())
     }
 
     pub fn read(&self, buffer: &mut [u8]) -> Result<usize> {
@@ -369,4 +439,66 @@ pub fn copy_tree(from: &str, to: &str) -> Result<()> {
         set_permissions(to, metadata.permissions())?;
     }
     Ok(())
+}
+
+/// Writes everything waiting to the disks.
+pub fn sync() {
+    // SAFETY: takes no arguments.
+    unsafe { sys::syscall(sys::SYNC, [0; 6]) };
+}
+
+pub const MOUNT_READ_ONLY: usize = 1;
+pub const MOUNT_REMOUNT: usize = 32;
+pub const MOUNT_BIND: usize = 4096;
+
+/// Mounts `source` (a device like `/dev/sda2`, or a name for virtual file
+/// systems) of type `kind` (`ext2`, `vfat`, `proc`...; empty to detect) at
+/// `target`.
+pub fn mount(source: &str, target: &str, kind: &str, flags: usize) -> Result<()> {
+    let (source, target, kind) = (c_path(source), c_path(target), c_path(kind));
+    // SAFETY: the strings are NUL-terminated.
+    unsafe {
+        sys::call(sys::MOUNT, [source.as_ptr() as usize, target.as_ptr() as usize, kind.as_ptr() as usize, flags, 0, 0])
+    }
+    .map(|_| ())
+}
+
+pub fn unmount(target: &str) -> Result<()> {
+    let target = c_path(target);
+    // SAFETY: the path is NUL-terminated.
+    unsafe { sys::call(sys::UMOUNT2, [target.as_ptr() as usize, 0, 0, 0, 0, 0]) }.map(|_| ())
+}
+
+/// Space on the file system holding `path`: (block size, total blocks,
+/// free blocks).
+pub fn space(path: &str) -> Result<(u64, u64, u64)> {
+    let path = c_path(path);
+    let mut fields = [0u64; 15];
+    // SAFETY: room for a `struct statfs`.
+    unsafe { sys::call(sys::STATFS, [path.as_ptr() as usize, fields.as_mut_ptr() as usize, 0, 0, 0, 0]) }?;
+    Ok((fields[1], fields[2], fields[4]))
+}
+
+/// One line of /proc/mounts: (device, mount point, type, options).
+pub struct MountEntry {
+    pub source: String,
+    pub target: String,
+    pub kind: String,
+    pub options: String,
+}
+
+pub fn mounts() -> Vec<MountEntry> {
+    read_to_string("/proc/mounts")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some(MountEntry {
+                source: fields.next()?.into(),
+                target: fields.next()?.into(),
+                kind: fields.next()?.into(),
+                options: fields.next().unwrap_or("").into(),
+            })
+        })
+        .collect()
 }

@@ -17,6 +17,9 @@ pub const ELIOS_PAGE_TABLES: MemoryType = MemoryType(0x8000_0002);
 pub const ELIOS_BOOT_INFO: MemoryType = MemoryType(0x8000_0003);
 pub const ELIOS_INITRD: MemoryType = MemoryType(0x8000_0004);
 
+/// The memory attribute marking what runtime services use.
+const EFI_MEMORY_RUNTIME: u64 = 1 << 63;
+
 /// Allocates `count` contiguous pages and returns their physical address
 /// (which is also their address in the firmware's identity mapping).
 pub fn allocate_pages(ty: MemoryType, count: usize) -> Result<u64, Error> {
@@ -118,10 +121,14 @@ impl MemoryMap {
     pub fn to_regions(&self, out: &mut [MemoryRegion]) -> usize {
         let mut count = 0;
         for descriptor in self.descriptors() {
+            // Device registers the runtime services need are kept apart from
+            // other devices' (the kernel maps them for firmware calls).
+            let runtime_mmio = descriptor.attribute & EFI_MEMORY_RUNTIME != 0
+                && matches!(descriptor.ty, MemoryType::MMIO | MemoryType::MMIO_PORT_SPACE);
             out[count] = MemoryRegion {
                 start: descriptor.physical_start,
                 len: descriptor.number_of_pages * PAGE_SIZE,
-                kind: kind_of(descriptor.ty),
+                kind: if runtime_mmio { MemoryKind::FirmwareRuntimeMmio } else { kind_of(descriptor.ty) },
                 _reserved: 0,
             };
             count += 1;

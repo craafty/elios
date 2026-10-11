@@ -16,6 +16,7 @@ mod editor;
 mod init;
 mod network;
 mod shell;
+mod storage;
 
 use alloc::string::String;
 use alloc::vec::Vec;

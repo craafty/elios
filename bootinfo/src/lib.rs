@@ -7,7 +7,9 @@
 //!
 //! - 64-bit long mode, 4-level paging, interrupts disabled (`RFLAGS.IF = 0`).
 //! - `EFER.NXE` set if the CPU supports it.
-//! - UEFI boot services exited. Firmware runtime services are not used.
+//! - UEFI boot services exited. Runtime services are still available, at
+//!   their physical addresses ([`BootInfo::runtime_services`]); eliboot
+//!   doesn't call `SetVirtualAddressMap`.
 //! - `rsp` pointing at the top of a [`KERNEL_STACK_SIZE`] stack (through the
 //!   direct map), with a zero return address pushed, so the entry point sees
 //!   a normal SysV call frame.
@@ -31,7 +33,10 @@
 pub const MAGIC: u64 = u64::from_le_bytes(*b"eliOSbi\0");
 
 /// Bumped on every incompatible change to the structures in this crate.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
+
+/// The most bytes of kernel command line passed on.
+pub const COMMAND_LINE_SIZE: usize = 256;
 
 /// Where all of physical memory is mapped (the "higher half direct map").
 pub const HHDM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
@@ -63,6 +68,15 @@ pub struct BootInfo {
     /// null with size 0 if there is none.
     pub initrd: *const u8,
     pub initrd_size: u64,
+    /// The kernel command line (from `\EFI\eliOS\cmdline.txt`), UTF-8,
+    /// `command_line_len` bytes of it.
+    pub command_line: [u8; COMMAND_LINE_SIZE],
+    pub command_line_len: u64,
+    /// The GPT unique GUID (in on-disk byte order) of the partition eliboot
+    /// was loaded from, or all zeros if the firmware didn't say.
+    pub boot_partition: [u8; 16],
+    /// Physical address of the UEFI runtime services table, or 0.
+    pub runtime_services: u64,
 }
 
 impl BootInfo {
@@ -82,6 +96,15 @@ impl BootInfo {
         // SAFETY: the bootloader guarantees the pointer and size describe
         // memory tagged `MemoryKind::Initrd`.
         (self.initrd_size > 0).then(|| unsafe { core::slice::from_raw_parts(self.initrd, self.initrd_size as usize) })
+    }
+
+    pub fn command_line(&self) -> &str {
+        let len = (self.command_line_len as usize).min(COMMAND_LINE_SIZE);
+        core::str::from_utf8(&self.command_line[..len]).unwrap_or("")
+    }
+
+    pub fn boot_partition(&self) -> Option<[u8; 16]> {
+        self.boot_partition.iter().any(|&b| b != 0).then_some(self.boot_partition)
     }
 
     pub fn framebuffer(&self) -> Option<&Framebuffer> {
@@ -134,6 +157,9 @@ pub enum MemoryKind {
     Persistent = 13,
     /// The initial RAM disk. Free once the kernel has unpacked it.
     Initrd = 14,
+    /// Device registers the firmware's runtime services use: must be
+    /// mapped (uncached) when calling them.
+    FirmwareRuntimeMmio = 15,
 }
 
 #[repr(C)]

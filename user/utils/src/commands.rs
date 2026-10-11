@@ -25,6 +25,7 @@ pub fn find(name: &str) -> Option<Command> {
         "clear" => clear,
         "cp" => cp,
         "date" => date,
+        "df" => crate::storage::df,
         "deluser" => crate::accounts::deluser,
         "dmesg" => dmesg,
         "echo" => echo,
@@ -44,7 +45,10 @@ pub fn find(name: &str) -> Option<Command> {
         "ln" => ln,
         "login" => crate::accounts::login,
         "ls" => ls,
+        "lsblk" => crate::storage::lsblk,
         "mkdir" => mkdir,
+        "mkfs" => crate::storage::mkfs,
+        "mount" => crate::storage::mount,
         "mv" => mv,
         "nc" => crate::network::nc,
         "ping" => crate::network::ping,
@@ -63,11 +67,16 @@ pub fn find(name: &str) -> Option<Command> {
         "seq" => seq,
         "sleep" => sleep,
         "stat" => stat,
+        "sync" => |_| {
+            fs::sync();
+            0
+        },
         "strace" => strace,
         "tail" => |args| head_or_tail(args, false),
         "tee" => tee,
         "touch" => touch,
         "true" => |_| 0,
+        "umount" => crate::storage::umount,
         "uname" => uname,
         "nproc" => nproc,
         "uptime" => uptime,
@@ -393,15 +402,21 @@ fn destination(source: &str, target: &str) -> String {
     }
 }
 
+/// `cp [-r] SOURCE... DESTINATION`: with `-r` (or `-a`), directories are
+/// copied with everything in them, keeping permissions.
 fn cp(arguments: &[String]) -> i32 {
-    let (_, paths) = split_flags(arguments);
+    let (flags, paths) = split_flags(arguments);
+    let recursive = flags.contains(['r', 'R', 'a']);
     let Some((&target, sources)) = paths.split_last().filter(|(_, sources)| !sources.is_empty()) else {
-        eprintln!("usage: cp SOURCE... DESTINATION");
+        eprintln!("usage: cp [-r] SOURCE... DESTINATION");
         return 2;
     };
     let mut status = 0;
     for &source in sources {
-        if let Err(error) = fs::copy(source, &destination(source, target)) {
+        let destination = destination(source, target);
+        let result =
+            if recursive { fs::copy_tree(source, &destination) } else { fs::copy(source, &destination).map(|_| ()) };
+        if let Err(error) = result {
             status = report("cp", source, error);
         }
     }

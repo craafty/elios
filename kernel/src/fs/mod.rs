@@ -11,10 +11,13 @@
 
 pub mod cpio;
 pub mod devfs;
+pub mod ext2fs;
 pub mod fatfs;
+pub mod mount;
 pub mod pipe;
 pub mod procfs;
 pub mod ramfs;
+pub mod sysfs;
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -22,7 +25,7 @@ use alloc::vec::Vec;
 
 use crate::errno::{Errno, Result};
 use crate::process::credentials::{self, Credentials, Gid, Uid};
-use crate::sync::{Once, SpinLock};
+use crate::sync::SpinLock;
 use crate::task::WaitQueue;
 
 // Readiness bits for `poll` (Linux values).
@@ -45,6 +48,7 @@ pub enum FileKind {
     Directory,
     Symlink,
     CharDevice,
+    BlockDevice,
     Fifo,
     Socket,
 }
@@ -57,6 +61,7 @@ impl FileKind {
             FileKind::Directory => 0o040000,
             FileKind::Symlink => 0o120000,
             FileKind::CharDevice => 0o020000,
+            FileKind::BlockDevice => 0o060000,
             FileKind::Fifo => 0o010000,
             FileKind::Socket => 0o140000,
         }
@@ -68,6 +73,7 @@ impl FileKind {
             FileKind::Fifo => 1,
             FileKind::CharDevice => 2,
             FileKind::Directory => 4,
+            FileKind::BlockDevice => 6,
             FileKind::Regular => 8,
             FileKind::Symlink => 10,
             FileKind::Socket => 12,
@@ -88,13 +94,15 @@ pub struct Metadata {
     pub links: u32,
     /// Seconds since the Unix epoch.
     pub modified: u64,
+    /// For device files, the device's number (Linux's `dev_t` encoding).
+    pub rdev: u64,
 }
 
 impl Metadata {
     /// Metadata for something owned by root that isn't stored anywhere (a
     /// device, a pipe, a /proc file): one link, never modified.
     pub const fn virtual_file(kind: FileKind, inode: u64, permissions: u32) -> Self {
-        Self { kind, inode, size: 0, permissions, uid: 0, gid: 0, links: 1, modified: 0 }
+        Self { kind, inode, size: 0, permissions, uid: 0, gid: 0, links: 1, modified: 0, rdev: 0 }
     }
 }
 
@@ -249,36 +257,7 @@ pub trait Inode: Send + Sync {
     }
 }
 
-static ROOT: Once<Arc<dyn Inode>> = Once::new();
-
-/// Sets up the root file system: an in-memory directory tree, unpacked from
-/// the initrd (if there is one), with devices under /dev.
-pub fn init(initrd: Option<&[u8]>) {
-    let root: Arc<dyn Inode> = ramfs::Directory::new(Attributes::root(0o755));
-    let _ = ROOT.set(root.clone());
-    if let Some(archive) = initrd {
-        match cpio::unpack(archive) {
-            Ok(count) => info!("fs: unpacked {count} files from the initrd"),
-            Err(error) => warn!("fs: initrd is damaged: {error}"),
-        }
-    }
-    let dev = match root.lookup("dev") {
-        Ok(dev) => dev,
-        Err(_) => root.create("dev", FileKind::Directory, Attributes::root(0o755)).expect("can't create /dev"),
-    };
-    devfs::populate(&dev);
-    let _ = root.link("proc", procfs::create());
-    // /tmp is for everyone, but people can only delete their own files.
-    for (directory, permissions) in [("tmp", 0o1777), ("home", 0o755), ("root", 0o700), ("run", 0o755)] {
-        if root.lookup(directory).is_err() {
-            let _ = root.create(directory, FileKind::Directory, Attributes::root(permissions));
-        }
-    }
-}
-
-pub fn root() -> Arc<dyn Inode> {
-    ROOT.get().expect("file system not initialized").clone()
-}
+pub use self::mount::root;
 
 /// Makes `path` absolute (relative to `cwd`) and removes `.`, `..` and
 /// repeated slashes. Symbolic links are not involved.
@@ -336,7 +315,7 @@ fn lookup_depth(
         if !credentials.is_root() {
             check_access(credentials, &inode.metadata(), MAY_EXEC)?;
         }
-        let next = inode.lookup(name)?;
+        let next = mount::cross(inode.lookup(name)?);
         let last = index + 1 == components.len();
         if next.metadata().kind == FileKind::Symlink && (follow || !last) {
             if depth >= MAX_SYMLINK_DEPTH {

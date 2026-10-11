@@ -21,7 +21,7 @@ use crate::{net, task, time};
 
 type Generator = Box<dyn Fn() -> String + Send + Sync>;
 /// A directory's entries.
-type Listing = Vec<(String, Arc<dyn Inode>)>;
+pub(super) type Listing = Vec<(String, Arc<dyn Inode>)>;
 
 /// A file whose contents are produced on demand. Every lookup makes a new
 /// one, so each open file gets its own snapshot.
@@ -31,7 +31,7 @@ struct Generated {
     snapshot: SpinLock<Option<String>>,
 }
 
-fn generated(generate: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn Inode> {
+pub(super) fn generated(generate: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn Inode> {
     Arc::new(Generated {
         inode: ramfs::next_inode_number(),
         generate: Box::new(generate),
@@ -66,7 +66,7 @@ struct Link {
     target: Generator,
 }
 
-fn link(target: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn Inode> {
+pub(super) fn link(target: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn Inode> {
     Arc::new(Link { inode: ramfs::next_inode_number(), target: Box::new(target) })
 }
 
@@ -89,7 +89,7 @@ struct Directory {
     owner: (Uid, Gid),
 }
 
-fn directory(list: impl Fn() -> Listing + Send + Sync + 'static) -> Arc<dyn Inode> {
+pub(super) fn directory(list: impl Fn() -> Listing + Send + Sync + 'static) -> Arc<dyn Inode> {
     Arc::new(Directory { inode: ramfs::next_inode_number(), list: Box::new(list), owner: (0, 0) })
 }
 
@@ -124,8 +124,9 @@ pub fn create() -> Arc<dyn Inode> {
             ("stat".into(), generated(system_stat)),
             ("cpuinfo".into(), generated(cpuinfo)),
             ("loadavg".into(), generated(|| format!("0.00 0.00 0.00 1/{} {}\n", process::count(), process::count()))),
-            ("filesystems".into(), generated(|| "nodev\tramfs\nnodev\tproc\n".into())),
+            ("filesystems".into(), generated(filesystems)),
             ("mounts".into(), generated(mounts)),
+            ("partitions".into(), generated(partitions)),
             ("net".into(), net_directory()),
         ];
         for info in process::list() {
@@ -358,10 +359,29 @@ fn system_stat() -> String {
     text
 }
 
+/// The file system types `mount` accepts. Those marked `nodev` need no
+/// device; `mount` tries the others in order when no type is given.
+fn filesystems() -> String {
+    ["nodev\tsysfs", "nodev\ttmpfs", "nodev\tramfs", "nodev\tproc", "nodev\tdevtmpfs", "\text2", "\tvfat"]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
 fn mounts() -> String {
-    let mut text = String::from("ramfs / ramfs rw 0 0\nproc /proc proc rw 0 0\n");
-    if super::lookup("/", "/disk", false).is_ok() {
-        text.push_str("/dev/sda1 /disk vfat rw 0 0\n");
+    super::mount::table()
+}
+
+/// /proc/partitions: every disk and partition, with its size in KiB.
+fn partitions() -> String {
+    use crate::drivers::block::{self, Partition};
+    let mut text = String::from("major minor  #blocks  name\n\n");
+    for disk in block::disks() {
+        let whole = Partition::whole(&disk);
+        for partition in core::iter::once(whole).chain(block::partitions(&disk)) {
+            let (major, minor) = block::device_numbers(&partition);
+            text.push_str(&format!("{major:>4} {minor:>7} {:>10} {}\n", partition.sectors / 2, partition.name()));
+        }
     }
     text
 }

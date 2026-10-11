@@ -22,6 +22,7 @@ name = "elikernel"
 version = "0.1.0"
 dependencies = [
  "bootinfo",
+ "ext2",
  "fat",
 ]
 
@@ -30,7 +31,13 @@ name = "eliutils"
 version = "0.1.0"
 dependencies = [
  "eli",
+ "ext2",
+ "fat",
 ]
+
+[[package]]
+name = "ext2"
+version = "0.1.0"
 
 [[package]]
 name = "fat"

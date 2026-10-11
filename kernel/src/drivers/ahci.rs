@@ -8,13 +8,12 @@
 //! driver uses one command slot per port and waits for completion by
 //! polling.
 
-use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr;
 
-use super::block::Disk;
+use super::block::{self, Disk};
 use super::pci;
 use crate::memory::{self, CacheType, PAGE_SIZE, frames, phys_to_virt};
 use crate::sync::Mutex;
@@ -77,6 +76,7 @@ struct Port {
 
 pub struct AhciDisk {
     name: String,
+    model: String,
     sectors: u64,
     port: Mutex<Port>,
 }
@@ -110,7 +110,7 @@ pub fn probe(devices: &[pci::Device]) -> Vec<Arc<AhciDisk>> {
         let Some(base) = device.memory_bar(5) else { continue };
         device.enable_bus_mastering();
         let registers = memory::map_device(base, 0x1100, CacheType::Uncached) as usize;
-        match init_controller(registers, disks.len()) {
+        match init_controller(registers) {
             Ok(found) => disks.extend(found),
             Err(error) => warn!("ahci: controller at {base:#x}: {error}"),
         }
@@ -118,7 +118,7 @@ pub fn probe(devices: &[pci::Device]) -> Vec<Arc<AhciDisk>> {
     disks
 }
 
-fn init_controller(registers: usize, first_index: usize) -> Result<Vec<Arc<AhciDisk>>, &'static str> {
+fn init_controller(registers: usize) -> Result<Vec<Arc<AhciDisk>>, &'static str> {
     // Take the controller over from the firmware, if it supports handing off.
     if read_register(registers + CAPABILITIES_2) & HANDOFF_SUPPORTED != 0 {
         let handoff = registers + HANDOFF;
@@ -138,13 +138,10 @@ fn init_controller(registers: usize, first_index: usize) -> Result<Vec<Arc<AhciD
             continue;
         }
         match init_port(port, addressing_64) {
-            Ok(port) => {
-                let name = format!("sata{}", first_index + disks.len());
-                match AhciDisk::identify(name, port) {
-                    Ok(disk) => disks.push(Arc::new(disk)),
-                    Err(error) => warn!("ahci: port {index}: {error}"),
-                }
-            }
+            Ok(port) => match AhciDisk::identify(block::next_sd_name(), port) {
+                Ok(disk) => disks.push(Arc::new(disk)),
+                Err(error) => warn!("ahci: port {index}: {error}"),
+            },
             Err(error) => warn!("ahci: port {index}: {error}"),
         }
     }
@@ -263,13 +260,17 @@ impl AhciDisk {
         let model: Vec<u8> = (27..47).flat_map(|index| word(index).to_be_bytes()).collect();
         let model = String::from(String::from_utf8_lossy(&model).trim());
         info!("ahci: {name}: {model}, {} MiB", sectors / 2048);
-        Ok(Self { name, sectors, port: Mutex::new(port) })
+        Ok(Self { name, model, sectors, port: Mutex::new(port) })
     }
 }
 
 impl Disk for AhciDisk {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn model(&self) -> &str {
+        &self.model
     }
 
     fn sectors(&self) -> u64 {

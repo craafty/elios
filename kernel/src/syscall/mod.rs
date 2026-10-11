@@ -9,6 +9,7 @@
 //! from 0x1000 up, far from Linux's.
 
 mod files;
+mod mounts;
 mod net;
 mod poll;
 mod processes;
@@ -124,6 +125,9 @@ fn name(number: u64) -> Option<&'static str> {
         138 => "fstatfs",
         157 => "prctl",
         158 => "arch_prctl",
+        162 => "sync",
+        165 => "mount",
+        166 => "umount2",
         170 => "sethostname",
         186 => "gettid",
         201 => "time",
@@ -274,8 +278,8 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         62 => processes::kill(a[0], a[1]),
         63 => system::uname(a[0]),
         72 => files::fcntl(a[0], a[1], a[2]),
-        // fsync, fdatasync: everything is in memory already.
-        74 | 75 => Ok(0),
+        // fsync, fdatasync: everything is written back.
+        74 | 75 => mounts::sync(),
         76 => files::truncate(a[0], a[1]),
         77 => files::ftruncate(a[0], a[1]),
         79 => files::getcwd(a[0], a[1]),
@@ -321,8 +325,9 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         138 => files::fstatfs(a[0], a[1]),
         157 => processes::prctl(a[0], a[1]),
         158 => processes::arch_prctl(a[0], a[1]),
-        // sync
-        162 => Ok(0),
+        162 | 306 => mounts::sync(),
+        165 => mounts::mount(a[0], a[1], a[2], a[3], a[4]),
+        166 => mounts::umount(a[0], a[1]),
         169 => system::reboot(a[0], a[2]),
         170 => system::sethostname(a[0], a[1]),
         186 => processes::gettid(),

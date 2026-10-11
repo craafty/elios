@@ -20,6 +20,7 @@ pub enum Errno {
     ENOMEM = 12,
     EACCES = 13,
     EFAULT = 14,
+    ENOTBLK = 15,
     EBUSY = 16,
     EEXIST = 17,
     EXDEV = 18,

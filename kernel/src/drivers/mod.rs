@@ -8,13 +8,12 @@ pub mod pci;
 pub mod usb;
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use self::block::Disk;
 
-/// Finds devices and starts drivers for the ones eliOS supports. Returns the
-/// disks found.
-pub fn init() -> Vec<Arc<dyn Disk>> {
+/// Finds devices and starts drivers for the ones eliOS supports. Disks
+/// found are registered (see [`block::register`]).
+pub fn init() {
     let devices = pci::scan();
     for device in &devices {
         debug!(
@@ -30,10 +29,12 @@ pub fn init() -> Vec<Arc<dyn Disk>> {
         );
     }
     info!("pci: {} devices", devices.len());
-    let mut disks: Vec<Arc<dyn Disk>> = Vec::new();
-    disks.extend(ahci::probe(&devices).into_iter().map(|disk| disk as Arc<dyn Disk>));
-    disks.extend(nvme::probe(&devices).into_iter().map(|disk| disk as Arc<dyn Disk>));
+    for disk in ahci::probe(&devices) {
+        block::register(disk as Arc<dyn Disk>);
+    }
+    for disk in nvme::probe(&devices) {
+        block::register(disk as Arc<dyn Disk>);
+    }
     e1000::probe(&devices);
     usb::probe(&devices);
-    disks
 }

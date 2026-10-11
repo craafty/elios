@@ -5,6 +5,10 @@ edition.workspace = true
 
 [dependencies]
 eli = { path = "../eli" }
+# eliOS's own file system code, shared with the kernel (for mkfs and the
+# installer).
+ext2 = { path = "../../ext2" }
+fat = { path = "../../fat" }
 
 # The commands that need root's privileges when ordinary users run them, as
 # a separate small program installed setuid root.

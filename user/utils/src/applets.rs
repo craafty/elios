@@ -60,6 +60,12 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("chmod", "change permissions"),
     ("chown", "change owner (and group)"),
     ("chgrp", "change group"),
+    ("lsblk", "list disks and partitions"),
+    ("mount", "attach a disk's file system to a directory"),
+    ("umount", "detach a mounted file system"),
+    ("df", "show free space on disks"),
+    ("mkfs", "make an empty file system (ext2 or FAT)"),
+    ("sync", "write everything waiting to the disks"),
 ];
 
 /// The commands of eliauth, the separate setuid-root program: links to

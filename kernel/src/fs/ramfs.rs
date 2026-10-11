@@ -47,6 +47,7 @@ impl Ownership {
             gid: self.gid.load(Ordering::Relaxed),
             links,
             modified: self.modified.load(Ordering::Relaxed),
+            rdev: 0,
         }
     }
 

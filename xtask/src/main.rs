@@ -32,9 +32,13 @@ options:
   --no-kvm     emulate the CPU even if hardware virtualization is available
   --cpus N     give the machine N CPUs (default 4)
   --forward H:G  forward TCP port H on this machine to port G in eliOS
+  --second-disk  attach target/second-disk.img (an empty 2 GiB NVMe disk,
+               kept between runs) to try partitioning and installing
 ";
 
 const DEFAULT_CPUS: usize = 4;
+/// The size of the empty disk `--second-disk` attaches.
+const SECOND_DISK_BYTES: u64 = 2 << 30;
 
 const BOOTLOADER_TARGET: &str = "x86_64-unknown-uefi";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
@@ -73,6 +77,7 @@ struct Options {
     cpus: Option<usize>,
     /// TCP ports to forward from the host into eliOS: (host, guest).
     forwards: Vec<(u16, u16)>,
+    second_disk: bool,
     qemu_args: Vec<String>,
 }
 
@@ -131,6 +136,7 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options, Stri
                 });
                 options.forwards.push(forward.ok_or("--forward needs HOST_PORT:GUEST_PORT")?);
             }
+            "--second-disk" => options.second_disk = true,
             "--cpus" => {
                 let count = args.next().and_then(|count| count.parse().ok()).filter(|&count| (1..=64).contains(&count));
                 options.cpus = Some(count.ok_or("--cpus needs a number from 1 to 64")?);
@@ -559,6 +565,17 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
     let kvm = fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok();
     if kvm && !options.no_kvm {
         qemu.args(["-enable-kvm", "-cpu", "host"]);
+    }
+    if options.second_disk {
+        let path = workspace_root().join("target/second-disk.img");
+        if !path.exists() {
+            let file = fs::File::create(&path).map_err(|e| format!("creating {}: {e}", path.display()))?;
+            file.set_len(SECOND_DISK_BYTES).map_err(|e| format!("sizing {}: {e}", path.display()))?;
+        }
+        // On NVMe, so both disk drivers get used.
+        qemu.arg("-drive")
+            .arg(format!("if=none,id=second,format=raw,file={}", path.display()))
+            .args(["-device", "nvme,drive=second,serial=eli-second"]);
     }
     if options.gdb {
         qemu.args(["-s", "-S"]);

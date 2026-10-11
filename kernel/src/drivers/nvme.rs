@@ -71,6 +71,7 @@ struct Controller {
 
 pub struct NvmeDisk {
     name: String,
+    model: String,
     sectors: u64,
     controller: Mutex<Controller>,
 }
@@ -115,7 +116,8 @@ pub fn probe(devices: &[pci::Device]) -> Vec<Arc<NvmeDisk>> {
         let Some(base) = device.memory_bar(0) else { continue };
         device.enable_bus_mastering();
         let registers = memory::map_device(base, 0x2000, CacheType::Uncached) as usize;
-        let name = format!("nvme{}", disks.len());
+        // Namespace 1 of controller N, as Linux names it.
+        let name = format!("nvme{}n1", disks.len());
         match NvmeDisk::start(name, registers) {
             Ok(disk) => disks.push(Arc::new(disk)),
             Err(error) => warn!("nvme: controller at {base:#x}: {error}"),
@@ -242,7 +244,7 @@ impl NvmeDisk {
         controller.admin.run(create, timeout_ns)?;
 
         info!("nvme: {name}: {model}, {} MiB", sectors / 2048);
-        Ok(Self { name, sectors, controller: Mutex::new(controller) })
+        Ok(Self { name, model, sectors, controller: Mutex::new(controller) })
     }
 }
 
@@ -276,6 +278,10 @@ impl Controller {
 impl Disk for NvmeDisk {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn model(&self) -> &str {
+        &self.model
     }
 
     fn sectors(&self) -> u64 {

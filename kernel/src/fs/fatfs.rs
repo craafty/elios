@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use super::mount::{self, MountRequest};
 use super::{Attributes, FileKind, Inode, Metadata, ramfs};
 use crate::drivers::block::Partition;
 use crate::errno::{Errno, Result};
@@ -50,14 +51,40 @@ fn error(error: fat::Error) -> Errno {
     }
 }
 
-/// Mounts the FAT32 file system on a partition, returning its root.
-pub fn mount(partition: Partition) -> Result<(Arc<dyn Inode>, u64, u64)> {
+/// Mounts the FAT32 file system on a partition: what to put in the mount
+/// table, and the space (total, free) in bytes.
+pub fn mount(partition: Partition, source: String) -> Result<(MountRequest, u64, u64)> {
+    let disk = String::from(partition.disk.name());
     let mut fs = fat::FileSystem::mount(partition, time::unix_time).map_err(error)?;
     let total = fs.total_bytes();
     let free = fs.free_bytes().map_err(error)?;
     let root = fs.root();
     let volume = Arc::new(Volume { fs: Mutex::new(fs), nodes: SpinLock::new(BTreeMap::new()) });
-    Ok((volume.node(root), total, free))
+    let request =
+        MountRequest { root: volume.node(root), source, kind: "vfat", disk: Some(disk), volume: Some(volume) };
+    Ok((request, total, free))
+}
+
+impl mount::Volume for Volume {
+    /// Every change is written as it's made.
+    fn sync(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn unmount(&self) -> Result<()> {
+        // The mount table holds the root's node; anything else alive is a
+        // file or directory still in use.
+        let live = self.nodes.lock().values().filter(|node| node.strong_count() > 0).count();
+        if live > 1 { Err(Errno::EBUSY) } else { Ok(()) }
+    }
+
+    fn read_only(&self) -> bool {
+        false
+    }
+
+    fn set_read_only(&self, read_only: bool) -> Result<()> {
+        if read_only { Err(Errno::EINVAL) } else { Ok(()) }
+    }
 }
 
 impl Volume {
@@ -108,6 +135,7 @@ impl Inode for Node {
             gid: 0,
             links: 1,
             modified: entry.modified_unix(),
+            rdev: 0,
         }
     }
 

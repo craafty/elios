@@ -119,10 +119,12 @@ fn map_direct(table: &mut PageTable, boot_info: &BootInfo) {
 
     // Regions are sorted; merge touching ones so large pages can span them.
     let mut run = (0, 1 << 20);
-    let ram = boot_info
-        .memory_regions()
-        .iter()
-        .filter(|r| !matches!(r.kind, MemoryKind::Mmio | MemoryKind::Reserved | MemoryKind::Defective));
+    let ram = boot_info.memory_regions().iter().filter(|r| {
+        !matches!(
+            r.kind,
+            MemoryKind::Mmio | MemoryKind::FirmwareRuntimeMmio | MemoryKind::Reserved | MemoryKind::Defective
+        )
+    });
     for region in ram {
         if region.start <= run.1 {
             run.1 = run.1.max(region.end());

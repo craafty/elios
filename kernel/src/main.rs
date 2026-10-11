@@ -13,6 +13,7 @@ mod test;
 
 mod acpi;
 mod arch;
+mod cmdline;
 mod collections;
 mod console;
 mod drivers;
@@ -144,13 +145,18 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
         Err(error) => warn!("keyboard: {error}"),
     }
 
+    cmdline::init(boot_info.command_line());
+    net::init();
+    drivers::init();
     let initrd = boot_info.initrd();
-    fs::init(initrd);
+    let disk_root = mount_root(initrd);
     if let Some(initrd) = initrd {
-        // Unpacked; the original isn't needed any more.
+        // Unpacked (or not needed); the original can go.
         let start = initrd.as_ptr() as u64 - boot_info.hhdm_offset;
         memory::frames::reclaim(start, start + initrd.len() as u64);
     }
+    fs::mount::mount_system(disk_root);
+    mount_boot_partition(boot_info.boot_partition());
     if let Ok(name) = fs::lookup("/", "/etc/hostname", true) {
         let mut buffer = [0; 64];
         let len = name.read_at(0, &mut buffer).unwrap_or(0);
@@ -158,8 +164,6 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
             *syscall::HOSTNAME.lock() = alloc::string::String::from(text.trim());
         }
     }
-    net::init();
-    mount_disk(drivers::init());
     net::wait_until_configured(3000);
     if let Err(error) = serial::enable_input() {
         warn!("serial: no input: {error}");
@@ -180,25 +184,70 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
     }
 }
 
-/// Mounts the first FAT32 partition found (the boot disk's EFI partition,
-/// normally) at /disk.
-fn mount_disk(disks: alloc::vec::Vec<alloc::sync::Arc<dyn drivers::block::Disk>>) {
-    use drivers::block::{PartitionKind, partitions};
-    let candidates = disks.iter().flat_map(partitions).filter(|p| p.kind != PartitionKind::Other);
-    for partition in candidates {
-        let name = alloc::string::String::from(partition.disk.name());
-        match fs::fatfs::mount(partition) {
-            Ok((root, total, free)) => {
-                if fs::root().link("disk", root).is_ok() {
-                    info!("disk: {name} mounted at /disk ({} free of {})", Size(free), Size(total));
+/// How long to wait for the root partition's disk to appear (USB disks are
+/// found a little after boot).
+const ROOT_WAIT_MS: u64 = 10_000;
+
+/// Mounts the root file system: the ext2 partition named by
+/// `root=PARTUUID=...` on the command line (an installed system), or else
+/// the initrd unpacked into memory (the live system). Returns whether the
+/// root is on a disk.
+fn mount_root(initrd: Option<&[u8]>) -> bool {
+    use drivers::block;
+    if let Some(guid) = cmdline::get("root").and_then(|root| root.strip_prefix("PARTUUID=")) {
+        match block::parse_guid(guid) {
+            Some(guid) => {
+                let deadline = time::uptime_nanos() + ROOT_WAIT_MS * 1_000_000;
+                let mut partition = block::find_partition(&guid);
+                while partition.is_none() && time::uptime_nanos() < deadline {
+                    task::sleep_ms(100);
+                    partition = block::find_partition(&guid);
                 }
-                return;
+                match partition {
+                    Some(partition) => {
+                        let source = alloc::format!("/dev/{}", partition.name());
+                        match fs::ext2fs::mount(partition, source.clone(), false) {
+                            Ok(request) => {
+                                fs::mount::init_disk_root(request);
+                                info!("fs: root is {source} (ext2)");
+                                return true;
+                            }
+                            Err(error) => error!("fs: can't mount the root {source}: {error:?}"),
+                        }
+                    }
+                    None => error!("fs: the root partition {guid:x?} wasn't found"),
+                }
             }
-            Err(error) => warn!("disk: {name}: can't mount: {error:?}"),
+            None => error!("fs: can't understand root={guid}"),
         }
+        warn!("fs: starting the live system from the initrd instead");
     }
-    if !disks.is_empty() {
-        warn!("disk: no FAT32 partition to mount");
+    fs::mount::init_memory_root(initrd);
+    false
+}
+
+/// Mounts the partition eliboot was loaded from at /disk: there, the boot
+/// files can be updated, and on the live system, files persist. Without a
+/// boot partition GUID (an older eliboot), the first FAT partition is used.
+fn mount_boot_partition(boot_partition: Option<[u8; 16]>) {
+    use drivers::block::{self, PartitionKind};
+    let partition = match boot_partition {
+        Some(guid) => block::find_partition(&guid),
+        None => block::disks().iter().flat_map(block::partitions).find(|p| p.kind != PartitionKind::Other),
+    };
+    let Some(partition) = partition else {
+        if !block::disks().is_empty() {
+            warn!("disk: the boot partition wasn't found (booted from a disk eliOS can't read?)");
+        }
+        return;
+    };
+    let source = alloc::format!("/dev/{}", partition.name());
+    match fs::fatfs::mount(partition, source.clone()) {
+        Ok((request, total, free)) => match fs::mount::mount("/disk", request) {
+            Ok(()) => info!("disk: {source} mounted at /disk ({} free of {})", Size(free), Size(total)),
+            Err(error) => warn!("disk: can't mount {source}: {error:?}"),
+        },
+        Err(error) => warn!("disk: {source}: can't mount: {error:?}"),
     }
 }
 
