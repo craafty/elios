@@ -13,7 +13,9 @@ mod applets;
 mod commands;
 mod edit;
 mod editor;
+mod gpt;
 mod init;
+mod installer;
 mod network;
 mod shell;
 mod storage;
@@ -46,6 +48,7 @@ fn run(name: &str, arguments: &[String]) -> i32 {
         "sh" => shell::main(arguments),
         "init" => init::main(),
         "edit" => edit::main(arguments),
+        "installer" => installer::main(arguments),
         _ => match commands::find(name) {
             Some(command) => command(arguments),
             None => {

@@ -87,6 +87,19 @@ cargo xtask image --release
 sudo dd if=target/eliOS.img of=/dev/sdX bs=4M conv=fsync   # sdX = the stick
 ```
 
+### Installing it
+
+`installer` (as root, which the live system is) copies eliOS onto another
+disk: erasing it, or alongside another system in the disk's free space
+(the disk needs an EFI System Partition, which any PC with a UEFI-installed
+OS has). It asks for your account; the installed system boots to a login
+prompt, and your account can use `sudo`. Try it in QEMU:
+
+```sh
+cargo xtask run --second-disk     # then, inside eliOS: installer
+cargo xtask run --installed       # boot the installed disk on its own
+```
+
 Real machines vary far more than QEMU. Keyboards work over PS/2 or USB
 (plugged into the computer itself; not yet through a hub). It reads and writes
 SATA (AHCI) and NVMe disks; without a supported disk it still runs from
@@ -223,5 +236,7 @@ glyph and rebuild.
 - [x] **Users:** accounts, permissions, setuid programs, `login`, `su`,
       `sudo`, `passwd`, `adduser`, with Linux's file formats and password
       hashes
+- [x] **Installer:** partitions a disk (or uses its free space), ext2 root,
+      a UEFI boot entry through the firmware's runtime services
 - [ ] **Next:** a graphical desktop, USB hubs, mice and storage, Unix
       domain sockets, and TLS for HTTPS

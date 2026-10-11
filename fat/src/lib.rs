@@ -148,8 +148,15 @@ pub struct FileSystem<D> {
     /// Number of data clusters; valid cluster numbers are 2..clusters + 2.
     clusters: u32,
     root_cluster: u32,
-    /// The last FAT sector read (from the first FAT).
-    fat_cache: Option<(u64, [u8; SECTOR_SIZE])>,
+    /// The last FAT sector used (from the first FAT), and whether it has
+    /// changes not yet written to every copy of the FAT. Changes are
+    /// written back at the end of each operation, so a file growing by
+    /// thousands of clusters costs a few writes, not thousands.
+    fat_cache: Option<(u64, [u8; SECTOR_SIZE], bool)>,
+    /// The cluster chain of the file read or written last, by its first
+    /// cluster: reading a big file in pieces would otherwise follow the
+    /// whole chain through the FAT for every piece.
+    chain_cache: Option<(u32, Vec<u32>)>,
     /// Where to start looking for free clusters.
     next_free: u32,
     /// Free clusters, once counted (then kept up to date).
@@ -192,7 +199,15 @@ impl<D: BlockDevice> FileSystem<D> {
         let data_start = reserved + fat_sectors * u64::from(fat_count);
         let clusters = (total.saturating_sub(data_start) / u64::from(sectors_per_cluster)) as u32;
         let root_cluster = u32_at(&boot, 44);
-        if clusters < 65_525 || !(2..clusters + 2).contains(&root_cluster) {
+        // The specification says a FAT32 volume has at least 65,525
+        // clusters, but some tools make smaller ones (Linux's mkfs.vfat, for
+        // small EFI partitions). Like Linux, the layout of the boot sector
+        // decides; the FAT just has to be big enough for every cluster.
+        if clusters == 0
+            || fat_sectors * (SECTOR_SIZE as u64 / 4) < u64::from(clusters) + 2
+            || total > device.sectors()
+            || !(2..clusters + 2).contains(&root_cluster)
+        {
             return Err(Error::Corrupt);
         }
         Ok(Self {
@@ -205,6 +220,7 @@ impl<D: BlockDevice> FileSystem<D> {
             clusters,
             root_cluster,
             fat_cache: None,
+            chain_cache: None,
             next_free: 2,
             free_clusters: None,
             clock,
@@ -332,35 +348,56 @@ impl<D: BlockDevice> FileSystem<D> {
         }
     }
 
-    fn fat_entry(&mut self, cluster: u32) -> Result<u32> {
+    /// Makes the FAT sector holding `cluster`'s entry the cached one.
+    /// Returns the entry's offset in it.
+    fn load_fat_sector(&mut self, cluster: u32) -> Result<usize> {
         let offset = u64::from(cluster) * 4;
         let sector = self.fat_start + offset / SECTOR_SIZE as u64;
-        let within = (offset % SECTOR_SIZE as u64) as usize;
-        if self.fat_cache.as_ref().is_none_or(|(cached, _)| *cached != sector) {
+        if self.fat_cache.as_ref().is_none_or(|(cached, _, _)| *cached != sector) {
+            self.flush_fat()?;
             let mut data = [0; SECTOR_SIZE];
             self.device.read(sector, &mut data)?;
-            self.fat_cache = Some((sector, data));
+            self.fat_cache = Some((sector, data, false));
         }
-        let (_, data) = self.fat_cache.as_ref().unwrap();
+        Ok((offset % SECTOR_SIZE as u64) as usize)
+    }
+
+    fn fat_entry(&mut self, cluster: u32) -> Result<u32> {
+        let within = self.load_fat_sector(cluster)?;
+        let (_, data, _) = self.fat_cache.as_ref().unwrap();
         Ok(u32_at(data, within) & CLUSTER_MASK)
     }
 
     fn set_fat_entry(&mut self, cluster: u32, value: u32) -> Result<()> {
-        let offset = u64::from(cluster) * 4;
-        let within = (offset % SECTOR_SIZE as u64) as usize;
-        for copy in 0..u64::from(self.fat_count) {
-            let sector = self.fat_start + copy * self.fat_sectors + offset / SECTOR_SIZE as u64;
-            let mut data = [0; SECTOR_SIZE];
-            self.device.read(sector, &mut data)?;
-            // Keep the top four bits, which are reserved.
-            let old = u32_at(&data, within);
-            data[within..within + 4].copy_from_slice(&((old & !CLUSTER_MASK) | (value & CLUSTER_MASK)).to_le_bytes());
-            self.device.write(sector, &data)?;
-            if copy == 0 {
-                self.fat_cache = Some((sector, data));
+        let within = self.load_fat_sector(cluster)?;
+        let (_, data, dirty) = self.fat_cache.as_mut().unwrap();
+        // Keep the top four bits, which are reserved.
+        let old = u32_at(data, within);
+        data[within..within + 4].copy_from_slice(&((old & !CLUSTER_MASK) | (value & CLUSTER_MASK)).to_le_bytes());
+        *dirty = true;
+        Ok(())
+    }
+
+    /// Writes the cached FAT sector to every copy of the FAT, if changed.
+    fn flush_fat(&mut self) -> Result<()> {
+        if let Some((sector, data, dirty)) = &mut self.fat_cache
+            && *dirty
+        {
+            for copy in 0..u64::from(self.fat_count) {
+                self.device.write(*sector + copy * self.fat_sectors, data)?;
             }
+            *dirty = false;
         }
         Ok(())
+    }
+
+    /// Runs a change, then writes the FAT back, whether it worked or not.
+    fn change<T>(&mut self, operation: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let result = operation(self);
+        let flushed = self.flush_fat();
+        let value = result?;
+        flushed?;
+        Ok(value)
     }
 
     /// The clusters of a chain, in order.
@@ -399,7 +436,16 @@ impl<D: BlockDevice> FileSystem<D> {
         self.device.write(sector, &zeros)
     }
 
+    /// A file's chain, from the cache if it's the one used last.
+    fn take_chain(&mut self, first: u32) -> Result<Vec<u32>> {
+        match self.chain_cache.take() {
+            Some((cached, chain)) if cached == first && first != 0 => Ok(chain),
+            _ => self.chain(first),
+        }
+    }
+
     fn free_chain(&mut self, first: u32) -> Result<()> {
+        self.chain_cache = None;
         for cluster in self.chain(first)? {
             self.set_fat_entry(cluster, 0)?;
             if let Some(free) = &mut self.free_clusters {
@@ -490,21 +536,25 @@ impl<D: BlockDevice> FileSystem<D> {
             return Ok(0);
         }
         let count = (buffer.len() as u64).min(size - offset) as usize;
-        let chain = self.chain(file.cluster)?;
+        let chain = self.take_chain(file.cluster)?;
         if chain.len() * self.cluster_bytes() < file.size as usize {
             return Err(Error::Corrupt);
         }
         self.transfer(&chain, offset as usize, &mut buffer[..count], false)?;
+        self.chain_cache = Some((file.cluster, chain));
         Ok(count)
     }
 
     /// Makes sure a file's chain has room for `bytes`, allocating clusters
-    /// (zeroed, so gaps read as zeros).
-    fn grow(&mut self, file: &mut Entry, chain: &mut Vec<u32>, bytes: usize) -> Result<()> {
+    /// (zeroed with `zero`, so gaps read as zeros; a write that's about to
+    /// fill them needn't).
+    fn grow(&mut self, file: &mut Entry, chain: &mut Vec<u32>, bytes: usize, zero: bool) -> Result<()> {
         let needed = bytes.div_ceil(self.cluster_bytes());
         while chain.len() < needed {
             let cluster = self.allocate()?;
-            self.zero_cluster(cluster)?;
+            if zero {
+                self.zero_cluster(cluster)?;
+            }
             match chain.last() {
                 Some(&last) => self.set_fat_entry(last, cluster)?,
                 None => file.cluster = cluster,
@@ -522,24 +572,37 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         let end =
             offset.checked_add(data.len() as u64).filter(|&end| end <= u64::from(u32::MAX)).ok_or(Error::NoSpace)?;
-        let mut chain = self.chain(file.cluster)?;
-        self.grow(file, &mut chain, end as usize)?;
-        let mut copy = data.to_vec();
-        self.transfer(&chain, offset as usize, &mut copy, true)?;
-        file.size = file.size.max(end as u32);
-        self.touch(file)?;
-        Ok(data.len())
+        self.change(|fs| {
+            let mut chain = fs.take_chain(file.cluster)?;
+            fs.grow(file, &mut chain, end as usize, false)?;
+            // A write past the end leaves a gap, which must read as zeros.
+            if offset > u64::from(file.size) {
+                let mut zeros = vec![0; (offset - u64::from(file.size)) as usize];
+                fs.transfer(&chain, file.size as usize, &mut zeros, true)?;
+            }
+            let mut copy = data.to_vec();
+            fs.transfer(&chain, offset as usize, &mut copy, true)?;
+            fs.chain_cache = Some((file.cluster, chain));
+            file.size = file.size.max(end as u32);
+            fs.touch(file)?;
+            Ok(data.len())
+        })
     }
 
     /// Changes a file's length, freeing or adding (zeroed) clusters.
     pub fn truncate(&mut self, file: &mut Entry, len: u64) -> Result<()> {
+        self.change(|fs| fs.truncate_unflushed(file, len))
+    }
+
+    fn truncate_unflushed(&mut self, file: &mut Entry, len: u64) -> Result<()> {
         if file.directory {
             return Err(Error::IsDirectory);
         }
         let len = u32::try_from(len).map_err(|_| Error::NoSpace)?;
+        self.chain_cache = None;
         let mut chain = self.chain(file.cluster)?;
         if len > file.size {
-            self.grow(file, &mut chain, len as usize)?;
+            self.grow(file, &mut chain, len as usize, true)?;
             // Zero the old tail of the last cluster too.
             let tail =
                 (file.size as usize).next_multiple_of(self.cluster_bytes()).min(len as usize) - file.size as usize;
@@ -580,6 +643,10 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Creates a file or directory.
     pub fn create(&mut self, parent: &Entry, name: &str, directory: bool) -> Result<Entry> {
+        self.change(|fs| fs.create_unflushed(parent, name, directory))
+    }
+
+    fn create_unflushed(&mut self, parent: &Entry, name: &str, directory: bool) -> Result<Entry> {
         validate_name(name)?;
         let existing = self.list(parent)?;
         if existing.iter().any(|entry| entry.name.eq_ignore_ascii_case(name)) {
@@ -652,7 +719,7 @@ impl<D: BlockDevice> FileSystem<D> {
         if start + needed > total_slots {
             // Not enough room: add (zeroed) clusters to the directory.
             let mut grown = parent.clone();
-            self.grow(&mut grown, &mut chain, (start + needed) * SLOT)?;
+            self.grow(&mut grown, &mut chain, (start + needed) * SLOT, true)?;
         }
         for (index, slot) in slots.iter().enumerate() {
             let offset = ((start + index) * SLOT) as u32;
@@ -690,6 +757,10 @@ impl<D: BlockDevice> FileSystem<D> {
 
     /// Deletes a file or an empty directory.
     pub fn remove(&mut self, entry: &Entry) -> Result<()> {
+        self.change(|fs| fs.remove_unflushed(entry))
+    }
+
+    fn remove_unflushed(&mut self, entry: &Entry) -> Result<()> {
         if entry.directory && !self.list(entry)?.is_empty() {
             return Err(Error::NotEmpty);
         }
@@ -703,6 +774,10 @@ impl<D: BlockDevice> FileSystem<D> {
     /// Moves an entry to `new_parent` under `new_name`. Returns it as it is
     /// now.
     pub fn rename(&mut self, entry: &Entry, new_parent: &Entry, new_name: &str) -> Result<Entry> {
+        self.change(|fs| fs.rename_unflushed(entry, new_parent, new_name))
+    }
+
+    fn rename_unflushed(&mut self, entry: &Entry, new_parent: &Entry, new_name: &str) -> Result<Entry> {
         validate_name(new_name)?;
         let existing = self.list(new_parent)?;
         if existing.iter().any(|other| other.name.eq_ignore_ascii_case(new_name) && other.id() != entry.id()) {
@@ -1072,6 +1147,47 @@ mod tests {
         let file = fs.lookup(&root, "persist.txt").unwrap();
         assert_eq!(file.size, 10);
         assert_eq!(file.modified_unix() / 86_400, clock() / 86_400);
+    }
+
+    /// Lots of growing, shrinking and deleting, checked by Linux's
+    /// `fsck.vfat` (if it's installed), which knows FAT's rules well.
+    #[test]
+    fn linux_finds_no_errors() {
+        let mut fs = volume(40);
+        let root = fs.root();
+        let directory = fs.create(&root, "a directory", true).unwrap();
+        let mut files = alloc::vec::Vec::new();
+        for index in 0..40 {
+            let name = alloc::format!("file number {index}.data");
+            let mut file = fs.create(&directory, &name, false).unwrap();
+            let data: alloc::vec::Vec<u8> = (0..(index * 7919) as u32).map(|i| (i % 253) as u8).collect();
+            // In pieces, some past the end (leaving gaps).
+            for (piece, chunk) in data.chunks(3000).enumerate() {
+                fs.write(&mut file, (piece * 3100) as u64, chunk).unwrap();
+            }
+            files.push(file);
+        }
+        for (index, file) in files.iter_mut().enumerate() {
+            match index % 3 {
+                0 => fs.remove(file).unwrap(),
+                1 => fs.truncate(file, 1000).unwrap(),
+                _ => {}
+            }
+        }
+        let mut gap = fs.create(&root, "gap", false).unwrap();
+        fs.write(&mut gap, 100_000, b"end").unwrap();
+        let mut back = [1u8; 64];
+        fs.read(&gap, 50_000, &mut back).unwrap();
+        assert!(back.iter().all(|&b| b == 0), "a gap didn't read as zeros");
+
+        let image = core::mem::replace(fs.device(), MemoryDevice::new(0)).data;
+        let path = std::env::temp_dir().join(alloc::format!("eli-fat-{}.img", std::process::id()));
+        std::fs::write(&path, &image).unwrap();
+        let output = std::process::Command::new("fsck.vfat").arg("-n").arg(&path).output();
+        let _ = std::fs::remove_file(&path);
+        let Ok(output) = output else { return };
+        let report = alloc::string::String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(output.status.success(), "fsck.vfat found problems:\n{report}");
     }
 
     #[test]

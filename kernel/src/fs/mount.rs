@@ -235,6 +235,7 @@ pub fn mount_system(disk_root: bool) {
         ("root", 0o700),
         ("run", 0o755),
         ("disk", 0o755),
+        ("mnt", 0o755),
     ];
     for (name, permissions) in directories {
         if root.lookup(name).is_err() {

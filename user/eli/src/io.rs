@@ -38,7 +38,7 @@ pub fn write_all(fd: i32, mut data: &[u8]) -> Result<()> {
 /// Reads until end of file.
 pub fn read_to_end(fd: i32) -> Result<Vec<u8>> {
     let mut data = Vec::new();
-    let mut buffer = [0; 4096];
+    let mut buffer = alloc::vec![0; 64 * 1024];
     loop {
         let count = read(fd, &mut buffer)?;
         if count == 0 {

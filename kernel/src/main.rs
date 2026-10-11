@@ -17,6 +17,7 @@ mod cmdline;
 mod collections;
 mod console;
 mod drivers;
+mod efi;
 mod errno;
 mod font;
 mod framebuffer;
@@ -109,6 +110,7 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
     let boot_info = unsafe { &*(boot_info as *const BootInfo) };
     let reclaimed = memory::reclaim_boot_memory(boot_info);
     task::init("kernel", BOOT_STACK.lock().take().expect("boot stack missing"));
+    efi::init(boot_info);
 
     if let Some(info) = boot_info.framebuffer() {
         let pixels = memory::map_device(info.base, info.size, CacheType::WriteCombining);

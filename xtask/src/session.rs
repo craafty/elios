@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 /// The end of the shell's prompt: `#` (root) or `$`, then the color reset,
 /// then a space.
 const PROMPT_ENDS: [&[u8]; 2] = [b"#\x1b[0m ", b"$\x1b[0m "];
+/// What `login` asks.
+const LOGIN_PROMPT: &[u8] = b" login: ";
 const BOOT_TIMEOUT: Duration = Duration::from_secs(120);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -64,9 +66,14 @@ pub fn run(mut qemu: Command, steps: &[String], monitor: &Path) -> Result<(), St
         }
     };
 
-    wait_for_prompt(0, BOOT_TIMEOUT);
-    if !prompt_since(0) {
-        eprintln!("xtask: no shell prompt within {}s", BOOT_TIMEOUT.as_secs());
+    // Booted: a shell prompt, or (on an installed system) a login prompt.
+    let login_prompt = || output.lock().unwrap().windows(LOGIN_PROMPT.len()).any(|window| window == LOGIN_PROMPT);
+    let deadline = Instant::now() + BOOT_TIMEOUT;
+    while Instant::now() < deadline && !prompt_since(0) && !login_prompt() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !prompt_since(0) && !login_prompt() {
+        eprintln!("xtask: no shell or login prompt within {}s", BOOT_TIMEOUT.as_secs());
     }
     let mut previous_start = length();
     for step in steps {

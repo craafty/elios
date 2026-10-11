@@ -11,6 +11,7 @@
 
 pub mod cpio;
 pub mod devfs;
+pub mod efivarfs;
 pub mod ext2fs;
 pub mod fatfs;
 pub mod mount;

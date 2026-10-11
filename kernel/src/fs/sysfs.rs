@@ -4,6 +4,7 @@
 //! - `/sys/block/<disk>/`: `size` (in 512-byte sectors), `removable`, `ro`,
 //!   `device/model`, and a directory per partition with `partition` (its
 //!   number), `start` and `size`.
+//! - `/sys/firmware/efi/efivars/`: UEFI variables (see `efivarfs.rs`).
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -16,7 +17,16 @@ use crate::drivers::block::{self, Disk, Partition};
 
 /// The /sys directory.
 pub fn create() -> Arc<dyn Inode> {
-    directory(|| alloc::vec![("block".into(), directory(block_listing))])
+    directory(|| {
+        let mut entries: Listing = alloc::vec![("block".into(), directory(block_listing))];
+        // /sys/firmware/efi exists on UEFI systems, which is how programs
+        // tell; its efivars directory holds the firmware's variables.
+        if crate::efi::available() {
+            let efi = directory(|| alloc::vec![("efivars".into(), super::efivarfs::create())]);
+            entries.push(("firmware".into(), directory(move || alloc::vec![("efi".into(), efi.clone())])));
+        }
+        entries
+    })
 }
 
 fn block_listing() -> Listing {

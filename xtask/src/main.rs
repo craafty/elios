@@ -28,12 +28,15 @@ options:
   --headless   no QEMU window; serial output only (run; test is always headless)
   --gdb        wait for a debugger on localhost:1234 (run, test)
   --trace      log interrupts and CPU resets to target/qemu.log (run, test)
-  --fresh      start from an empty disk image instead of updating it (run)
+  --fresh      start from an empty disk image instead of updating it, and
+               forget the firmware's settings (boot entries) (run)
   --no-kvm     emulate the CPU even if hardware virtualization is available
   --cpus N     give the machine N CPUs (default 4)
   --forward H:G  forward TCP port H on this machine to port G in eliOS
   --second-disk  attach target/second-disk.img (an empty 2 GiB NVMe disk,
                kept between runs) to try partitioning and installing
+  --installed  boot only target/second-disk.img: the system the installer
+               put there, without the live disk
 ";
 
 const DEFAULT_CPUS: usize = 4;
@@ -78,6 +81,10 @@ struct Options {
     /// TCP ports to forward from the host into eliOS: (host, guest).
     forwards: Vec<(u16, u16)>,
     second_disk: bool,
+    /// Boot the second disk alone.
+    installed: bool,
+    /// Use a throwaway copy of the firmware's variables (for tests).
+    fresh_firmware: bool,
     qemu_args: Vec<String>,
 }
 
@@ -137,6 +144,7 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options, Stri
                 options.forwards.push(forward.ok_or("--forward needs HOST_PORT:GUEST_PORT")?);
             }
             "--second-disk" => options.second_disk = true,
+            "--installed" => options.installed = true,
             "--cpus" => {
                 let count = args.next().and_then(|count| count.parse().ok()).filter(|&count| (1..=64).contains(&count));
                 options.cpus = Some(count.ok_or("--cpus needs a number from 1 to 64")?);
@@ -171,7 +179,7 @@ fn test(options: &Options) -> Result<(), String> {
     let initrd = build_initrd()?;
     let disk = make_disk_image("eliOS-test.img", &bootloader, &kernel, &initrd, true)?;
 
-    let mut qemu = qemu_command(&disk, options)?;
+    let mut qemu = qemu_command(&disk, &Options { fresh_firmware: true, ..options.clone() })?;
     qemu.args(["-display", "none", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
     let status = run_with_timeout(qemu, TEST_TIMEOUT)?;
     match status.code() {
@@ -537,7 +545,6 @@ fn network(forwards: &[(u16, u16)]) -> String {
 
 /// The QEMU invocation shared by `run` and `test`.
 fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
-    let firmware = find_ovmf()?;
     let mut qemu = Command::new("qemu-system-x86_64");
     let cpus = options.cpus.unwrap_or(DEFAULT_CPUS).to_string();
     qemu.args(["-machine", "q35", "-m", "256M", "-smp", &cpus])
@@ -545,16 +552,36 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
         // networking: the guest is 10.0.2.15, the host 10.0.2.2, DNS
         // 10.0.2.3), so eliOS can reach the host and the internet.
         .arg("-nic")
-        .arg(network(&options.forwards))
-        .arg("-bios")
-        .arg(&firmware)
+        .arg(network(&options.forwards));
+    firmware(&mut qemu, options)?;
+    if !options.installed {
         // On the q35 machine the disk is attached to an AHCI (SATA)
-        // controller, as on a real PC.
-        .arg("-drive")
-        .arg(format!("format=raw,file={}", disk.display()))
-        // The serial port is a second console in this terminal. With
-        // signal=off, Ctrl+C goes to eliOS instead of stopping QEMU.
-        .args(["-chardev", "stdio,id=console,signal=off", "-serial", "chardev:console"])
+        // controller, as on a real PC. It's first in the boot order, so the
+        // firmware starts it even if the second disk has eliOS installed
+        // (as a PC would with its USB stick put first).
+        qemu.arg("-drive")
+            .arg(format!("if=none,id=live,format=raw,file={}", disk.display()))
+            .args(["-device", "ide-hd,drive=live,bus=ide.0,bootindex=0"]);
+    }
+    if options.second_disk || options.installed {
+        let path = workspace_root().join("target/second-disk.img");
+        if !path.exists() {
+            let file = fs::File::create(&path).map_err(|e| format!("creating {}: {e}", path.display()))?;
+            file.set_len(SECOND_DISK_BYTES).map_err(|e| format!("sizing {}: {e}", path.display()))?;
+        }
+        // On NVMe, so both disk drivers get used. Alone (--installed), it
+        // gets no boot index: given one, QEMU's firmware replaces its boot
+        // order with QEMU's list, dropping entries like the one the
+        // installer adds, which real PCs keep.
+        let boot_index = if options.installed { "" } else { ",bootindex=1" };
+        qemu.arg("-drive")
+            .arg(format!("if=none,id=second,format=raw,file={}", path.display()))
+            .arg("-device")
+            .arg(format!("nvme,drive=second,serial=eli-second{boot_index}"));
+    }
+    // The serial port is a second console in this terminal. With
+    // signal=off, Ctrl+C goes to eliOS instead of stopping QEMU.
+    qemu.args(["-chardev", "stdio,id=console,signal=off", "-serial", "chardev:console"])
         // A USB controller with a keyboard. QEMU types into the keyboard
         // added last, so the window's keystrokes arrive over USB.
         .args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"])
@@ -565,17 +592,6 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
     let kvm = fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok();
     if kvm && !options.no_kvm {
         qemu.args(["-enable-kvm", "-cpu", "host"]);
-    }
-    if options.second_disk {
-        let path = workspace_root().join("target/second-disk.img");
-        if !path.exists() {
-            let file = fs::File::create(&path).map_err(|e| format!("creating {}: {e}", path.display()))?;
-            file.set_len(SECOND_DISK_BYTES).map_err(|e| format!("sizing {}: {e}", path.display()))?;
-        }
-        // On NVMe, so both disk drivers get used.
-        qemu.arg("-drive")
-            .arg(format!("if=none,id=second,format=raw,file={}", path.display()))
-            .args(["-device", "nvme,drive=second,serial=eli-second"]);
     }
     if options.gdb {
         qemu.args(["-s", "-S"]);
@@ -603,6 +619,45 @@ fn run_with_timeout(mut command: Command, timeout: Duration) -> Result<ExitStatu
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// UEFI firmware for QEMU. Where the distribution has OVMF in two parts
+/// (code, and a template for its variables), the variables live in
+/// `target/ovmf-vars.fd`, so settings like boot entries persist between
+/// runs as on a real PC. Otherwise (or for tests, which get a throwaway
+/// copy) the single-file firmware keeps them only while QEMU runs.
+fn firmware(qemu: &mut Command, options: &Options) -> Result<(), String> {
+    if let Some((code, template)) = find_split_ovmf() {
+        let name = if options.fresh_firmware { "ovmf-vars-test.fd" } else { "ovmf-vars.fd" };
+        let variables = workspace_root().join("target").join(name);
+        if options.fresh || options.fresh_firmware || !variables.exists() {
+            fs::copy(&template, &variables).map_err(|e| format!("copying {}: {e}", template.display()))?;
+        }
+        qemu.arg("-drive")
+            .arg(format!("if=pflash,format=raw,unit=0,readonly=on,file={}", code.display()))
+            .arg("-drive")
+            .arg(format!("if=pflash,format=raw,unit=1,file={}", variables.display()));
+        return Ok(());
+    }
+    qemu.arg("-bios").arg(find_ovmf()?);
+    Ok(())
+}
+
+/// OVMF's code and variable template, where the distribution has them.
+fn find_split_ovmf() -> Option<(PathBuf, PathBuf)> {
+    if env::var("OVMF_PATH").is_ok() {
+        return None;
+    }
+    const PAIRS: &[(&str, &str)] = &[
+        ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
+        ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
+        ("/usr/share/edk2/x64/OVMF_CODE.4m.fd", "/usr/share/edk2/x64/OVMF_VARS.4m.fd"),
+        ("/usr/share/edk2/ovmf/OVMF_CODE.fd", "/usr/share/edk2/ovmf/OVMF_VARS.fd"),
+    ];
+    PAIRS
+        .iter()
+        .map(|(code, variables)| (PathBuf::from(code), PathBuf::from(variables)))
+        .find(|(code, variables)| code.exists() && variables.exists())
 }
 
 fn find_ovmf() -> Result<PathBuf, String> {

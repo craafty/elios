@@ -220,7 +220,41 @@ retry once; eliboot does.
 After that, there's no firmware: no console, no allocator, no way to report
 errors. eliboot disables interrupts, converts the memory map into eliOS's
 format (sorted, adjacent regions of the same kind merged), fills in
-`BootInfo`, and jumps.
+`BootInfo`, and jumps. Only the firmware's **runtime services** survive
+(see below); the memory they use is marked so the kernel never reuses it,
+and device registers they need get their own kind
+(`FirmwareRuntimeMmio`) so the kernel knows to map them for them.
+
+### Runtime services, after boot (`kernel/src/efi.rs`)
+
+A small part of UEFI keeps working after boot: the clock, reset, and
+**variables**, a little non-volatile storage holding settings such as the
+firmware's boot entries. eliOS uses the variables so the installer can add
+a boot entry, as Linux's `efibootmgr` does.
+
+Runtime code is still at its physical addresses: the OS may call
+`SetVirtualAddressMap` once to relocate it, but eliboot deliberately
+doesn't, because that's permanent and some firmware handles it badly. So
+calls go through a separate set of page tables: the kernel's half (shared,
+so the calling code, its stack and its buffers are all there) plus the
+firmware's runtime memory and device registers mapped at their physical
+addresses. A call:
+
+1. takes a lock (firmware may only be entered by one CPU at a time; a
+   spinlock, so interrupts are off throughout),
+2. saves the user program's FPU registers (firmware may use SSE, and the
+   kernel itself never does, so those registers belong to the program),
+3. switches to the firmware's page tables,
+4. switches to a private 64 KiB stack (firmware's stack needs aren't
+   documented, and a kernel thread's stack is smaller), loads the arguments
+   into `rcx`, `rdx`, `r8`, `r9` and the stack, above 32 bytes of "shadow
+   space", as the Microsoft x64 convention UEFI uses requires, and calls,
+5. switches everything back.
+
+Every pointer passed must point into kernel memory, since only the kernel's
+half is mapped during the call. The first version passed a program's
+buffer straight through and the firmware faulted reading it; buffers are
+now always copied into the kernel first.
 
 ### The jump
 
@@ -1311,6 +1345,12 @@ partition files (refused while one is mounted).
 `device/model`, and per partition `partition`, `start`, `size` and its GPT
 `uuid`. `lsblk` and the installer read it.
 
+`/sys/firmware/efi/efivars` exists on UEFI systems (that's how programs
+tell) and holds the firmware's variables in Linux's **efivarfs** format: a
+file per variable, named `Name-<vendor GUID>`, containing the variable's
+32-bit attributes followed by its value. Writing a file (in one write, same
+layout) sets the variable; deleting it deletes the variable.
+
 `/proc` follows Linux's layout because programs read it: `meminfo`,
 `uptime`, `cpuinfo`, `stat`, `mounts`, `partitions`, `filesystems`,
 `version`, `loadavg`, and per
@@ -1817,6 +1857,72 @@ done and never uses chunked encoding) and `nc` (connects standard input and
 output to a TCP connection, made or accepted; it waits on both with
 `poll`).
 
+### The installer (`installer.rs`, `gpt.rs`, `storage.rs`)
+
+`installer` puts eliOS on a disk so the PC starts it without the USB stick
+or live disk. It asks which disk (the one eliOS is running from isn't
+offered), whether to erase it or install alongside what's there, and for
+the first account; then it shows what will happen and wants the disk's
+name typed before touching anything. Every answer can also be given as an
+option (`--disk nvme0n1 --erase --user alice --password ... --yes`), which
+is how it's tested.
+
+An installed system is two partitions: an EFI System Partition (FAT32)
+holding eliboot, the kernel, the initrd and `cmdline.txt` (which names the
+root partition by its GUID), and an ext2 root partition with eliOS's own
+type GUID. The steps:
+
+1. **Partitioning** (`gpt.rs`, eliOS's own GPT code: headers, entries,
+   CRC32s, the backup copy at the end of the disk). *Erase*: the first and
+   last MiB are cleared (old tables and file system signatures), and a new
+   table gets a 128 or 256 MiB EFI partition and a root partition filling
+   the rest, 1 MiB aligned. *Alongside*: the disk must already have a GPT
+   and an EFI partition (any PC with a UEFI-installed OS does); the root
+   partition goes in the largest free stretch, at least 512 MiB, and the
+   existing MBR, partitions and their numbers are left alone. The primary
+   header is written last, so until then the old table stands. Then
+   `BLKRRPART` makes the kernel see the new partitions.
+2. **Formatting** with the same `fat` and `ext2` crates the kernel uses
+   (the EFI partition only when erasing).
+3. **Copying the system**: the files come from the initrd on the boot
+   partition, unpacked straight into the new ext2 volume through the `ext2`
+   crate (no mounting needed): a pristine system, not the live one with
+   whatever was changed in it. Owners, permissions and times come from the
+   archive. `/etc/autologin` is left out, so the installed system asks who
+   you are.
+4. **The account**: added to `/etc/passwd`, its own group and `wheel` (so
+   it can use sudo), a SHA-512 crypt password in `/etc/shadow`, a home
+   copied from `/etc/skel`. Root's password is locked (`!`): administration
+   goes through sudo, as on Ubuntu. The computer's name goes in
+   `/etc/hostname`.
+5. **The boot loader**: eliboot, the kernel and initrd go in
+   `\EFI\eliOS\` with `cmdline.txt`; when erasing, eliboot also goes in the
+   fallback path `\EFI\BOOT\BOOTX64.EFI`, so the disk starts even if the
+   firmware never got a boot entry. The initrd stays as a rescue: if the
+   root partition can't be mounted, the kernel says so and starts the live
+   system instead.
+6. **A boot entry**: an `EFI_LOAD_OPTION` named "eliOS" whose device path
+   is the EFI partition (number, start, size and GUID) and the file
+   `\EFI\eliOS\eliboot.efi`, written through efivarfs and put first in
+   `BootOrder`. Entries an earlier installation left, pointing at
+   partitions that no longer exist, are deleted, and an identical entry is
+   reused. Alongside another system this entry is the only way in (the
+   other system's fallback loader stays), so failing to write it is an
+   error there.
+
+The first version took about three minutes, nearly all of it in the FAT
+code: every read rebuilt the file's whole cluster chain, and every
+allocated cluster rewrote a FAT sector in both FAT copies and was zeroed
+before being overwritten. With the last chain cached, FAT sectors written
+back once per operation, and clusters zeroed only when a gap needs it, an
+installation takes about a second in QEMU.
+
+It was checked end to end: Linux's `sgdisk -v` finds the partition tables
+valid, `e2fsck` and `fsck.vfat` find the file systems clean, and the
+installed disk boots on its own (through the fallback path after erasing,
+and through the firmware boot entry alongside another system's
+partitions), logs in, and keeps files across reboots.
+
 ### Linux programs
 
 - `user/c/` holds C programs compiled by the host's GCC and glibc: a hello
@@ -1845,6 +1951,10 @@ needed.
 files) rather than rebuilding it, so files saved to `/disk` persist between
 runs. `--fresh` and `cargo xtask image` start over.
 
+`--second-disk` adds `target/second-disk.img`, an empty 2 GiB disk on NVMe
+(kept between runs), to partition, format and install to; `--installed`
+boots that disk alone, as a PC would after the USB stick is removed.
+
 A raw disk image rather than an ISO: written to a USB stick it becomes an
 ordinary, writable disk, and QEMU boots it directly.
 
@@ -1852,7 +1962,16 @@ ordinary, writable disk, and QEMU boots it directly.
 
 - Machine `q35`: a modern chipset with AHCI and PCI Express, closer to real
   PCs than the default.
-- Firmware: OVMF, the open-source UEFI implementation.
+- Firmware: OVMF, the open-source UEFI implementation. Where the
+  distribution ships it in two parts (code, and a template for its
+  variables), the variables live in `target/ovmf-vars.fd` so boot entries
+  persist between runs, as on a real PC; tests get a throwaway copy, and
+  `--fresh` starts over.
+- The live disk has QEMU's `bootindex=0`, so the firmware starts it even
+  when the second disk has eliOS installed. `--installed` sets no boot
+  index at all: given one, OVMF replaces its boot order with QEMU's list
+  and drops entries like the one the installer adds, which a real PC keeps
+  (this cost some head-scratching).
 - KVM with the host's CPU model when `/dev/kvm` is usable: hardware
   virtualization, dozens of times faster than emulation. eliOS boots in
   about half a second under KVM.
@@ -1864,9 +1983,11 @@ ordinary, writable disk, and QEMU boots it directly.
 ### Sessions (`xtask/src/session.rs`)
 
 `cargo xtask session -- steps...` boots eliOS headless, types commands at
-the shell (waiting for each prompt), can press keys through the QEMU
-monitor and take screenshots, then prints a clean transcript. It's how
-end-to-end behavior is checked without a person typing.
+the shell (waiting for each prompt, `#` or `$`), can wait for text to
+appear (`@wait Password:`), press keys through the QEMU monitor and take
+screenshots, then prints a clean transcript. Boot counts as done at a
+shell prompt or a login prompt. It's how end-to-end behavior is checked
+without a person typing.
 
 ## 23. Testing
 
@@ -1902,7 +2023,9 @@ Current limits, roughly in order of how much they'd matter to a user:
   (and panic). Linux avoids this with "exception tables" that turn such
   faults into errors; eliOS will need the same.
 - **USB:** keyboards only, and only on the controller's own ports (no hub
-  support yet); no USB storage or mice.
+  support yet); no USB storage or mice. That matters for installing on a
+  real PC: started from a USB stick, eliOS can't yet read the stick, so
+  `/disk` (and the installer's source files) are missing.
 - **Networking is IPv4 only**, with one network card (Intel e1000
   family), no TLS (so `https` doesn't work), no Unix domain sockets, and
   TCP without congestion control or out-of-order buffering.

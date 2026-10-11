@@ -24,6 +24,11 @@ impl Device {
         Ok(Self { file, start: 0, sectors })
     }
 
+    /// A slice of the device (a partition, by its place on the disk).
+    pub fn slice(path: &str, start: u64, sectors: u64) -> eli::Result<Self> {
+        Ok(Self { file: File::open_read_write(path)?, start, sectors })
+    }
+
     pub fn sectors(&self) -> u64 {
         self.sectors
     }
@@ -44,6 +49,20 @@ impl Device {
 }
 
 impl fat::BlockDevice for Device {
+    fn read(&mut self, sector: u64, buffer: &mut [u8]) -> fat::Result<()> {
+        Device::read(self, sector, buffer).map_err(|_| fat::Error::Io)
+    }
+
+    fn write(&mut self, sector: u64, data: &[u8]) -> fat::Result<()> {
+        Device::write(self, sector, data).map_err(|_| fat::Error::Io)
+    }
+
+    fn sectors(&self) -> u64 {
+        self.sectors
+    }
+}
+
+impl fat::BlockDevice for &mut Device {
     fn read(&mut self, sector: u64, buffer: &mut [u8]) -> fat::Result<()> {
         Device::read(self, sector, buffer).map_err(|_| fat::Error::Io)
     }
