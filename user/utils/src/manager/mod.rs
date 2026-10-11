@@ -21,7 +21,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use eli::{eprintln, fs, print, println, time, users};
+use eli::{eprint, eprintln, fs, print, println, time, users};
 
 pub use self::config::User as ConfiguredUser;
 
@@ -187,10 +187,13 @@ fn apply(reason: &str, newest: bool) -> Result<(), String> {
                 if fetching.len() == 1 { "" } else { "s" },
                 size(bytes)
             );
-            for package in &fetching {
-                store::fetch(package, &repositories)?;
-                println!("  {}", package.id());
+            // One line, rewritten as each downloads; the summary below
+            // lists what was added.
+            for (number, package) in fetching.iter().enumerate() {
+                let label = format!("[{}/{}] {}", number + 1, fetching.len(), package.id());
+                store::fetch(package, &repositories, &label)?;
             }
+            eprint!("\r\x1b[K");
         }
         ids
     };

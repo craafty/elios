@@ -12,6 +12,8 @@
 //! - `@key NAME`: a key on the PS/2 keyboard (QEMU names: `ret`, `f12`, `ctrl-c`...)
 //! - `@screenshot PATH`: saves the screen as a PNG
 //! - `@monitor COMMAND`: any QEMU monitor command (`device_add ...`)
+//! - `@early STEP`: any of these, done while the machine starts, before
+//!   waiting for the first prompt (to use the boot menu, say)
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -66,6 +68,51 @@ pub fn run(mut qemu: Command, steps: &[String], monitor: &Path) -> Result<(), St
         }
     };
 
+    let mut previous_start = 0;
+    let mut run = |step: &str, previous_start: &mut usize| -> Result<(), String> {
+        let start = length();
+        if let Some(text) = step.strip_prefix("@wait ") {
+            let deadline = Instant::now() + COMMAND_TIMEOUT;
+            let appeared = || {
+                let data = output.lock().unwrap();
+                let since = &data[(*previous_start).min(data.len())..];
+                since.windows(text.len()).any(|window| window == text.as_bytes())
+            };
+            while Instant::now() < deadline && !appeared() {
+                thread::sleep(Duration::from_millis(50));
+            }
+            if !appeared() {
+                eprintln!("xtask: `{text}` didn't appear within {}s", COMMAND_TIMEOUT.as_secs());
+            }
+            // The next wait looks from here on.
+            *previous_start = length();
+            return Ok(());
+        }
+        if let Some(seconds) = step.strip_prefix("@sleep ") {
+            let seconds: f64 = seconds.trim().parse().map_err(|_| format!("bad step `{step}`"))?;
+            thread::sleep(Duration::from_secs_f64(seconds));
+        } else if let Some(key) = step.strip_prefix("@key ") {
+            monitor_command(monitor, &format!("sendkey {key}"))?;
+        } else if let Some(command) = step.strip_prefix("@monitor ") {
+            monitor_command(monitor, command)?;
+        } else if let Some(path) = step.strip_prefix("@screenshot ") {
+            monitor_command(monitor, &format!("screendump {path} -f png"))?;
+        } else if let Some(text) = step.strip_prefix("@raw ") {
+            input.write_all(&unescape(text)).and_then(|_| input.flush()).map_err(|e| e.to_string())?;
+            thread::sleep(Duration::from_millis(500));
+        } else {
+            input.write_all(format!("{step}\r").as_bytes()).and_then(|_| input.flush()).map_err(|e| e.to_string())?;
+            wait_for_prompt(start, COMMAND_TIMEOUT);
+        }
+        *previous_start = start;
+        Ok(())
+    };
+
+    // Steps marked `@early` happen while the machine starts (to press keys
+    // in the boot menu, say), before waiting for the first prompt.
+    for step in steps.iter().filter_map(|step| step.strip_prefix("@early ")) {
+        run(step, &mut previous_start)?;
+    }
     // Booted: a shell prompt, or (on an installed system) a login prompt.
     let login_prompt = || output.lock().unwrap().windows(LOGIN_PROMPT.len()).any(|window| window == LOGIN_PROMPT);
     let deadline = Instant::now() + BOOT_TIMEOUT;
@@ -75,46 +122,9 @@ pub fn run(mut qemu: Command, steps: &[String], monitor: &Path) -> Result<(), St
     if !prompt_since(0) && !login_prompt() {
         eprintln!("xtask: no shell or login prompt within {}s", BOOT_TIMEOUT.as_secs());
     }
-    let mut previous_start = length();
-    for step in steps {
-        let start = length();
-        let result = if let Some(text) = step.strip_prefix("@wait ") {
-            let deadline = Instant::now() + COMMAND_TIMEOUT;
-            let appeared = || {
-                let data = output.lock().unwrap();
-                let since = &data[previous_start.min(data.len())..];
-                since.windows(text.len()).any(|window| window == text.as_bytes())
-            };
-            while Instant::now() < deadline && !appeared() {
-                thread::sleep(Duration::from_millis(50));
-            }
-            if !appeared() {
-                eprintln!("xtask: `{text}` didn't appear within {}s", COMMAND_TIMEOUT.as_secs());
-            }
-            Ok(())
-        } else if let Some(seconds) = step.strip_prefix("@sleep ") {
-            let seconds: f64 = seconds.trim().parse().map_err(|_| format!("bad step `{step}`"))?;
-            thread::sleep(Duration::from_secs_f64(seconds));
-            Ok(())
-        } else if let Some(key) = step.strip_prefix("@key ") {
-            monitor_command(monitor, &format!("sendkey {key}"))
-        } else if let Some(command) = step.strip_prefix("@monitor ") {
-            monitor_command(monitor, command)
-        } else if let Some(path) = step.strip_prefix("@screenshot ") {
-            monitor_command(monitor, &format!("screendump {path} -f png"))
-        } else if let Some(text) = step.strip_prefix("@raw ") {
-            input.write_all(&unescape(text)).and_then(|_| input.flush()).map_err(|e| e.to_string()).map(|_| {
-                thread::sleep(Duration::from_millis(500));
-            })
-        } else {
-            input.write_all(format!("{step}\r").as_bytes()).and_then(|_| input.flush()).map_err(|e| e.to_string())?;
-            wait_for_prompt(start, COMMAND_TIMEOUT);
-            Ok(())
-        };
-        result?;
-        if !step.starts_with("@wait ") {
-            previous_start = start;
-        }
+    previous_start = length();
+    for step in steps.iter().filter(|step| !step.starts_with("@early ")) {
+        run(step, &mut previous_start)?;
     }
     thread::sleep(Duration::from_millis(300));
     let _ = child.kill();

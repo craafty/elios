@@ -27,10 +27,11 @@ Contents:
 19. [Networking](#19-networking)
 20. [ACPI: tables and power](#20-acpi-tables-and-power)
 21. [Userland](#21-userland)
-22. [Disk images and the build tool](#22-disk-images-and-the-build-tool)
-23. [Testing](#23-testing)
-24. [Limits and what's next](#24-limits-and-whats-next)
-25. [Reference tables](#25-reference-tables)
+22. [The system manager: packages, system.conf and generations](#22-the-system-manager-packages-systemconf-and-generations)
+23. [Disk images and the build tool](#23-disk-images-and-the-build-tool)
+24. [Testing](#24-testing)
+25. [Limits and what's next](#25-limits-and-whats-next)
+26. [Reference tables](#26-reference-tables)
 
 ---
 
@@ -283,8 +284,9 @@ the firmware's runtime services. All pointers in it are direct-map
 addresses, so they stay valid after the kernel drops the identity map.
 
 The **command line** is one line of text from `\EFI\eliOS\cmdline.txt`, if
-it exists: `root=PARTUUID=<guid>` there makes an installed system's ext2
-partition the root (section 16). The **boot partition** comes from the
+it exists: `data=PARTUUID=<guid>` there names an installed system's data
+partition (section 22), and `generation=N` (which eliboot's menu adds)
+which generation of the system to start. The **boot partition** comes from the
 firmware's device path for eliboot's volume (its "hard drive" node carries
 the GPT partition GUID), so the kernel mounts the partition it actually
 booted from at `/disk`, not just the first FAT partition it sees (which,
@@ -1081,7 +1083,8 @@ since a corrupt value would make `fxrstor` fault inside the kernel.
 `SA_RESTART`: if a handler interrupted a system call that returned `EINTR`,
 the frame is rewound to re-execute the `syscall` instruction (2 bytes) with
 the original call number, so the call transparently restarts after the
-handler.
+handler. Calls Linux never restarts (pause, sigsuspend, sigtimedwait,
+sleeps, poll, select, epoll) are left returning `EINTR`.
 
 **CPU faults** in user code become signals: page faults outside any area
 and protection faults become SIGSEGV, invalid opcodes SIGILL, division by
@@ -1208,9 +1211,10 @@ changed), changes to their home and runs their shell as a login shell
 `PATH`, `TERM`). The shell's `logout` (or `exit`, or Ctrl+D) ends the
 session and login asks again.
 
-The live system has `/etc/autologin` naming root, so the first session
-starts without asking (the live image is for trying things, and root has no
-password there). Every later session asks.
+On the live system (no data partition), the first session logs root in
+without asking (the live image is for trying things, and root has no
+password there); `autologin = NAME` in system.conf does the same for any
+system (a kiosk, say). Every later session asks.
 
 ### su, sudo and passwd
 
@@ -1918,39 +1922,36 @@ option (`--disk nvme0n1 --erase --user alice --password ... --yes`), which
 is how it's tested.
 
 An installed system is two partitions: an EFI System Partition (FAT32)
-holding eliboot, the kernel, the initrd and `cmdline.txt` (which names the
-root partition by its GUID), and an ext2 root partition with eliOS's own
-type GUID. The steps:
+holding eliboot, the kernel, the initrd (the system image) and
+`cmdline.txt` (which names the data partition by its GUID), and an ext2
+*data* partition with eliOS's own type GUID. The system isn't copied
+anywhere: it boots from the image, as the live system does (section 22).
+The steps:
 
 1. **Partitioning** (`gpt.rs`, eliOS's own GPT code: headers, entries,
    CRC32s, the backup copy at the end of the disk). *Erase*: the first and
    last MiB are cleared (old tables and file system signatures), and a new
-   table gets a 128 or 256 MiB EFI partition and a root partition filling
+   table gets a 128 or 256 MiB EFI partition and a data partition filling
    the rest, 1 MiB aligned. *Alongside*: the disk must already have a GPT
-   and an EFI partition (any PC with a UEFI-installed OS does); the root
+   and an EFI partition (any PC with a UEFI-installed OS does); the data
    partition goes in the largest free stretch, at least 512 MiB, and the
    existing MBR, partitions and their numbers are left alone. The primary
    header is written last, so until then the old table stands. Then
    `BLKRRPART` makes the kernel see the new partitions.
 2. **Formatting** with the same `fat` and `ext2` crates the kernel uses
    (the EFI partition only when erasing).
-3. **Copying the system**: the files come from the initrd on the boot
-   partition, unpacked straight into the new ext2 volume through the `ext2`
-   crate (no mounting needed): a pristine system, not the live one with
-   whatever was changed in it. Owners, permissions and times come from the
-   archive. `/etc/autologin` is left out, so the installed system asks who
-   you are.
-4. **The account**: added to `/etc/passwd`, its own group and `wheel` (so
-   it can use sudo), a SHA-512 crypt password in `/etc/shadow`, a home
-   copied from `/etc/skel`. Root's password is locked (`!`): administration
-   goes through sudo, as on Ubuntu. The computer's name goes in
-   `/etc/hostname`.
+3. **The account and settings**, written straight into the new ext2
+   volume through the `ext2` crate (no mounting needed): `system.conf`
+   (the live system's, with the computer's name and the account added),
+   `shadow` with a SHA-512 crypt password (root's is locked: administration
+   goes through sudo, as on Ubuntu), the account's home copied from
+   `/etc/skel`, and generation 1.
+4. **Packages added to the live system** are copied into the new store, so
+   trying something live and then installing keeps it.
 5. **The boot loader**: eliboot, the kernel and initrd go in
-   `\EFI\eliOS\` with `cmdline.txt`; when erasing, eliboot also goes in the
-   fallback path `\EFI\BOOT\BOOTX64.EFI`, so the disk starts even if the
-   firmware never got a boot entry. The initrd stays as a rescue: if the
-   root partition can't be mounted, the kernel says so and starts the live
-   system instead.
+   `\EFI\eliOS\` with `cmdline.txt` and the boot menu's list; when
+   erasing, eliboot also goes in the fallback path `\EFI\BOOT\BOOTX64.EFI`,
+   so the disk starts even if the firmware never got a boot entry.
 6. **A boot entry**: an `EFI_LOAD_OPTION` named "eliOS" whose device path
    is the EFI partition (number, start, size and GUID) and the file
    `\EFI\eliOS\eliboot.efi`, written through efivarfs and put first in
@@ -1971,7 +1972,9 @@ It was checked end to end: Linux's `sgdisk -v` finds the partition tables
 valid, `e2fsck` and `fsck.vfat` find the file systems clean, and the
 installed disk boots on its own (through the fallback path after erasing,
 and through the firmware boot entry alongside another system's
-partitions), logs in, and keeps files across reboots.
+partitions), logs in, and keeps files across reboots. (The first version
+installed a copy of the system on an ext2 root partition; the kernel still
+accepts `root=PARTUUID=...` for that layout.)
 
 ### Linux programs
 
@@ -1986,7 +1989,142 @@ partitions), logs in, and keeps files across reboots.
   `tar`, `gzip`, `top`, ...). Links go in `/usr/bin`, which comes after
   `/bin` in `PATH`, so eliOS's own commands take precedence.
 
-## 22. Disk images and the build tool
+## 22. The system manager: packages, system.conf and generations
+
+`user/utils/src/manager/`, `apk/`, `user/eli/src/http.rs`.
+
+eliOS's answer to "how do I get git or vim" and "how do I keep a system
+from slowly breaking" is one tool, `eli`, built on three ideas:
+
+1. **The system itself is an image.** The kernel and the initrd are the
+   whole base system; it's unpacked into memory fresh at every boot, live
+   or installed. Nothing can drift: what boots is always exactly the image.
+2. **One file says what's added to it.** `/etc/system.conf` names the
+   computer, its accounts and its packages:
+
+   ```text
+   hostname = robinpc
+   packages = git vim htop
+
+   user robin
+       name = Robin Example
+       admin = yes
+   ```
+3. **Every change is a numbered generation.** `eli apply` makes the system
+   match the file and records the result; `eli rollback` returns to any
+   earlier one, and eliboot's menu can start one for a single boot.
+
+This is NixOS's central idea (a declared system, with rollback), with the
+complexity left out: a plain settings file instead of a programming
+language, folders and links instead of a build system, and an existing,
+very large package collection instead of a new one.
+
+### Where things live
+
+Everything that should last is under `/data`: the data partition on an
+installed system (the kernel mounts it from `data=PARTUUID=...` on the
+command line), or a directory in memory on the live system.
+
+| Path | What |
+|------|------|
+| `/data/etc/system.conf` | the configuration (`/etc/system.conf` links to it) |
+| `/data/etc/shadow` | passwords (`/etc/shadow` links to it, so `passwd` lasts) |
+| `/data/etc/ids` | user ids, remembered so they never change |
+| `/data/home` | homes, mounted (bind) on `/home` |
+| `/data/pkg/NAME-VERSION` | the package store: one directory per package, never changed |
+| `/data/generations/N` | each generation: `system.conf`, `packages`, `info`; `current` links to one |
+| `/data/cache` | the repositories' verified package lists |
+
+### Packages come from Alpine Linux
+
+Writing and maintaining thousands of packages isn't something one project
+can do, and eliOS doesn't need to: it runs Linux programs unmodified, so
+it can use another distribution's builds. Alpine was chosen because its
+packages are small, built against musl (a small C library whose dynamic
+loader runs on eliOS as is), cover about 28,000 programs, and come in a
+simple, well-documented format served over plain HTTP.
+
+Plain HTTP is safe because nothing downloaded is trusted until checked
+(`apk/src/lib.rs` has the details):
+
+- A repository's index is two gzip streams: an RSA signature (made with
+  one of Alpine's keys, which eliOS ships in `/etc/eli/keys`, fetched once
+  over HTTPS and cross-checked against Alpine's Git repository), then the
+  index it signs.
+- The index gives each package's SHA-1 of its *control section*.
+- The control section gives the SHA-256 of the package's files.
+
+So one signature check plus two hashes per package cover every byte. All
+of it is eliOS's own code, in the `apk` crate: DEFLATE decompression, tar
+(with the PAX and GNU extensions for long names), SHA-1, SHA-256, base64,
+RSA with 4096-bit keys (Montgomery multiplication), PEM keys, the index
+format, Alpine's version ordering (`1.2_rc1 < 1.2 < 1.2_p1`, `-r2 > -r1`)
+and dependency resolution (by name, version, shared library `so:...` or
+command `cmd:...`). Its host tests check it against Python's zlib, tarfile
+and hashlib and against OpenSSL, and against real Alpine files when
+they're provided.
+
+Package install scripts (`.post-install` and the like) aren't run; few
+programs need them, and the ones skipped are recorded in the store.
+
+### Applying a configuration
+
+`eli apply` (and `eli add`, `eli remove`, `eli upgrade`, which change the
+file and then apply):
+
+1. resolves the packages, with dependencies, against the cached indexes
+   (fetched first if missing), keeping the versions already in use unless
+   upgrading;
+2. downloads what isn't in the store, verifies it, and unpacks it into
+   `/data/pkg/.unpacking-...`, renamed into place only when complete;
+3. records a new generation (nothing changed means no new generation);
+4. activates it, then points `current` at it (a new link renamed over the
+   old one, so the switch is all or nothing), and writes the boot menu's
+   list to the EFI partition (eliboot can read FAT, not ext2).
+
+**Activation** makes the running system match a generation:
+
+- `/etc/passwd` and `/etc/group` are written from the image's own
+  accounts (ids below 1000) plus the configured users, each with a group
+  of its own name; `admin = yes` puts a user in `wheel`. New users get a
+  locked password entry until `passwd` sets one, and a home copied from
+  `/etc/skel`.
+- The hostname is set.
+- Every file of every package is linked into place: `/usr/bin/git`
+  becomes a symbolic link into `/data/pkg/git-2.54.0-r0/`. Directories
+  that don't exist yet are created; ones that do are shared. What was
+  created is recorded in `/run/eli/links`, so activating another
+  generation first undoes it exactly. A package's file never replaces the
+  base system's, except BusyBox's command links (asking for a real `less`
+  should get it).
+
+At boot, init runs `eli boot` before anything else: it makes sure `/data`
+is set up (a fresh live system gets the image's default configuration and
+a first generation), links `/etc/system.conf` and `/etc/shadow` into it,
+mounts `/data/home` on `/home`, and activates the current generation (or
+the one picked in eliboot's menu, from `generation=N` on the command line).
+
+`adduser` and `deluser` change `system.conf` and apply it on such a system,
+so accounts last; `passwd` writes through the `/etc/shadow` link. The shell
+answers an unknown command with the package that has it ("vim isn't
+installed; it's in the vim package: sudo eli add vim"), from the cached
+indexes' `cmd:` entries.
+
+### What it took from the kernel
+
+Alpine's vim needed POSIX timers: `timer_create`, `timer_settime` and
+friends (and `setitimer` and `alarm` came with them). Every armed timer is
+in one list; a kernel thread sleeps until the earliest is due, sends its
+signal (to the process, or to one thread for `SIGEV_THREAD_ID`), and
+re-arms repeating ones, counting missed periods as overruns. Signals now
+carry their details (`si_code`, and a timer's id and value), and
+`rt_sigtimedwait` waits for chosen signals, which is how musl runs a
+timer's function in a thread. Testing this turned up an old bug: a handler
+with `SA_RESTART` made `pause()` restart and wait forever; calls Linux
+never restarts (waiting for signals, sleeping, `poll` and `select`) now
+return `EINTR`. `timertest` checks it all through glibc.
+
+## 23. Disk images and the build tool
 
 ### The disk image (`xtask/src/image.rs`)
 
@@ -2042,7 +2180,7 @@ screenshots, then prints a clean transcript. Boot counts as done at a
 shell prompt or a login prompt. It's how end-to-end behavior is checked
 without a person typing.
 
-## 23. Testing
+## 24. Testing
 
 - **Kernel tests** (`ktest!`) register themselves in a dedicated linker
   section; the linker script brackets the section with symbols, so the
@@ -2062,7 +2200,7 @@ without a person typing.
 Every phase was also tested in release builds, since optimizations can
 expose bugs that debug builds hide.
 
-## 24. Limits and what's next
+## 25. Limits and what's next
 
 Current limits, roughly in order of how much they'd matter to a user:
 
@@ -2082,11 +2220,15 @@ Current limits, roughly in order of how much they'd matter to a user:
 - **Networking is IPv4 only**, with one network card (Intel e1000
   family), no TLS (so `https` doesn't work), no Unix domain sockets, and
   TCP without congestion control or out-of-order buffering.
+- **Packages:** install scripts aren't run, and without TLS, programs
+  that need HTTPS (git cloning from GitHub, for one) can't reach those
+  servers. The system image itself is updated by replacing the files on
+  the EFI partition; generations cover packages and configuration.
 - **No graphical desktop** (planned, deliberately postponed).
 - **fork copies eagerly**; copy-on-write would make it cheaper.
 - **Disk I/O is polled** and holds the volume lock for whole operations.
 
-## 25. Reference tables
+## 26. Reference tables
 
 ### Physical memory at boot (QEMU, 256 MiB)
 

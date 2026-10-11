@@ -12,6 +12,18 @@ design, but at the boundary to programs it implements the Linux system call
 ABI. Unmodified Linux programs run on it: C programs built with glibc (static
 or dynamically linked), and BusyBox with its ~200 commands including `vi`.
 
+## What makes it different
+
+- **One file describes your computer.** `/etc/system.conf` lists its name,
+  its accounts and its programs; `eli apply` makes the system match.
+- **It can't slowly break.** The system starts fresh from one image at
+  every boot; your files, settings and programs live separately. Every
+  change is a numbered generation: `eli rollback` (or a menu at boot)
+  returns to any earlier one.
+- **Tens of thousands of programs.** `eli add git vim python3` installs
+  them from Alpine Linux's repositories, checked against Alpine's
+  signatures by eliOS's own code; they run unmodified.
+
 ## Try it
 
 You need [rustup](https://rustup.rs), QEMU (`qemu-system-x86_64`) and OVMF,
@@ -56,6 +68,8 @@ lsblk; df                     # disks, partitions, and free space
 ifconfig; ping -c 3 10.0.2.2  # the network (QEMU's virtual router)
 wget -O - http://example.com/ # the internet, if the host has it
 nettest                       # sockets through glibc: TCP, UDP, poll...
+eli add vim git               # programs from Alpine Linux (needs the internet)
+eli generations; eli rollback # every change is a generation you can go back to
 adduser --admin alice         # an account (--admin: may use sudo)
 su - alice                    # become alice; or `logout` and log in as her
 sudo whoami                   # as alice: run a command as root
@@ -94,7 +108,11 @@ sudo dd if=target/eliOS.img of=/dev/sdX bs=4M conv=fsync   # sdX = the stick
 disk: erasing it, or alongside another system in the disk's free space
 (the disk needs an EFI System Partition, which any PC with a UEFI-installed
 OS has). It asks for your account; the installed system boots to a login
-prompt, and your account can use `sudo`. Try it in QEMU:
+prompt, and your account can use `sudo`. Programs added with `eli` on the
+live system come along. On the installed system, the system itself boots
+from the image every time, and your files, packages and settings live on
+the data partition; press a key while it starts for a menu of earlier
+generations. Try it in QEMU:
 
 ```sh
 cargo xtask run --second-disk     # then, inside eliOS: installer
@@ -208,6 +226,7 @@ glyph and rebuild.
 | `kernel/font/`  | The console font                                             |
 | `fat/`          | FAT32, shared by the kernel and the disk image builder       |
 | `ext2/`         | ext2, shared by the kernel, `mkfs` and the installer         |
+| `apk/`          | Alpine's package format: gzip, tar, hashes, RSA, indexes      |
 | `user/eli/`     | libeli, the runtime for eliOS's Rust programs                |
 | `user/utils/`   | eliutils: shell, init, editor and commands                   |
 | `user/c/`       | C test programs built with the host's toolchain              |
@@ -239,7 +258,9 @@ glyph and rebuild.
 - [x] **Users:** accounts, permissions, setuid programs, `login`, `su`,
       `sudo`, `passwd`, `adduser`, with Linux's file formats and password
       hashes
-- [x] **Installer:** partitions a disk (or uses its free space), ext2 root,
-      a UEFI boot entry through the firmware's runtime services
+- [x] **Installer:** partitions a disk (or uses its free space), a data
+      partition, a UEFI boot entry through the firmware's runtime services
+- [x] **System manager:** `system.conf`, packages from Alpine, generations,
+      rollback, a boot menu of generations
 - [ ] **Next:** a graphical desktop, USB mice, Unix
       domain sockets, and TLS for HTTPS

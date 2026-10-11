@@ -53,8 +53,8 @@ fn progress_bar(label: &str) -> impl FnMut(usize, Option<usize>) + '_ {
         if now != last {
             last = now;
             match total {
-                Some(total) if total > 0 => eprint!("\r  {label}: {}%  ", done * 100 / total),
-                _ => eprint!("\r  {label}: {} KiB  ", done / 1024),
+                Some(total) if total > 0 => eprint!("\r\x1b[K  {label}: {}%", done * 100 / total),
+                _ => eprint!("\r\x1b[K  {label}: {} KiB", done / 1024),
             }
         }
     }
@@ -75,7 +75,7 @@ pub fn update(repositories: &[String]) -> Result<(), String> {
     for (number, repository) in repositories.iter().enumerate() {
         let url = format!("{repository}/x86_64/APKINDEX.tar.gz");
         let file = http::get(&url, &mut progress_bar(repository))?;
-        eprint!("\r");
+        eprint!("\r\x1b[K");
         let text = apk::read_index(&file, &keys).map_err(|error| format!("{url}: {error}"))?;
         fs::write(&index_path(number), text.as_bytes()).map_err(|error| format!("saving the index: {error}"))?;
         eprintln!("  {repository}: {} packages", text.matches("\nP:").count() + 1);
@@ -122,15 +122,15 @@ pub fn installed(id: &str) -> bool {
 
 /// Makes sure a package is in the store: downloads it, checks it against
 /// the (signed) index, and unpacks it.
-pub fn fetch(package: &Package, repositories: &[String]) -> Result<(), String> {
+pub fn fetch(package: &Package, repositories: &[String], label: &str) -> Result<(), String> {
     let id = package.id();
     if installed(&id) {
         return Ok(());
     }
     let repository = repositories.get(package.repository).ok_or("unknown repository")?;
     let url = format!("{repository}/x86_64/{}", package.file_name());
-    let file = http::get(&url, &mut progress_bar(&id))?;
-    eprint!("\r  {id}                    \r");
+    let file = http::get(&url, &mut progress_bar(label))?;
+    eprint!("\r\x1b[K  {label}: checking and unpacking");
     let contents = apk::read_package(&file, &package.checksum).map_err(|error| format!("{id}: {error}"))?;
     let entries = tar::entries(&contents.data).map_err(|error| format!("{id}: {error}"))?;
 
