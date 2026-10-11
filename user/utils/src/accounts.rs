@@ -161,6 +161,27 @@ pub fn adduser(arguments: &[String]) -> i32 {
         }
     };
 
+    // A system described by /etc/system.conf gets the account there, so it
+    // lasts (/etc/passwd is rewritten from it at every boot).
+    if crate::manager::managed() {
+        let user = crate::manager::ConfiguredUser { name: name.clone(), full_name, admin, shell: "/bin/sh".into() };
+        if let Err(error) = crate::manager::change_user(Some(user), None) {
+            eprintln!("adduser: {error}");
+            return 1;
+        }
+        let hash = match password {
+            None => "!".into(),
+            Some(password) if password.is_empty() => String::new(),
+            Some(password) => eli::crypt::hash_password(&password),
+        };
+        if let Err(error) = users::set_password_hash(&name, hash) {
+            eprintln!("adduser: can't set the password: {error}");
+            return 1;
+        }
+        println!("Added {name}{} (in /etc/system.conf).", if admin { ", who can use sudo" } else { "" });
+        return 0;
+    }
+
     // The first free id from 1000 up, the same for the user and their group.
     let taken = |id: u32| accounts.iter().any(|u| u.uid == id) || groups.iter().any(|g| g.gid == id);
     let id = (users::FIRST_USER_ID..60_000).find(|&id| !taken(id)).unwrap_or(60_000);
@@ -245,6 +266,20 @@ pub fn deluser(arguments: &[String]) -> i32 {
     if user.uid == 0 {
         eprintln!("deluser: refusing to remove root");
         return 1;
+    }
+    if crate::manager::managed() {
+        if let Err(error) = crate::manager::change_user(None, Some(name)) {
+            eprintln!("deluser: {error}");
+            return 1;
+        }
+        let shadow: Vec<Shadow> =
+            users::shadow_entries().unwrap_or_default().into_iter().filter(|entry| entry.name != *name).collect();
+        let _ = users::write_shadow(&shadow);
+        if remove_home {
+            let _ = crate::commands::remove_tree(&user.home);
+        }
+        println!("Removed {name}.");
+        return 0;
     }
     accounts.retain(|account| account.name != *name);
     let mut groups = users::all_groups();
@@ -501,11 +536,11 @@ impl Names {
     }
 }
 
-/// The account init logs in automatically the first time (the live system
-/// names root here; an installed one has no such file).
+/// The account init logs in automatically the first time: system.conf's
+/// `autologin`, or root on the live system.
 pub fn autologin_user() -> Option<String> {
-    let name = fs::read_to_string("/etc/autologin").ok()?.trim().to_string();
-    (!name.is_empty() && users::user_named(&name).is_some()).then_some(name)
+    let name = crate::manager::autologin()?;
+    users::user_named(&name).is_some().then_some(name)
 }
 
 /// Whether this shell is a login shell (started as `-sh`).

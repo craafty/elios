@@ -556,7 +556,8 @@ fn network(forwards: &[(u16, u16)]) -> String {
 fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
     let mut qemu = Command::new("qemu-system-x86_64");
     let cpus = options.cpus.unwrap_or(DEFAULT_CPUS).to_string();
-    qemu.args(["-machine", "q35", "-m", "256M", "-smp", &cpus])
+    // 1 GiB: packages installed on the live system live in memory.
+    qemu.args(["-machine", "q35", "-m", "1G", "-smp", &cpus])
         // An Intel network card on QEMU's built-in NAT network ("user"
         // networking: the guest is 10.0.2.15, the host 10.0.2.2, DNS
         // 10.0.2.3), so eliOS can reach the host and the internet.

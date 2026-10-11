@@ -4,7 +4,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use eli::net::{self, DatagramSocket, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use eli::{eprintln, fs, io, print, println, time};
+use eli::{eprintln, fs, http, io, print, println, time};
 
 /// Interface flags.
 const IFF_UP: u16 = 0x1;
@@ -205,26 +205,6 @@ pub fn host(arguments: &[String]) -> i32 {
     }
 }
 
-/// A parsed `http://host[:port]/path` URL.
-struct Url {
-    host: String,
-    port: u16,
-    path: String,
-}
-
-fn parse_url(text: &str) -> Result<Url, String> {
-    if text.starts_with("https://") {
-        return Err("https isn't supported yet (eliOS has no TLS); try http://".into());
-    }
-    let rest = text.strip_prefix("http://").unwrap_or(text);
-    let (authority, path) = match rest.find('/') {
-        Some(slash) => (&rest[..slash], &rest[slash..]),
-        None => (rest, "/"),
-    };
-    let (host, port) = net::split_host_port(authority, 80).ok_or("bad port")?;
-    Ok(Url { host, port, path: path.into() })
-}
-
 /// `wget [-q] [-O file] url`: downloads over HTTP.
 pub fn wget(arguments: &[String]) -> i32 {
     let mut output = None;
@@ -238,103 +218,35 @@ pub fn wget(arguments: &[String]) -> i32 {
             _ => url = Some(word.clone()),
         }
     }
-    let Some(mut url) = url else {
+    let Some(url) = url else {
         eprintln!("usage: wget [-q] [-O file] url");
         return 2;
     };
-    // Follow up to 5 redirects.
-    for _ in 0..6 {
-        let parsed = match parse_url(&url) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                eprintln!("wget: {error}");
-                return 1;
-            }
-        };
-        let response = match http_get(&parsed, quiet) {
-            Ok(response) => response,
-            Err(error) => {
-                eprintln!("wget: {}: {error}", parsed.host);
-                return 1;
-            }
-        };
-        if (300..400).contains(&response.status)
-            && let Some(location) = response.header("location")
-        {
-            url = if location.starts_with('/') {
-                alloc::format!("http://{}:{}{location}", parsed.host, parsed.port)
-            } else {
-                location
-            };
-            if !quiet {
-                eprintln!("redirected to {url}");
-            }
-            continue;
-        }
-        if response.status != 200 {
-            eprintln!("wget: server says {} {}", response.status, response.reason);
-            return 1;
-        }
-        let name = output.clone().unwrap_or_else(|| {
-            let last = parsed.path.rsplit('/').next().unwrap_or("");
-            if last.is_empty() { "index.html".into() } else { last.into() }
-        });
-        let result =
-            if name == "-" { io::write_all(io::STDOUT, &response.body) } else { fs::write(&name, &response.body) };
-        if let Err(error) = result {
-            eprintln!("wget: {name}: {error}");
-            return 1;
-        }
-        if !quiet && name != "-" {
-            eprintln!("saved {} bytes to {name}", response.body.len());
-        }
-        return 0;
-    }
-    eprintln!("wget: too many redirects");
-    1
-}
-
-struct Response {
-    status: u32,
-    reason: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-impl Response {
-    fn header(&self, name: &str) -> Option<String> {
-        self.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.clone())
-    }
-}
-
-fn http_get(url: &Url, quiet: bool) -> Result<Response, eli::Error> {
-    let address = net::resolve(&url.host)?;
     if !quiet {
-        eprintln!("connecting to {} ({address}:{})...", url.host, url.port);
+        eprintln!("downloading {url}");
     }
-    let stream = TcpStream::connect(SocketAddr::new(address, url.port))?;
-    // HTTP/1.0: the server closes the connection after the response, and
-    // never uses chunked encoding.
-    let request = alloc::format!(
-        "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: eliOS-wget\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-        url.path,
-        url.host
-    );
-    stream.write_all(request.as_bytes())?;
-    let data = stream.read_to_end()?;
-    let split = data.windows(4).position(|window| window == b"\r\n\r\n").ok_or(eli::Error::INVALID)?;
-    let head = String::from_utf8_lossy(&data[..split]);
-    let mut lines = head.lines();
-    let status_line = lines.next().unwrap_or("");
-    let mut parts = status_line.splitn(3, ' ');
-    let _version = parts.next();
-    let status = parts.next().and_then(|code| code.parse().ok()).ok_or(eli::Error::INVALID)?;
-    let reason = parts.next().unwrap_or("").into();
-    let headers = lines
-        .filter_map(|line| line.split_once(':'))
-        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
-        .collect();
-    Ok(Response { status, reason, headers, body: data[split + 4..].to_vec() })
+    let body = match http::get(&url, &mut |_, _| {}) {
+        Ok(body) => body,
+        Err(error) => {
+            eprintln!("wget: {error}");
+            return 1;
+        }
+    };
+    let name = output.unwrap_or_else(|| {
+        let path = url.split('?').next().unwrap_or("");
+        let last = path.trim_start_matches("http://").split_once('/').map_or("", |(_, path)| path);
+        let last = last.rsplit('/').next().unwrap_or("");
+        if last.is_empty() { "index.html".into() } else { last.into() }
+    });
+    let result = if name == "-" { io::write_all(io::STDOUT, &body) } else { fs::write(&name, &body) };
+    if let Err(error) = result {
+        eprintln!("wget: {name}: {error}");
+        return 1;
+    }
+    if !quiet && name != "-" {
+        eprintln!("saved {} bytes to {name}", body.len());
+    }
+    0
 }
 
 /// `nc host port`, or `nc -l port`: connects standard input and output to a

@@ -29,6 +29,7 @@ pub const SIGFPE: u32 = 8;
 pub const SIGKILL: u32 = 9;
 pub const SIGSEGV: u32 = 11;
 pub const SIGPIPE: u32 = 13;
+pub const SIGALRM: u32 = 14;
 #[cfg_attr(not(test), allow(dead_code, reason = "used by tests"))]
 pub const SIGTERM: u32 = 15;
 pub const SIGCHLD: u32 = 17;
@@ -61,11 +62,45 @@ pub struct SigAction {
     pub mask: u64,
 }
 
+/// What a handler (or `sigwaitinfo`) is told about a signal beyond its
+/// number: the `si_code`, and the two words after it in `siginfo_t` (for a
+/// timer: its id and overrun count, then the value it was created with).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SignalInfo {
+    pub code: i32,
+    pub fields: [u64; 2],
+}
+
+/// `si_code` for a signal from a POSIX timer.
+pub const SI_TIMER: i32 = -2;
+
+/// The details of pending signals that have any (a signal set has room for
+/// just one pending instance of each).
+#[derive(Clone, Default)]
+struct PendingInfo(Vec<(u32, SignalInfo)>);
+
+impl PendingInfo {
+    fn set(&mut self, signal: u32, info: SignalInfo) {
+        self.0.retain(|(other, _)| *other != signal);
+        if info != SignalInfo::default() {
+            self.0.push((signal, info));
+        }
+    }
+
+    fn take(&mut self, signal: u32) -> SignalInfo {
+        match self.0.iter().position(|(other, _)| *other == signal) {
+            Some(index) => self.0.remove(index).1,
+            None => SignalInfo::default(),
+        }
+    }
+}
+
 /// A process's signal state, shared by its threads.
 #[derive(Clone)]
 pub struct Signals {
     /// Signals sent to the process as a whole.
     pending: u64,
+    info: PendingInfo,
     pub actions: [SigAction; SIGNAL_COUNT],
 }
 
@@ -82,13 +117,14 @@ pub struct ThreadSignals {
     /// The mask to go back to after the next handler, set while
     /// `rt_sigsuspend` waits with a temporary one.
     saved_mask: Option<u64>,
+    info: PendingInfo,
 }
 
 impl ThreadSignals {
     /// The state of a forked child's thread: the same mask and alternate
     /// stack.
     pub fn for_child(&self) -> Self {
-        Self { pending: 0, fault_address: 0, saved_mask: None, ..self.clone() }
+        Self { pending: 0, fault_address: 0, saved_mask: None, info: PendingInfo::default(), ..self.clone() }
     }
 
     /// A new thread in the same process: only the mask carries over.
@@ -104,12 +140,16 @@ impl ThreadSignals {
 
 impl Signals {
     pub const fn new() -> Self {
-        Self { pending: 0, actions: [SigAction { handler: SIG_DFL, flags: 0, restorer: 0, mask: 0 }; SIGNAL_COUNT] }
+        Self {
+            pending: 0,
+            info: PendingInfo(Vec::new()),
+            actions: [SigAction { handler: SIG_DFL, flags: 0, restorer: 0, mask: 0 }; SIGNAL_COUNT],
+        }
     }
 
     /// The state a forked child starts with: everything but pending signals.
     pub fn for_child(&self) -> Self {
-        Self { pending: 0, ..self.clone() }
+        Self { pending: 0, info: PendingInfo::default(), ..self.clone() }
     }
 
     /// After `exec`: handlers point into the old program, so they go back to
@@ -157,6 +197,10 @@ fn valid(signal: u32) -> bool {
 /// Sends a signal to a process: marks it pending and wakes a thread that
 /// will act on it.
 pub fn send(process: &Process, signal: u32) {
+    send_with_info(process, signal, SignalInfo::default());
+}
+
+pub fn send_with_info(process: &Process, signal: u32, info: SignalInfo) {
     if !valid(signal) || process.status.lock().is_some() {
         return;
     }
@@ -166,7 +210,9 @@ pub fn send(process: &Process, signal: u32) {
             return;
         }
         signals.pending |= bit(signal);
+        signals.info.set(signal, info);
     }
+    SIGNAL_WAIT.wake_all();
     let threads = process.threads.lock().clone();
     let taker = threads.iter().find(|thread| thread.signals.lock().blocked & bit(signal) & !UNBLOCKABLE == 0);
     if let Some(thread) = taker {
@@ -176,14 +222,21 @@ pub fn send(process: &Process, signal: u32) {
 
 /// Sends a signal to one thread (`tgkill`).
 pub fn send_to_thread(thread: &UserThread, signal: u32) {
+    send_to_thread_with_info(thread, signal, SignalInfo::default());
+}
+
+pub fn send_to_thread_with_info(thread: &UserThread, signal: u32, info: SignalInfo) {
     if !valid(signal) || thread.process.signals.lock().ignored(signal) {
         return;
     }
     let wake = {
         let mut signals = thread.signals.lock();
         signals.pending |= bit(signal);
+        signals.info.set(signal, info);
         signals.blocked & bit(signal) & !UNBLOCKABLE == 0
     };
+    // A thread waiting in sigwaitinfo waits for blocked signals too.
+    SIGNAL_WAIT.wake_all();
     if wake {
         task::interrupt(thread.id);
     }
@@ -222,7 +275,7 @@ pub fn deliver(thread: &UserThread, frame: &mut InterruptFrame, syscall: Option<
         crate::arch::enable_interrupts();
         super::exit_thread(0);
     }
-    let (signal, action) = {
+    let (signal, action, info) = {
         let mut process = thread.process.signals.lock();
         let mut signals = thread.signals.lock();
         // Pending signals that are ignored by now are dropped.
@@ -238,12 +291,14 @@ pub fn deliver(thread: &UserThread, frame: &mut InterruptFrame, syscall: Option<
             return;
         }
         let signal = deliverable.trailing_zeros() + 1;
-        if signals.pending & bit(signal) != 0 {
+        let info = if signals.pending & bit(signal) != 0 {
             signals.pending &= !bit(signal);
+            signals.info.take(signal)
         } else {
             process.pending &= !bit(signal);
-        }
-        (signal, process.actions[signal as usize])
+            process.info.take(signal)
+        };
+        (signal, process.actions[signal as usize], info)
     };
 
     if action.handler == SIG_DFL || signal == SIGKILL {
@@ -254,6 +309,7 @@ pub fn deliver(thread: &UserThread, frame: &mut InterruptFrame, syscall: Option<
     if let Some(number) = syscall
         && frame.rax as i64 == -(Errno::EINTR as i64)
         && action.flags & SA_RESTART != 0
+        && !NEVER_RESTARTED.contains(&number)
     {
         // Back up over the `syscall` instruction (2 bytes) to run it again
         // once the handler returns.
@@ -261,12 +317,18 @@ pub fn deliver(thread: &UserThread, frame: &mut InterruptFrame, syscall: Option<
         frame.rip -= 2;
     }
 
-    if push_frame(thread, frame, signal, &action).is_err() {
+    if push_frame(thread, frame, signal, &action, info).is_err() {
         // No usable stack for the handler: nothing to do but end it.
         crate::arch::enable_interrupts();
         super::exit_group(super::signal_status(SIGSEGV));
     }
 }
+
+/// Calls Linux never restarts after a handler, `SA_RESTART` or not: waiting
+/// for a signal (pause, sigsuspend, sigtimedwait), sleeping, and waiting
+/// with a timeout (poll, select, epoll). They return `EINTR`, which is how
+/// the program learns the signal came.
+const NEVER_RESTARTED: [u64; 11] = [7, 23, 34, 35, 128, 130, 230, 232, 270, 271, 281];
 
 const UCONTEXT_SIZE: u64 = 304;
 const SIGINFO_SIZE: u64 = 128;
@@ -297,7 +359,13 @@ fn context_registers(frame: &InterruptFrame) -> [u64; 18] {
     ]
 }
 
-fn push_frame(thread: &UserThread, frame: &mut InterruptFrame, signal: u32, action: &SigAction) -> Result<()> {
+fn push_frame(
+    thread: &UserThread,
+    frame: &mut InterruptFrame,
+    signal: u32,
+    action: &SigAction,
+    info: SignalInfo,
+) -> Result<()> {
     let (blocked, alternate, fault_address) = {
         let mut signals = thread.signals.lock();
         // After rt_sigsuspend, the handler returns to the mask from before.
@@ -350,11 +418,9 @@ fn push_frame(thread: &UserThread, frame: &mut InterruptFrame, signal: u32, acti
     }
     // uc_sigmask: the mask to restore.
     push(blocked);
-    // siginfo: signo, errno, code; then the faulting address or sender.
-    push(u64::from(signal));
-    let code: u64 = if fault_address != 0 { 1 } else { 0 };
-    push(code);
-    push(fault_address);
+    // siginfo: signo, errno, code; then the faulting address, or what the
+    // sender said.
+    bytes.extend_from_slice(&siginfo(signal, info, fault_address));
     bytes.resize(frame_size as usize, 0);
     user::write_bytes(frame_address, &bytes)?;
 
@@ -452,6 +518,51 @@ pub fn set_mask(thread: &UserThread, how: u64, set: Option<u64>) -> Result<u64> 
 
 /// Where `pause` and `rt_sigsuspend` wait: nothing wakes it but signals.
 static SIGNAL_WAIT: task::WaitQueue = task::WaitQueue::new();
+
+/// The first 32 bytes of a `siginfo_t` (the rest is zeros).
+fn siginfo(signal: u32, info: SignalInfo, fault_address: u64) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[0..4].copy_from_slice(&signal.to_le_bytes());
+    if fault_address != 0 {
+        // SEGV_MAPERR and the address.
+        bytes[8..12].copy_from_slice(&1i32.to_le_bytes());
+        bytes[16..24].copy_from_slice(&fault_address.to_le_bytes());
+    } else {
+        bytes[8..12].copy_from_slice(&info.code.to_le_bytes());
+        bytes[16..24].copy_from_slice(&info.fields[0].to_le_bytes());
+        bytes[24..32].copy_from_slice(&info.fields[1].to_le_bytes());
+    }
+    bytes
+}
+
+/// `rt_sigtimedwait` (`sigwaitinfo`, `sigtimedwait`): waits until one of
+/// the signals in `set` is pending, takes it without running a handler, and
+/// returns it with its details. Blocked signals count (that's the usual
+/// way to use it). Gives up with `EAGAIN` at `deadline` (in timer ticks),
+/// or `EINTR` if another signal needs handling.
+pub fn wait_for(thread: &UserThread, set: u64, deadline: Option<u64>) -> Result<(u32, [u8; 32])> {
+    let set = set & !UNBLOCKABLE;
+    let taken = SIGNAL_WAIT.wait_until_deadline(deadline, || {
+        let mut process = thread.process.signals.lock();
+        let mut signals = thread.signals.lock();
+        let waiting = (signals.pending | process.pending) & set;
+        if waiting != 0 {
+            let signal = waiting.trailing_zeros() + 1;
+            let info = if signals.pending & bit(signal) != 0 {
+                signals.pending &= !bit(signal);
+                signals.info.take(signal)
+            } else {
+                process.pending &= !bit(signal);
+                process.info.take(signal)
+            };
+            return Some(Ok((signal, siginfo(signal, info, 0))));
+        }
+        drop(signals);
+        drop(process);
+        pending().then_some(Err(Errno::EINTR))
+    });
+    taken.unwrap_or(Err(Errno::EAGAIN))
+}
 
 /// `pause`: waits for a signal. Always returns `EINTR`.
 pub fn pause() -> Result<u64> {

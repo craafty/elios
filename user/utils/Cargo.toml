@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# Alpine's package format, for the package manager (eliOS's own code).
+apk = { path = "../../apk" }
 eli = { path = "../eli" }
 # eliOS's own file system code, shared with the kernel (for mkfs and the
 # installer).

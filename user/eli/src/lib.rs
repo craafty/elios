@@ -25,6 +25,7 @@ pub mod crypt;
 pub mod env;
 pub mod fs;
 mod heap;
+pub mod http;
 pub mod io;
 pub mod net;
 pub mod process;

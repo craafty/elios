@@ -251,6 +251,20 @@ pub fn has_empty_password(name: &str) -> bool {
 /// to it, given the same owner and permissions, then renamed over it. Anyone
 /// reading it sees the old or the new file, never half of one.
 fn replace_file(path: &str, lines: &[String], permissions: u32) -> Result<()> {
+    // Through symbolic links: on eliOS, /etc/shadow is a link to the data
+    // partition, and that's the file to replace.
+    let mut path = String::from(path);
+    for _ in 0..8 {
+        match fs::read_link(&path) {
+            Ok(target) if target.starts_with('/') => path = target,
+            Ok(target) => {
+                let directory = path.rsplit_once('/').map_or("", |(directory, _)| directory).to_string();
+                path = alloc::format!("{directory}/{target}");
+            }
+            Err(_) => break,
+        }
+    }
+    let path = path.as_str();
     let temporary = alloc::format!("{path}+");
     let mut text = lines.join("\n");
     text.push('\n');

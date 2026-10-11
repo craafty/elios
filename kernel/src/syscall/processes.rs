@@ -6,7 +6,7 @@ use crate::errno::{Errno, Result};
 use crate::fs::{self, FileKind};
 use crate::memory::PAGE_SIZE;
 use crate::process::{self, CloneArgs, PROT_EXEC, PROT_READ, PROT_WRITE, Pid, SIGKILL, SigAction, USER_END};
-use crate::process::{credentials, futex, signal, user};
+use crate::process::{credentials, futex, signal, timers, user};
 use crate::{task, time};
 
 pub fn fork(frame: &InterruptFrame) -> Result<u64> {
@@ -527,4 +527,142 @@ pub fn setgroups(size: u64, list: u64) -> Result<u64> {
 /// `umask`: sets the mask, returning the old one.
 pub fn umask(mask: u64) -> Result<u64> {
     Ok(u64::from(process::current().set_umask(mask as u32)))
+}
+
+const SIGEV_SIGNAL: u32 = 0;
+const SIGEV_NONE: u32 = 1;
+const SIGEV_THREAD_ID: u32 = 4;
+const NANOS: u64 = 1_000_000_000;
+
+/// The clocks timers can use; all count the same way here.
+fn timer_clock(clock: u64) -> Result<()> {
+    match clock as i32 {
+        0 | 1 | 4..=9 => Ok(()),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn read_timespec(address: u64) -> Result<u64> {
+    let [seconds, nanoseconds]: [i64; 2] = user::read_value(address)?;
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
+        return Err(Errno::EINVAL);
+    }
+    Ok((seconds as u64).saturating_mul(NANOS).saturating_add(nanoseconds as u64))
+}
+
+fn timespec(nanoseconds: u64) -> [u64; 2] {
+    [nanoseconds / NANOS, nanoseconds % NANOS]
+}
+
+/// `timer_create(clock, event, id)`. Without an event, the timer sends
+/// SIGALRM.
+pub fn timer_create(clock: u64, event: u64, id_address: u64) -> Result<u64> {
+    timer_clock(clock)?;
+    let pid = process::current().pid;
+    let (signal, notify, value) = if event == 0 {
+        (signal::SIGALRM, timers::Notify::Signal, None)
+    } else {
+        // struct sigevent: value, signal, notify, then the thread id.
+        let [value, words, tid]: [u64; 3] = user::read_value(event)?;
+        let (signal, kind) = (words as u32, (words >> 32) as u32);
+        let notify = match kind {
+            SIGEV_SIGNAL => timers::Notify::Signal,
+            SIGEV_NONE => timers::Notify::None,
+            SIGEV_THREAD_ID => timers::Notify::Thread(tid as u32),
+            _ => return Err(Errno::EINVAL),
+        };
+        (signal, notify, Some(value))
+    };
+    let id = timers::create(pid, signal, notify, value)?;
+    user::write_value(id_address, &id)?;
+    Ok(0)
+}
+
+/// `timer_settime(id, flags, new, old)`: itimerspecs (interval, value).
+pub fn timer_settime(id: u64, flags: u64, new: u64, old: u64) -> Result<u64> {
+    let pid = process::current().pid;
+    let interval = read_timespec(new)?;
+    let mut value = read_timespec(new + 16)?;
+    if flags & TIMER_ABSTIME != 0 && value != 0 {
+        // An absolute time on the clock: how long from now.
+        value = value.saturating_sub(time::unix_nanos()).max(1);
+    }
+    let (left, old_interval) = timers::set(pid, id as i32, value, interval)?;
+    if old != 0 {
+        user::write_value(old, &[timespec(old_interval), timespec(left)])?;
+    }
+    Ok(0)
+}
+
+pub fn timer_gettime(id: u64, current: u64) -> Result<u64> {
+    let (left, interval) = timers::get(process::current().pid, id as i32)?;
+    user::write_value(current, &[timespec(interval), timespec(left)])?;
+    Ok(0)
+}
+
+pub fn timer_getoverrun(id: u64) -> Result<u64> {
+    timers::overrun(process::current().pid, id as i32).map(u64::from)
+}
+
+pub fn timer_delete(id: u64) -> Result<u64> {
+    timers::delete(process::current().pid, id as i32).map(|_| 0)
+}
+
+const ITIMER_REAL: u64 = 0;
+
+fn read_timeval(address: u64) -> Result<u64> {
+    let [seconds, microseconds]: [i64; 2] = user::read_value(address)?;
+    if seconds < 0 || !(0..1_000_000).contains(&microseconds) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(seconds as u64 * NANOS + microseconds as u64 * 1000)
+}
+
+fn timeval(nanoseconds: u64) -> [u64; 2] {
+    [nanoseconds / NANOS, nanoseconds % NANOS / 1000]
+}
+
+/// `setitimer(which, new, old)`: only the real-time timer (SIGALRM).
+pub fn setitimer(which: u64, new: u64, old: u64) -> Result<u64> {
+    if which != ITIMER_REAL {
+        return Err(Errno::EINVAL);
+    }
+    let (interval, value) = (read_timeval(new)?, read_timeval(new + 16)?);
+    let (left, old_interval) = timers::set(process::current().pid, timers::INTERVAL_TIMER, value, interval)?;
+    if old != 0 {
+        user::write_value(old, &[timeval(old_interval), timeval(left)])?;
+    }
+    Ok(0)
+}
+
+pub fn getitimer(which: u64, current: u64) -> Result<u64> {
+    if which != ITIMER_REAL {
+        return Err(Errno::EINVAL);
+    }
+    let (left, interval) = timers::get(process::current().pid, timers::INTERVAL_TIMER)?;
+    user::write_value(current, &[timeval(interval), timeval(left)])?;
+    Ok(0)
+}
+
+/// `alarm(seconds)`: SIGALRM after that long (0 cancels). Returns the
+/// seconds that were left on the previous alarm.
+pub fn alarm(seconds: u64) -> Result<u64> {
+    let (left, _) = timers::set(process::current().pid, timers::INTERVAL_TIMER, seconds * NANOS, 0)?;
+    Ok(left.div_ceil(NANOS))
+}
+
+/// `rt_sigtimedwait(set, info, timeout, size)`.
+pub fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> Result<u64> {
+    if size != 8 {
+        return Err(Errno::EINVAL);
+    }
+    let set: u64 = user::read_value(set)?;
+    let deadline = if timeout == 0 { None } else { Some(time::ticks() + read_timespec(timeout)?.div_ceil(1_000_000)) };
+    let (signal, details) = signal::wait_for(&process::current_thread(), set, deadline)?;
+    if info != 0 {
+        let mut whole = [0u8; 128];
+        whole[..32].copy_from_slice(&details);
+        user::write_value(info, &whole)?;
+    }
+    Ok(u64::from(signal))
 }

@@ -1,8 +1,13 @@
 //! The kernel command line: `name=value` options (and bare words) from
 //! `\EFI\eliOS\cmdline.txt`, which eliboot passes on.
 //!
-//! - `root=PARTUUID=<guid>`: mount that ext2 partition as the root (an
-//!   installed system); without it, the root is the initrd (the live system).
+//! - `data=PARTUUID=<guid>`: mount that ext2 partition at /data, where an
+//!   installed system keeps everything that lasts (the system itself is
+//!   the initrd, fresh at every boot).
+//! - `root=PARTUUID=<guid>`: mount that ext2 partition as the root instead
+//!   of the initrd (the first installer's layout).
+//! - `generation=N`: which system generation to start (eliboot's menu adds
+//!   it; `eli` reads it from /proc/cmdline).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -10,8 +15,15 @@ use alloc::vec::Vec;
 use crate::sync::Once;
 
 static OPTIONS: Once<Vec<(String, String)>> = Once::new();
+static LINE: Once<String> = Once::new();
+
+/// The whole line, for /proc/cmdline.
+pub fn line() -> &'static str {
+    LINE.get().map_or("", String::as_str)
+}
 
 pub fn init(line: &str) {
+    let _ = LINE.set(String::from(line));
     let options = line
         .split_whitespace()
         .map(|word| match word.split_once('=') {

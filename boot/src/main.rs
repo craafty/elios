@@ -13,6 +13,7 @@ mod cpu;
 mod elf;
 mod fs;
 mod memory;
+mod menu;
 mod paging;
 mod platform;
 mod uefi;
@@ -102,6 +103,17 @@ fn boot(image: Handle) -> Result<Infallible, Error> {
         command_line_len = text.len().min(command_line.len());
         command_line[..command_line_len].copy_from_slice(&text.as_bytes()[..command_line_len]);
         println!("options:     {}", &text[..command_line_len]);
+    }
+    if let Some(generation) = menu::choose_generation(image) {
+        // Appended to the command line, for `eli` to find.
+        let mut option = [0u8; 24];
+        let mut writer = Buffer { bytes: &mut option, len: 0 };
+        let _ = core::fmt::Write::write_fmt(&mut writer, format_args!(" generation={generation}"));
+        let len = writer.len;
+        let start = command_line_len.min(command_line.len() - len);
+        command_line[start..start + len].copy_from_slice(&option[..len]);
+        command_line_len = start + len;
+        println!("starting generation {generation}");
     }
     let boot_partition = fs::boot_partition(image).unwrap_or([0; 16]);
     let runtime_services = uefi::system_table().map_or(0, |table| table.runtime_services as u64);
@@ -230,6 +242,24 @@ fn load_kernel(file: &[u8], page_tables: &mut PageTables) -> Result<u64, Error> 
         return Err(Error::new("kernel has nothing to load"));
     }
     Ok(elf.entry)
+}
+
+/// Formats into a fixed buffer (eliboot has no allocator).
+struct Buffer<'a> {
+    bytes: &'a mut [u8],
+    len: usize,
+}
+
+impl core::fmt::Write for Buffer<'_> {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let end = self.len + text.len();
+        if end > self.bytes.len() {
+            return Err(core::fmt::Error);
+        }
+        self.bytes[self.len..end].copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
 }
 
 #[panic_handler]

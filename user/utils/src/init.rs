@@ -14,6 +14,7 @@ use eli::{env, eprintln, fs, time};
 
 const SHELL: &str = "/bin/sh";
 const LOGIN: &str = "/bin/login";
+const ELI: &str = "/bin/eli";
 
 pub fn main() -> i32 {
     if process::id() != 1 {
@@ -25,6 +26,11 @@ pub fn main() -> i32 {
         process::ignore_signal(signal);
     }
 
+    // The system as /etc/system.conf describes it: accounts, hostname,
+    // packages (see the `eli` command).
+    if let Ok(pid) = spawn(ELI, &["eli".into(), "boot".into()]) {
+        wait_for(pid);
+    }
     if fs::exists("/etc/rc")
         && let Ok(pid) = spawn(SHELL, &[SHELL.into(), "/etc/rc".into()])
     {

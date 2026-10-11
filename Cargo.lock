@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "apk"
+version = "0.1.0"
+
+[[package]]
 name = "bootinfo"
 version = "0.1.0"
 
@@ -30,6 +34,7 @@ dependencies = [
 name = "eliutils"
 version = "0.1.0"
 dependencies = [
+ "apk",
  "eli",
  "ext2",
  "fat",

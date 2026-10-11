@@ -11,6 +11,7 @@ pub mod credentials;
 pub mod elf;
 pub mod futex;
 pub mod signal;
+pub mod timers;
 pub mod user;
 
 use alloc::collections::BTreeMap;
@@ -465,6 +466,7 @@ pub fn exec(frame: &mut InterruptFrame, path: &str, arguments: Vec<String>, envi
         *process.credentials.lock() = Arc::new(image.credentials);
     }
     process.files.lock().exec();
+    timers::process_executed(process.pid);
     process.signals.lock().exec();
     thread.signals.lock().exec();
     let name = base_name(&image.path).to_string();
@@ -568,6 +570,7 @@ pub fn exit_thread(status: i32) -> ! {
 /// Releases a process whose threads have all exited, and makes it a zombie
 /// for its parent to collect.
 fn end_process(process: &Process, status: i32) {
+    timers::process_ended(process.pid);
     process.files.lock().close_all();
     let space = process.space.lock().take();
     drop(space);
@@ -875,7 +878,7 @@ mod tests {
 
         fn linux_c_programs_pass_their_self_tests() {
             // Built by the host's C compiler, if there was one.
-            for program in ["ctest", "sigtest", "threadtest", "nettest", "permtest", "hello-c", "hello-dynamic"] {
+            for program in ["ctest", "sigtest", "threadtest", "nettest", "permtest", "timertest", "hello-c", "hello-dynamic"] {
                 let path = alloc::format!("/usr/bin/{program}");
                 if fs::lookup("/", &path, true).is_err() {
                     continue;

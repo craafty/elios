@@ -24,8 +24,8 @@ pub type Guid = [u8; 16];
 
 /// The type of an EFI System Partition.
 pub const ESP_TYPE: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
-/// The type of an eliOS root partition (eliOS's own).
-pub const ELIOS_ROOT_TYPE: &str = "E1105A00-7E1D-4F0C-8C5B-30E1105A0002";
+/// The type of an eliOS data partition (eliOS's own).
+pub const ELIOS_DATA_TYPE: &str = "E1105A00-7E1D-4F0C-8C5B-30E1105A0003";
 
 /// A GUID in GPT's (mixed-endian) byte order, from its text form.
 pub fn guid(text: &str) -> Guid {

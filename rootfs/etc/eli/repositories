@@ -1,0 +1,5 @@
+# Where eli gets packages: Alpine Linux's repositories (plain HTTP is safe:
+# every package is checked against Alpine's signatures). A `repositories`
+# line in /etc/system.conf replaces these.
+http://dl-cdn.alpinelinux.org/alpine/v3.24/main
+http://dl-cdn.alpinelinux.org/alpine/v3.24/community

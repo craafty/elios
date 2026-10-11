@@ -127,6 +127,7 @@ pub fn create() -> Arc<dyn Inode> {
             ("filesystems".into(), generated(filesystems)),
             ("mounts".into(), generated(mounts)),
             ("partitions".into(), generated(partitions)),
+            ("cmdline".into(), generated(|| format!("{}\n", crate::cmdline::line()))),
             ("net".into(), net_directory()),
         ];
         for info in process::list() {

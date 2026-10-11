@@ -16,6 +16,7 @@ mod editor;
 mod gpt;
 mod init;
 mod installer;
+mod manager;
 mod network;
 mod shell;
 mod storage;
@@ -49,6 +50,7 @@ fn run(name: &str, arguments: &[String]) -> i32 {
         "init" => init::main(),
         "edit" => edit::main(arguments),
         "installer" => installer::main(arguments),
+        "eli" => manager::main(arguments),
         _ => match commands::find(name) {
             Some(command) => command(arguments),
             None => {

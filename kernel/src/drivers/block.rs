@@ -62,8 +62,8 @@ pub fn disks() -> Vec<Arc<dyn Disk>> {
 pub enum PartitionKind {
     /// An EFI System Partition (FAT).
     EfiSystem,
-    /// eliOS's root file system (ext2).
-    EliosRoot,
+    /// eliOS's own: a data partition (or, from the first installer, a root).
+    Elios,
     /// Another partition an MBR marks as FAT32.
     Fat32,
     Other,
@@ -126,8 +126,11 @@ impl Partition {
 /// GPT's type GUID for EFI System Partitions, in its on-disk byte order.
 const ESP_TYPE: [u8; 16] =
     [0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B];
-/// eliOS's own type GUID for its root partition,
-/// E1105A00-7E1D-4F0C-8C5B-30E1105A0002, in on-disk byte order.
+/// eliOS's own type GUIDs for its data partition,
+/// E1105A00-7E1D-4F0C-8C5B-30E1105A0003, and the first installer's root
+/// partition (…0002), in on-disk byte order.
+pub const ELIOS_DATA_TYPE: [u8; 16] =
+    [0x00, 0x5A, 0x10, 0xE1, 0x1D, 0x7E, 0x0C, 0x4F, 0x8C, 0x5B, 0x30, 0xE1, 0x10, 0x5A, 0x00, 0x03];
 pub const ELIOS_ROOT_TYPE: [u8; 16] =
     [0x00, 0x5A, 0x10, 0xE1, 0x1D, 0x7E, 0x0C, 0x4F, 0x8C, 0x5B, 0x30, 0xE1, 0x10, 0x5A, 0x00, 0x02];
 
@@ -164,7 +167,7 @@ pub fn partitions(disk: &Arc<dyn Disk>) -> Vec<Partition> {
                 }
                 let kind = match entry[..16].try_into().unwrap() {
                     ESP_TYPE => PartitionKind::EfiSystem,
-                    ELIOS_ROOT_TYPE => PartitionKind::EliosRoot,
+                    ELIOS_DATA_TYPE | ELIOS_ROOT_TYPE => PartitionKind::Elios,
                     _ => PartitionKind::Other,
                 };
                 Some(Partition {

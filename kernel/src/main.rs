@@ -158,6 +158,7 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
         memory::frames::reclaim(start, start + initrd.len() as u64);
     }
     fs::mount::mount_system(disk_root);
+    mount_data_partition();
     mount_boot_partition(boot_info.boot_partition());
     // In case DHCP finished before there was a root to write to.
     net::write_dns_settings();
@@ -197,37 +198,58 @@ const ROOT_WAIT_MS: u64 = 10_000;
 /// the initrd unpacked into memory (the live system). Returns whether the
 /// root is on a disk.
 fn mount_root(initrd: Option<&[u8]>) -> bool {
-    use drivers::block;
-    if let Some(guid) = cmdline::get("root").and_then(|root| root.strip_prefix("PARTUUID=")) {
-        match block::parse_guid(guid) {
-            Some(guid) => {
-                let deadline = time::uptime_nanos() + ROOT_WAIT_MS * 1_000_000;
-                let mut partition = block::find_partition(&guid);
-                while partition.is_none() && time::uptime_nanos() < deadline {
-                    task::sleep_ms(100);
-                    partition = block::find_partition(&guid);
+    if cmdline::get("root").is_some() {
+        if let Some(partition) = find_named_partition("root") {
+            let source = alloc::format!("/dev/{}", partition.name());
+            match fs::ext2fs::mount(partition, source.clone(), false) {
+                Ok(request) => {
+                    fs::mount::init_disk_root(request);
+                    info!("fs: root is {source} (ext2)");
+                    return true;
                 }
-                match partition {
-                    Some(partition) => {
-                        let source = alloc::format!("/dev/{}", partition.name());
-                        match fs::ext2fs::mount(partition, source.clone(), false) {
-                            Ok(request) => {
-                                fs::mount::init_disk_root(request);
-                                info!("fs: root is {source} (ext2)");
-                                return true;
-                            }
-                            Err(error) => error!("fs: can't mount the root {source}: {error:?}"),
-                        }
-                    }
-                    None => error!("fs: the root partition {guid:x?} wasn't found"),
-                }
+                Err(error) => error!("fs: can't mount the root {source}: {error:?}"),
             }
-            None => error!("fs: can't understand root={guid}"),
         }
         warn!("fs: starting the live system from the initrd instead");
     }
     fs::mount::init_memory_root(initrd);
     false
+}
+
+/// Finds the partition `PARTUUID=<guid>` on the command line names (for
+/// `root=` and `data=`), waiting a while for its disk (USB disks are found
+/// a little after boot).
+fn find_named_partition(option: &str) -> Option<drivers::block::Partition> {
+    use drivers::block;
+    let guid = cmdline::get(option)?.strip_prefix("PARTUUID=")?;
+    let Some(guid) = block::parse_guid(guid) else {
+        error!("fs: can't understand {option}={guid}");
+        return None;
+    };
+    let deadline = time::uptime_nanos() + ROOT_WAIT_MS * 1_000_000;
+    loop {
+        if let Some(partition) = block::find_partition(&guid) {
+            return Some(partition);
+        }
+        if time::uptime_nanos() >= deadline {
+            error!("fs: the {option} partition {} wasn't found", block::guid_text(&guid));
+            return None;
+        }
+        task::sleep_ms(100);
+    }
+}
+
+/// Mounts the data partition (`data=PARTUUID=...`) at /data: an installed
+/// system's homes, packages, configuration and generations.
+fn mount_data_partition() {
+    let Some(partition) = find_named_partition("data") else { return };
+    let source = alloc::format!("/dev/{}", partition.name());
+    let result =
+        fs::ext2fs::mount(partition, source.clone(), false).and_then(|request| fs::mount::mount("/data", request));
+    match result {
+        Ok(()) => info!("fs: {source} (data) mounted at /data"),
+        Err(error) => error!("fs: can't mount the data partition {source}: {error:?}"),
+    }
 }
 
 /// Mounts the partition eliboot was loaded from at /disk: there, the boot

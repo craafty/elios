@@ -116,7 +116,7 @@ pub struct SystemTable {
     pub firmware_vendor: *const u16,
     pub firmware_revision: u32,
     pub console_in_handle: Handle,
-    pub con_in: *mut c_void,
+    pub con_in: *mut SimpleTextInput,
     pub console_out_handle: Handle,
     pub con_out: *mut SimpleTextOutput,
     pub standard_error_handle: Handle,
@@ -138,6 +138,23 @@ impl SystemTable {
 pub struct ConfigurationTable {
     pub vendor_guid: Guid,
     pub vendor_table: *mut c_void,
+}
+
+/// The firmware's keyboard input.
+#[repr(C)]
+pub struct SimpleTextInput {
+    pub reset: unsafe extern "efiapi" fn(*mut Self, bool) -> Status,
+    pub read_key_stroke: unsafe extern "efiapi" fn(*mut Self, *mut InputKey) -> Status,
+    wait_for_key: usize,
+}
+
+/// A key: a scan code for special keys (1 up, 2 down, 0x17 escape), or a
+/// character.
+#[repr(C)]
+#[derive(Default)]
+pub struct InputKey {
+    pub scan_code: u16,
+    pub unicode_char: u16,
 }
 
 #[repr(C)]

@@ -67,6 +67,7 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("mkfs", "make an empty file system (ext2 or FAT)"),
     ("sync", "write everything waiting to the disks"),
     ("installer", "install eliOS onto a disk in this computer"),
+    ("eli", "the system manager: packages, system.conf, generations"),
 ];
 
 /// The commands of eliauth, the separate setuid-root program: links to

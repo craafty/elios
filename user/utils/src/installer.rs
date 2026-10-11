@@ -2,9 +2,13 @@
 //! USB stick (or live disk) it's running from.
 //!
 //! An installed system is two partitions: an EFI System Partition (FAT32)
-//! with eliboot, the kernel and the initrd, and an ext2 root partition
-//! holding the system's files, which the kernel finds through
-//! `root=PARTUUID=...` in `\EFI\eliOS\cmdline.txt`. Two ways to get there:
+//! with eliboot, the kernel and the system image (the initrd), and an ext2
+//! *data* partition with everything that's yours: /etc/system.conf, the
+//! passwords, homes, installed packages and the system's generations. The
+//! kernel finds it through `data=PARTUUID=...` in `\EFI\eliOS\cmdline.txt`.
+//! The system itself isn't copied anywhere: it starts fresh from the image
+//! at every boot, exactly as the live system does, so it can't drift or
+//! break. Two ways to get there:
 //!
 //! - **Erase the disk**: a new partition table with both partitions.
 //!   eliboot also goes in the firmware's fallback place
@@ -17,10 +21,9 @@
 //! Either way, a firmware boot entry named "eliOS" is added (through
 //! /sys/firmware/efi/efivars) and put first in the boot order.
 //!
-//! The system files come from the initrd on the boot partition (/disk): a
-//! pristine copy, not the running system with whatever was changed in it.
 //! The first account is set up as an administrator (it can use sudo); root
-//! gets no password, so it can't be logged into directly.
+//! gets no password, so it can't be logged into directly. Packages added to
+//! the live system come along.
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -36,9 +39,9 @@ use crate::storage::{self, Device, DiskInfo};
 
 const BOOT_FILES: &str = "/disk/EFI";
 const ESP_LABEL: &str = "EFI";
-const ROOT_LABEL: &str = "eliOS";
-/// The smallest root partition worth installing to.
-const MIN_ROOT_SECTORS: u64 = 512 * 2048;
+const DATA_LABEL: &str = "eliOS data";
+/// The smallest data partition worth installing to.
+const MIN_DATA_SECTORS: u64 = 512 * 2048;
 /// UEFI's global variables (boot entries).
 const GLOBAL_VARIABLES: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
 const EFIVARS: &str = "/sys/firmware/efi/efivars";
@@ -190,11 +193,11 @@ fn make_plan(arguments: &[String]) -> Result<Option<Plan>, String> {
     if fs::mounts().iter().any(|mount| mount.source.starts_with(&format!("/dev/{}", disk.name))) {
         return Err(format!("{} is in use (mounted); unmount it first", disk.name));
     }
-    if disk.sectors < MIN_ROOT_SECTORS + 300 * 2048 {
+    if disk.sectors < MIN_DATA_SECTORS + 300 * 2048 {
         return Err(format!("{} is too small for eliOS (it needs at least 800 MiB)", disk.name));
     }
 
-    let alongside = space_alongside(&disk).filter(|(first, last)| last - first + 1 >= MIN_ROOT_SECTORS);
+    let alongside = space_alongside(&disk).filter(|(first, last)| last - first + 1 >= MIN_DATA_SECTORS);
     let erase = if options.contains_key("--erase") {
         true
     } else if options.contains_key("--alongside") {
@@ -289,11 +292,11 @@ fn step(number: u32, text: &str) {
     println!("[{number}/6] {text}");
 }
 
-/// Where the new system goes: (EFI System Partition, root partition), each
+/// Where the new system goes: (EFI System Partition, data partition), each
 /// as (number, entry).
 struct Layout {
     esp: (u32, Entry),
-    root: (u32, Entry),
+    data: (u32, Entry),
 }
 
 fn install(plan: &Plan, files: &BootFiles) -> Result<(), String> {
@@ -308,28 +311,31 @@ fn install(plan: &Plan, files: &BootFiles) -> Result<(), String> {
     }
     let slice = |entry: &Entry| Device::slice(&disk_path, entry.first, entry.sectors());
     let mut esp = slice(&layout.esp.1).map_err(|e| e.to_string())?;
-    let mut root = slice(&layout.root.1).map_err(|e| e.to_string())?;
+    let mut data = slice(&layout.data.1).map_err(|e| e.to_string())?;
 
     step(2, "Formatting");
     if plan.erase {
         storage::format(&mut esp, "fat", ESP_LABEL).map_err(|e| format!("formatting the boot partition: {e}"))?;
     }
-    storage::format(&mut root, "ext2", ROOT_LABEL).map_err(|e| format!("formatting the root partition: {e}"))?;
+    storage::format(&mut data, "ext2", DATA_LABEL).map_err(|e| format!("formatting the data partition: {e}"))?;
 
-    step(3, "Copying the system");
+    step(3, "Setting up your account and settings");
     let mut volume =
-        ext2::FileSystem::mount(root, time::unix_time, false).map_err(|e| format!("the new root: {e:?}"))?;
-    let count = unpack(&mut volume, &files.initrd).map_err(|e| format!("copying the system: {e}"))?;
-    println!("      {count} files");
+        ext2::FileSystem::mount(data, time::unix_time, false).map_err(|e| format!("the data partition: {e:?}"))?;
+    let packages = set_up_data(&mut volume, plan).map_err(|e| format!("setting up: {e}"))?;
 
-    step(4, "Setting up your account");
-    set_up_accounts(&mut volume, plan).map_err(|e| format!("setting up the account: {e}"))?;
-    volume.unmount().map_err(|e| format!("finishing the root partition: {e:?}"))?;
+    step(4, "Copying packages added to the live system");
+    for id in &packages {
+        let pkg = find(&mut volume, "/pkg")?;
+        copy_into(&mut volume, &format!("/data/pkg/{id}"), pkg, id).map_err(|e| format!("copying {id}: {e}"))?;
+    }
+    println!("      {}", if packages.is_empty() { "none".to_string() } else { packages.join(", ") });
+    volume.unmount().map_err(|e| format!("finishing the data partition: {e:?}"))?;
     drop(volume);
 
     step(5, "Installing the boot loader");
-    let root_guid = gpt::guid_text(&layout.root.1.guid);
-    write_boot_partition(&mut esp, files, &root_guid, plan.erase).map_err(|e| format!("the boot partition: {e}"))?;
+    let data_guid = gpt::guid_text(&layout.data.1.guid);
+    write_boot_partition(&mut esp, files, &data_guid, plan.erase).map_err(|e| format!("the boot partition: {e}"))?;
     fs::sync();
 
     step(6, "Adding a boot entry to the firmware");
@@ -351,13 +357,13 @@ fn install(plan: &Plan, files: &BootFiles) -> Result<(), String> {
 /// Makes or extends the partition table.
 fn partition(plan: &Plan, disk: &Device) -> eli::Result<Layout> {
     let sectors = disk.sectors();
-    let root_entry = |first: u64, last: u64| Entry {
-        type_guid: gpt::guid(gpt::ELIOS_ROOT_TYPE),
+    let data_entry = |first: u64, last: u64| Entry {
+        type_guid: gpt::guid(gpt::ELIOS_DATA_TYPE),
         guid: gpt::random_guid(),
         first,
         last,
         attributes: 0,
-        name: "eliOS".into(),
+        name: "eliOS data".into(),
     };
     if plan.erase {
         // Clear what was at both ends (old tables, old file systems'
@@ -375,11 +381,11 @@ fn partition(plan: &Plan, disk: &Device) -> eli::Result<Layout> {
             attributes: 0,
             name: "EFI System".into(),
         };
-        let root = root_entry(esp.last + 1, table.last_usable);
+        let data = data_entry(esp.last + 1, table.last_usable);
         let esp_number = table.add(esp.clone()).ok_or(eli::Error::INVALID)?;
-        let root_number = table.add(root.clone()).ok_or(eli::Error::INVALID)?;
+        let data_number = table.add(data.clone()).ok_or(eli::Error::INVALID)?;
         table.write(disk, true)?;
-        return Ok(Layout { esp: (esp_number, esp), root: (root_number, root) });
+        return Ok(Layout { esp: (esp_number, esp), data: (data_number, data) });
     }
     let mut table = Table::read(disk).ok_or(eli::Error::INVALID)?;
     let esp = table
@@ -390,116 +396,13 @@ fn partition(plan: &Plan, disk: &Device) -> eli::Result<Layout> {
         .ok_or(eli::Error::NOT_FOUND)?;
     let (first, last) =
         table.free_space().into_iter().max_by_key(|(first, last)| last - first).ok_or(eli::Error::INVALID)?;
-    let root = root_entry(first, last);
-    let root_number = table.add(root.clone()).ok_or(eli::Error::INVALID)?;
+    let data = data_entry(first, last);
+    let data_number = table.add(data.clone()).ok_or(eli::Error::INVALID)?;
     table.write(disk, false)?;
-    Ok(Layout { esp, root: (root_number, root) })
+    Ok(Layout { esp, data: (data_number, data) })
 }
 
-/// One file of a cpio ("newc") archive.
-struct ArchiveEntry<'a> {
-    path: &'a str,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    modified: u32,
-    data: &'a [u8],
-}
-
-/// The entries of a cpio archive (the initrd), in order.
-fn archive_entries(archive: &[u8]) -> Result<Vec<ArchiveEntry<'_>>, String> {
-    let mut entries = Vec::new();
-    let mut offset = 0;
-    loop {
-        let header = archive.get(offset..offset + 110).ok_or("the initrd is cut short")?;
-        if &header[..6] != b"070701" {
-            return Err("the initrd is damaged".into());
-        }
-        let field = |index: usize| -> Result<usize, String> {
-            let text = core::str::from_utf8(&header[6 + index * 8..14 + index * 8]).map_err(|e| e.to_string())?;
-            usize::from_str_radix(text, 16).map_err(|e| e.to_string())
-        };
-        let (mode, uid, gid, modified, size, name_size) =
-            (field(1)?, field(2)?, field(3)?, field(5)?, field(6)?, field(11)?);
-        let name_at = offset + 110;
-        let name = archive.get(name_at..name_at + name_size - 1).ok_or("the initrd is cut short")?;
-        let name = core::str::from_utf8(name).map_err(|_| "a file name in the initrd isn't UTF-8")?;
-        let data_at = (name_at + name_size).next_multiple_of(4);
-        let data = archive.get(data_at..data_at + size).ok_or("the initrd is cut short")?;
-        offset = (data_at + size).next_multiple_of(4);
-        if name == "TRAILER!!!" {
-            return Ok(entries);
-        }
-        entries.push(ArchiveEntry {
-            path: name.trim_start_matches("./"),
-            mode: mode as u32,
-            uid: uid as u32,
-            gid: gid as u32,
-            modified: modified as u32,
-            data,
-        });
-    }
-}
-
-/// Copies the initrd's files into the new root. Returns how many.
-fn unpack(volume: &mut ext2::FileSystem<Device>, initrd: &[u8]) -> Result<usize, String> {
-    let mut directories: BTreeMap<String, u32> = BTreeMap::new();
-    directories.insert(String::new(), ext2::ROOT);
-    let mut count = 0;
-    for entry in archive_entries(initrd)? {
-        if entry.path.is_empty() || entry.path == "." || entry.path == "etc/autologin" {
-            continue;
-        }
-        let (parent, name) = entry.path.rsplit_once('/').unwrap_or(("", entry.path));
-        let parent = *directories.get(parent).ok_or(format!("{}: its directory comes later", entry.path))?;
-        let owner = ext2::Owner { uid: entry.uid, gid: entry.gid };
-        let permissions = (entry.mode & 0o7777) as u16;
-        let problem = |e: ext2::Error| format!("{}: {e:?}", entry.path);
-        let number = match entry.mode & 0o170000 {
-            0o040000 => {
-                let number =
-                    volume.create(parent, name, ext2::FileType::Directory, permissions, owner).map_err(problem)?;
-                directories.insert(entry.path.to_string(), number);
-                number
-            }
-            0o120000 => {
-                let target = core::str::from_utf8(entry.data).map_err(|_| format!("{}: bad link", entry.path))?;
-                volume.symlink(parent, name, target, owner).map_err(problem)?
-            }
-            0o100000 => {
-                let number =
-                    volume.create(parent, name, ext2::FileType::Regular, permissions, owner).map_err(problem)?;
-                volume.write(number, 0, entry.data).map_err(problem)?;
-                number
-            }
-            _ => continue,
-        };
-        volume.set_attributes(number, None, None, Some(entry.modified)).map_err(problem)?;
-        count += 1;
-    }
-    // Where /dev, /proc, /sys and the rest get mounted.
-    let root_owner = ext2::Owner { uid: 0, gid: 0 };
-    for (name, permissions) in [
-        ("dev", 0o755),
-        ("proc", 0o555),
-        ("sys", 0o555),
-        ("tmp", 0o1777),
-        ("run", 0o755),
-        ("disk", 0o755),
-        ("mnt", 0o755),
-        ("home", 0o755),
-        ("root", 0o700),
-    ] {
-        if volume.lookup(ext2::ROOT, name).is_err() {
-            volume
-                .create(ext2::ROOT, name, ext2::FileType::Directory, permissions, root_owner)
-                .map_err(|e| format!("/{name}: {e:?}"))?;
-        }
-    }
-    Ok(count)
-}
-
-/// Finds the inode at a path in the new root.
+/// Finds the inode at a path in the new volume.
 fn find(volume: &mut ext2::FileSystem<Device>, path: &str) -> Result<u32, String> {
     let mut number = ext2::ROOT;
     for name in path.split('/').filter(|name| !name.is_empty()) {
@@ -508,100 +411,118 @@ fn find(volume: &mut ext2::FileSystem<Device>, path: &str) -> Result<u32, String
     Ok(number)
 }
 
-fn read_text(volume: &mut ext2::FileSystem<Device>, path: &str) -> Result<String, String> {
-    let number = find(volume, path)?;
-    let size = volume.inode(number).map_err(|e| format!("{path}: {e:?}"))?.size as usize;
-    let mut data = vec![0; size];
-    volume.read(number, 0, &mut data).map_err(|e| format!("{path}: {e:?}"))?;
-    Ok(String::from_utf8_lossy(&data).into_owned())
-}
-
-/// Replaces a file's contents in the new root (making it if needed).
-fn write_text(volume: &mut ext2::FileSystem<Device>, path: &str, text: &str, permissions: u16) -> Result<(), String> {
+/// A new file in the new volume, owned by `owner`.
+fn write_file(
+    volume: &mut ext2::FileSystem<Device>,
+    path: &str,
+    text: &[u8],
+    permissions: u16,
+    owner: ext2::Owner,
+) -> Result<(), String> {
     let (directory, name) = path.rsplit_once('/').unwrap_or(("", path));
     let parent = find(volume, directory)?;
-    let number = match volume.lookup(parent, name) {
-        Ok(number) => number,
-        Err(_) => volume
-            .create(parent, name, ext2::FileType::Regular, permissions, ext2::Owner { uid: 0, gid: 0 })
-            .map_err(|e| format!("{path}: {e:?}"))?,
+    let number = volume
+        .create(parent, name, ext2::FileType::Regular, permissions, owner)
+        .map_err(|e| format!("{path}: {e:?}"))?;
+    volume.write(number, 0, text).map_err(|e| format!("{path}: {e:?}"))?;
+    Ok(())
+}
+
+/// Copies a file or directory tree of the running system into the new
+/// volume (as `name` in directory `parent`), keeping permissions, owners,
+/// times and symbolic links.
+fn copy_into(volume: &mut ext2::FileSystem<Device>, from: &str, parent: u32, name: &str) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(from).map_err(|e| format!("{from}: {e}"))?;
+    let owner = ext2::Owner { uid: metadata.uid, gid: metadata.gid };
+    let permissions = metadata.permissions() as u16;
+    let problem = |e: ext2::Error| format!("{from}: {e:?}");
+    let number = match metadata.kind {
+        fs::FileType::Directory => {
+            let number = volume.create(parent, name, ext2::FileType::Directory, permissions, owner).map_err(problem)?;
+            for entry in fs::read_dir(from).map_err(|e| format!("{from}: {e}"))? {
+                copy_into(volume, &format!("{from}/{}", entry.name), number, &entry.name)?;
+            }
+            number
+        }
+        fs::FileType::Symlink => {
+            let target = fs::read_link(from).map_err(|e| format!("{from}: {e}"))?;
+            volume.symlink(parent, name, &target, owner).map_err(problem)?
+        }
+        fs::FileType::File => {
+            let data = fs::read(from).map_err(|e| format!("{from}: {e}"))?;
+            let number = volume.create(parent, name, ext2::FileType::Regular, permissions, owner).map_err(problem)?;
+            volume.write(number, 0, &data).map_err(problem)?;
+            number
+        }
+        _ => return Ok(()),
     };
-    volume.truncate(number, 0).map_err(|e| format!("{path}: {e:?}"))?;
-    volume.write(number, 0, text.as_bytes()).map_err(|e| format!("{path}: {e:?}"))?;
-    volume.set_attributes(number, Some(permissions), None, None).map_err(|e| format!("{path}: {e:?}"))?;
+    volume.set_attributes(number, None, None, Some(metadata.modified.max(0) as u32)).map_err(problem)?;
     Ok(())
 }
 
-/// Copies a directory tree within the new root, giving it to `owner`.
-fn copy_tree(volume: &mut ext2::FileSystem<Device>, from: u32, to: u32, owner: ext2::Owner) -> Result<(), String> {
-    for entry in volume.list(from).map_err(|e| format!("{e:?}"))? {
-        let inode = volume.inode(entry.inode).map_err(|e| format!("{e:?}"))?;
-        let problem = |e: ext2::Error| format!("{}: {e:?}", entry.name);
-        match entry.kind {
-            ext2::FileType::Directory => {
-                let made = volume.create(to, &entry.name, entry.kind, inode.permissions(), owner).map_err(problem)?;
-                copy_tree(volume, entry.inode, made, owner)?;
-            }
-            ext2::FileType::Symlink => {
-                let target = volume.read_link(entry.inode).map_err(problem)?;
-                volume.symlink(to, &entry.name, &target, owner).map_err(problem)?;
-            }
-            _ => {
-                let mut data = vec![0; inode.size as usize];
-                volume.read(entry.inode, 0, &mut data).map_err(problem)?;
-                let made = volume.create(to, &entry.name, entry.kind, inode.permissions(), owner).map_err(problem)?;
-                volume.write(made, 0, &data).map_err(problem)?;
-            }
-        }
+/// Fills the new data partition: the configuration (this computer's name,
+/// the account, and the packages added to the live system), passwords,
+/// the account's home, and the first generation. Returns the packages
+/// (`name-version`) to copy.
+fn set_up_data(volume: &mut ext2::FileSystem<Device>, plan: &Plan) -> Result<Vec<String>, String> {
+    let root = ext2::Owner { uid: 0, gid: 0 };
+    let user = ext2::Owner { uid: users::FIRST_USER_ID, gid: users::FIRST_USER_ID };
+    for (name, permissions) in
+        [("etc", 0o755), ("home", 0o755), ("pkg", 0o755), ("generations", 0o755), ("cache", 0o755)]
+    {
+        volume
+            .create(ext2::ROOT, name, ext2::FileType::Directory, permissions, root)
+            .map_err(|e| format!("/{name}: {e:?}"))?;
     }
-    Ok(())
-}
 
-/// The new system's accounts: the user (an administrator, with a home copied
-/// from /etc/skel), root without a password, and the computer's name.
-fn set_up_accounts(volume: &mut ext2::FileSystem<Device>, plan: &Plan) -> Result<(), String> {
-    let uid = users::FIRST_USER_ID;
-    let owner = ext2::Owner { uid, gid: uid };
-    let mut passwd = read_text(volume, "/etc/passwd")?;
-    passwd.push_str(&format!("{}:x:{uid}:{uid}:{}:/home/{}:/bin/sh\n", plan.user, plan.full_name, plan.user));
-    write_text(volume, "/etc/passwd", &passwd, 0o644)?;
+    // The live system's configuration, as a starting point: its packages
+    // come along.
+    let live = fs::read_to_string("/etc/system.conf")
+        .or_else(|_| fs::read_to_string("/etc/eli/system.conf"))
+        .unwrap_or_default();
+    let mut config = crate::manager::set_setting(&live, "hostname", &plan.hostname);
+    let account = crate::manager::ConfiguredUser {
+        name: plan.user.clone(),
+        full_name: plan.full_name.clone(),
+        admin: true,
+        shell: "/bin/sh".into(),
+    };
+    config = crate::manager::add_user_block(&config, &account);
+    write_file(volume, "/etc/system.conf", config.as_bytes(), 0o644, root)?;
 
-    let mut group = String::new();
-    for line in read_text(volume, "/etc/group")?.lines() {
-        let line = if line.starts_with(&format!("{}:", users::ADMIN_GROUP)) {
-            if line.ends_with(':') { format!("{line}{}", plan.user) } else { format!("{line},{}", plan.user) }
-        } else {
-            line.to_string()
-        };
-        group.push_str(&line);
-        group.push('\n');
-    }
-    group.push_str(&format!("{}:x:{uid}:\n", plan.user));
-    write_text(volume, "/etc/group", &group, 0o644)?;
-
+    // Root's password is locked: administration goes through sudo.
     let days = time::unix_time() / 86_400;
-    let mut shadow = String::new();
-    for line in read_text(volume, "/etc/shadow")?.lines() {
-        // Root can't be logged into: administrators use sudo.
-        match line.strip_prefix("root:") {
-            Some(rest) => shadow.push_str(&format!("root:!:{}\n", rest.split_once(':').map_or("", |(_, rest)| rest))),
-            None => {
-                shadow.push_str(line);
-                shadow.push('\n');
-            }
-        }
-    }
     let hash = eli::crypt::hash_password(&plan.password);
-    shadow.push_str(&format!("{}:{hash}:{days}:0:99999:7:::\n", plan.user));
-    write_text(volume, "/etc/shadow", &shadow, 0o600)?;
-    write_text(volume, "/etc/hostname", &format!("{}\n", plan.hostname), 0o644)?;
+    let shadow =
+        format!("root:!:{days}:0:99999:7:::\nnobody:*:{days}:0:99999:7:::\n{}:{hash}:{days}:0:99999:7:::\n", plan.user);
+    write_file(volume, "/etc/shadow", shadow.as_bytes(), 0o600, root)?;
+    write_file(volume, "/etc/ids", format!("{} {}\n", plan.user, users::FIRST_USER_ID).as_bytes(), 0o644, root)?;
 
     let home = find(volume, "/home")?;
-    let user_home = volume
-        .create(home, &plan.user, ext2::FileType::Directory, 0o750, owner)
+    let skeleton_home = volume
+        .create(home, &plan.user, ext2::FileType::Directory, 0o750, user)
         .map_err(|e| format!("/home/{}: {e:?}", plan.user))?;
-    let skeleton = find(volume, "/etc/skel")?;
-    copy_tree(volume, skeleton, user_home, owner)
+    for entry in fs::read_dir("/etc/skel").unwrap_or_default() {
+        copy_into(volume, &format!("/etc/skel/{}", entry.name), skeleton_home, &entry.name)?;
+    }
+    // Copied as root's: they're the user's.
+    for entry in volume.list(skeleton_home).map_err(|e| format!("{e:?}"))? {
+        volume.set_attributes(entry.inode, None, Some(user), None).map_err(|e| format!("{e:?}"))?;
+    }
+
+    // The first generation: this configuration and the live system's
+    // packages.
+    let packages: Vec<String> = crate::manager::running_packages();
+    let generations = find(volume, "/generations")?;
+    volume
+        .create(generations, "1", ext2::FileType::Directory, 0o755, root)
+        .map_err(|e| format!("/generations/1: {e:?}"))?;
+    write_file(volume, "/generations/1/system.conf", config.as_bytes(), 0o644, root)?;
+    write_file(volume, "/generations/1/packages", (packages.join("\n") + "\n").as_bytes(), 0o644, root)?;
+    let info = format!("created = {}\nreason = installed\n", time::unix_time());
+    write_file(volume, "/generations/1/info", info.as_bytes(), 0o644, root)?;
+    volume.symlink(generations, "current", "1", root).map_err(|e| format!("current: {e:?}"))?;
+    Ok(packages)
 }
 
 /// Writes a file into the boot partition, making its directories.
@@ -628,7 +549,7 @@ fn put_file(volume: &mut fat::FileSystem<&mut Device>, path: &str, data: &[u8]) 
 
 /// Puts eliboot, the kernel, the initrd and the command line naming the
 /// root into the EFI System Partition.
-fn write_boot_partition(esp: &mut Device, files: &BootFiles, root_guid: &str, fallback: bool) -> Result<(), String> {
+fn write_boot_partition(esp: &mut Device, files: &BootFiles, data_guid: &str, fallback: bool) -> Result<(), String> {
     let mut volume = fat::FileSystem::mount(esp, time::unix_time).map_err(|e| format!("{e:?}"))?;
     let needed = (files.bootloader.len() * 2 + files.kernel.len() + files.initrd.len()) as u64;
     if volume.free_bytes().map_err(|e| format!("{e:?}"))? < needed {
@@ -637,7 +558,13 @@ fn write_boot_partition(esp: &mut Device, files: &BootFiles, root_guid: &str, fa
     put_file(&mut volume, "EFI/eliOS/eliboot.efi", &files.bootloader)?;
     put_file(&mut volume, "EFI/eliOS/kernel.elf", &files.kernel)?;
     put_file(&mut volume, "EFI/eliOS/initrd.cpio", &files.initrd)?;
-    put_file(&mut volume, "EFI/eliOS/cmdline.txt", format!("root=PARTUUID={root_guid}\n").as_bytes())?;
+    put_file(&mut volume, "EFI/eliOS/cmdline.txt", format!("data=PARTUUID={data_guid}\n").as_bytes())?;
+    let date = time::DateTime::from_unix(time::unix_time());
+    let menu = format!(
+        "1\t{:04}-{:02}-{:02} {:02}:{:02}  installed (current)\n",
+        date.year, date.month, date.day, date.hour, date.minute
+    );
+    put_file(&mut volume, "EFI/eliOS/generations.txt", menu.as_bytes())?;
     if fallback {
         put_file(&mut volume, "EFI/BOOT/BOOTX64.EFI", &files.bootloader)?;
     }

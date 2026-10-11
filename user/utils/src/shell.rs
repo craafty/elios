@@ -355,6 +355,12 @@ impl Shell {
         }
         let Some(path) = process::find_program(name) else {
             eprintln!("sh: {name}: command not found");
+            // A package may have it.
+            if !name.contains('/')
+                && let Some(hint) = crate::manager::suggest(name)
+            {
+                eprintln!("    {hint}");
+            }
             process::exit(127);
         };
         let error = process::exec(&path, &command.words, &env::vars());
