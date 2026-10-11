@@ -37,6 +37,9 @@ options:
                kept between runs) to try partitioning and installing
   --installed  boot only target/second-disk.img: the system the installer
                put there, without the live disk
+  --usb-stick  attach the disk image as a USB stick instead of a SATA disk
+               (as when eliOS is started from a stick on a real PC)
+  --usb-hub    put the USB keyboard (and stick) behind a USB hub
 ";
 
 const DEFAULT_CPUS: usize = 4;
@@ -83,6 +86,10 @@ struct Options {
     second_disk: bool,
     /// Boot the second disk alone.
     installed: bool,
+    /// The live disk is a USB stick.
+    usb_stick: bool,
+    /// USB devices go through a hub.
+    usb_hub: bool,
     /// Use a throwaway copy of the firmware's variables (for tests).
     fresh_firmware: bool,
     qemu_args: Vec<String>,
@@ -145,6 +152,8 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options, Stri
             }
             "--second-disk" => options.second_disk = true,
             "--installed" => options.installed = true,
+            "--usb-stick" => options.usb_stick = true,
+            "--usb-hub" => options.usb_hub = true,
             "--cpus" => {
                 let count = args.next().and_then(|count| count.parse().ok()).filter(|&count| (1..=64).contains(&count));
                 options.cpus = Some(count.ok_or("--cpus needs a number from 1 to 64")?);
@@ -556,12 +565,14 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
     firmware(&mut qemu, options)?;
     if !options.installed {
         // On the q35 machine the disk is attached to an AHCI (SATA)
-        // controller, as on a real PC. It's first in the boot order, so the
-        // firmware starts it even if the second disk has eliOS installed
-        // (as a PC would with its USB stick put first).
-        qemu.arg("-drive")
-            .arg(format!("if=none,id=live,format=raw,file={}", disk.display()))
-            .args(["-device", "ide-hd,drive=live,bus=ide.0,bootindex=0"]);
+        // controller, as on a real PC (or with --usb-stick, to USB, below).
+        // It's first in the boot order, so the firmware starts it even if
+        // the second disk has eliOS installed (as a PC would with its USB
+        // stick put first).
+        qemu.arg("-drive").arg(format!("if=none,id=live,format=raw,file={}", disk.display()));
+        if !options.usb_stick {
+            qemu.args(["-device", "ide-hd,drive=live,bus=ide.0,bootindex=0"]);
+        }
     }
     if options.second_disk || options.installed {
         let path = workspace_root().join("target/second-disk.img");
@@ -584,7 +595,18 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
     qemu.args(["-chardev", "stdio,id=console,signal=off", "-serial", "chardev:console"])
         // A USB controller with a keyboard. QEMU types into the keyboard
         // added last, so the window's keystrokes arrive over USB.
-        .args(["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0"])
+        .args(["-device", "qemu-xhci,id=xhci"]);
+    // Behind a hub (on root port 1) when asked: QEMU names hub ports 1.1,
+    // 1.2 and so on.
+    let place = |port: u32| if options.usb_hub { format!(",port=1.{port}") } else { String::new() };
+    if options.usb_hub {
+        qemu.args(["-device", "usb-hub,bus=xhci.0,port=1"]);
+    }
+    if options.usb_stick && !options.installed {
+        qemu.arg("-device").arg(format!("usb-storage,bus=xhci.0,drive=live,bootindex=0{}", place(1)));
+    }
+    qemu.arg("-device")
+        .arg(format!("usb-kbd,bus=xhci.0{}", place(2)))
         // A triple fault should stop the machine, not quietly reboot it.
         .arg("-no-reboot");
     // Hardware virtualization is much faster than emulating the CPU, when

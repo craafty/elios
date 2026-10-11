@@ -59,8 +59,12 @@ pub struct MountRequest {
 }
 
 pub fn root() -> Arc<dyn Inode> {
-    let mounts = MOUNTS.lock();
-    mounts.iter().find(|mount| mount.covered.is_none()).expect("no root file system").root.clone()
+    try_root().expect("no root file system")
+}
+
+/// The root, if one has been mounted yet (early in startup it hasn't).
+pub fn try_root() -> Option<Arc<dyn Inode>> {
+    MOUNTS.lock().iter().find(|mount| mount.covered.is_none()).map(|mount| mount.root.clone())
 }
 
 /// The root of whatever is mounted on `inode`, if anything; otherwise

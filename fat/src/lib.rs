@@ -804,11 +804,25 @@ impl<D: BlockDevice> FileSystem<D> {
         let free = match self.free_clusters {
             Some(free) => free,
             None => {
+                // The whole FAT is read, in big pieces (a sector at a time
+                // is slow on devices where each request costs, like USB).
+                self.flush_fat()?;
                 let mut free = 0;
-                for cluster in 2..self.clusters + 2 {
-                    if self.fat_entry(cluster)? == 0 {
-                        free += 1;
+                let entries_per_sector = SECTOR_SIZE as u64 / 4;
+                let needed = (u64::from(self.clusters) + 2).div_ceil(entries_per_sector).min(self.fat_sectors);
+                let mut sector = 0;
+                while sector < needed {
+                    let count = (needed - sector).min(MAX_TRANSFER as u64);
+                    let mut data = vec![0u8; count as usize * SECTOR_SIZE];
+                    self.device.read(self.fat_start + sector, &mut data)?;
+                    for (index, entry) in data.chunks(4).enumerate() {
+                        let cluster = sector * entries_per_sector + index as u64;
+                        if (2..u64::from(self.clusters) + 2).contains(&cluster) && u32_at(entry, 0) & CLUSTER_MASK == 0
+                        {
+                            free += 1;
+                        }
                     }
+                    sector += count;
                 }
                 self.free_clusters = Some(free);
                 free

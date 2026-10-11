@@ -1,5 +1,5 @@
 //! USB: the host controller driver (xHCI), and drivers for the devices on
-//! it (keyboards, for now).
+//! it: keyboards and storage (USB sticks and disks).
 //!
 //! Every USB device is set up the same way, through its endpoint 0 with
 //! "control transfers": a setup packet saying what's wanted, optionally some
@@ -9,6 +9,7 @@
 //! channels data flows through).
 
 mod hid;
+mod storage;
 mod xhci;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -102,8 +103,18 @@ struct Endpoint {
     interval: u8,
 }
 
-/// A keyboard interface's interrupt endpoint.
-pub struct KeyboardInterface {
+/// A mass storage interface's bulk endpoints.
+pub struct StorageInterface {
+    pub interface: u8,
+    pub input_address: u8,
+    pub input_packet_size: u16,
+    pub output_address: u8,
+    pub output_packet_size: u16,
+}
+
+/// An interface's interrupt IN endpoint (a keyboard's reports, a hub's
+/// port changes).
+pub struct InterruptInterface {
     pub interface: u8,
     pub address: u8,
     pub packet_size: u16,
@@ -151,18 +162,46 @@ impl Descriptors {
         descriptors
     }
 
-    /// The first HID boot-protocol keyboard interface (class 3, subclass 1,
-    /// protocol 1) with an interrupt IN endpoint.
-    pub fn boot_keyboard(&self) -> Option<KeyboardInterface> {
-        self.interfaces.iter().filter(|i| i.class == 3 && i.subclass == 1 && i.protocol == 1).find_map(|interface| {
+    /// The first mass storage interface speaking SCSI (subclass 6) over
+    /// the Bulk-Only Transport (protocol 0x50), with its bulk endpoints.
+    pub fn storage(&self) -> Option<StorageInterface> {
+        self.interfaces.iter().filter(|i| i.class == 8 && i.subclass == 6 && i.protocol == 0x50).find_map(|interface| {
+            let bulk = |input: bool| {
+                interface.endpoints.iter().find(|e| e.attributes & 0x3 == 2 && (e.address & 0x80 != 0) == input)
+            };
+            let (input, output) = (bulk(true)?, bulk(false)?);
+            Some(StorageInterface {
+                interface: interface.number,
+                input_address: input.address,
+                input_packet_size: input.packet_size,
+                output_address: output.address,
+                output_packet_size: output.packet_size,
+            })
+        })
+    }
+
+    /// The first interface matching `wanted` with an interrupt IN endpoint.
+    fn interrupt_interface(&self, wanted: impl Fn(&Interface) -> bool) -> Option<InterruptInterface> {
+        self.interfaces.iter().filter(|i| wanted(i)).find_map(|interface| {
             let endpoint = interface.endpoints.iter().find(|e| e.address & 0x80 != 0 && e.attributes & 0x3 == 3)?;
-            Some(KeyboardInterface {
+            Some(InterruptInterface {
                 interface: interface.number,
                 address: endpoint.address,
                 packet_size: endpoint.packet_size,
                 interval: endpoint.interval,
             })
         })
+    }
+
+    /// The first HID boot-protocol keyboard interface (class 3, subclass 1,
+    /// protocol 1) with an interrupt IN endpoint.
+    pub fn boot_keyboard(&self) -> Option<InterruptInterface> {
+        self.interrupt_interface(|i| i.class == 3 && i.subclass == 1 && i.protocol == 1)
+    }
+
+    /// A hub's interface (class 9) and its status change endpoint.
+    pub fn hub(&self) -> Option<InterruptInterface> {
+        self.interrupt_interface(|i| i.class == 9)
     }
 }
 
@@ -188,6 +227,8 @@ mod tests {
             ];
             let descriptors = Descriptors::parse(&bytes);
             assert_eq!(descriptors.configuration, 7);
+            // The storage interface has no endpoints here, so it's skipped.
+            assert!(descriptors.storage().is_none());
             let keyboard = descriptors.boot_keyboard().expect("no keyboard found");
             assert_eq!((keyboard.interface, keyboard.address, keyboard.packet_size, keyboard.interval), (1, 0x81, 8, 10));
         }

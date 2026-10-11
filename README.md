@@ -73,6 +73,7 @@ cargo xtask run --trace       # log interrupts and CPU resets to target/qemu.log
 cargo xtask run --cpus 8      # more (or fewer) CPUs; the default is 4
 cargo xtask run --forward 8080:80  # reach port 80 in eliOS at localhost:8080
 cargo xtask run --second-disk # an empty 2 GiB disk to format, mount, install to
+cargo xtask run --usb-stick   # start from a (virtual) USB stick, as on a real PC
 cargo xtask test              # boot a test kernel and run its tests
 cargo xtask image             # a fresh bootable disk image, target/eliOS.img
 ```
@@ -100,8 +101,9 @@ cargo xtask run --second-disk     # then, inside eliOS: installer
 cargo xtask run --installed       # boot the installed disk on its own
 ```
 
-Real machines vary far more than QEMU. Keyboards work over PS/2 or USB
-(plugged into the computer itself; not yet through a hub). It reads and writes
+Real machines vary far more than QEMU. Keyboards work over PS/2 or USB,
+and eliOS reads and writes the USB stick it started from (directly or
+through a hub), so files saved to `/disk` stay on the stick. It reads and writes
 SATA (AHCI) and NVMe disks; without a supported disk it still runs from
 memory. Networking needs an Intel e1000-family card (common in older PCs,
 and what VirtualBox and VMware emulate); it configures itself with DHCP.
@@ -140,7 +142,8 @@ may work too, but QEMU is the one eliOS is tested on.
   owners and permission bits on every file, the sticky bit, umask, and
   setuid programs, all with Linux's rules.
 - **Devices:** framebuffer console (with ANSI escape codes and its own 8x16
-  font), PS/2 and USB keyboards (an xHCI driver), serial port, Local and
+  font), USB (an xHCI driver, with keyboards, storage and hubs), PS/2
+  keyboards, serial port, Local and
   I/O APICs, PIT/TSC/APIC timers, CMOS clock, PCI with MSI/MSI-X, AHCI and
   NVMe, Intel e1000 network cards, ACPI power management.
 - **Networking:** eliOS's own TCP/IP stack (Ethernet, ARP, IPv4, ICMP, UDP,
@@ -229,8 +232,8 @@ glyph and rebuild.
 - [x] **Threads:** `clone`, futexes, per-thread signals; glibc's pthreads
 - [x] **Multiple CPUs:** startup through a real-mode trampoline, per-CPU
       data, a scheduler shared by all CPUs, TLB shootdowns
-- [x] **USB:** an xHCI host controller driver, HID keyboards, plugging and
-      unplugging
+- [x] **USB:** an xHCI host controller driver, HID keyboards, mass storage
+      (USB sticks), hubs, plugging and unplugging
 - [x] **Networking:** an e1000 driver, an own TCP/IP stack, DHCP, sockets,
       and `ifconfig`, `ping`, `host`, `wget` and `nc`
 - [x] **Users:** accounts, permissions, setuid programs, `login`, `su`,
@@ -238,5 +241,5 @@ glyph and rebuild.
       hashes
 - [x] **Installer:** partitions a disk (or uses its free space), ext2 root,
       a UEFI boot entry through the firmware's runtime services
-- [ ] **Next:** a graphical desktop, USB hubs, mice and storage, Unix
+- [ ] **Next:** a graphical desktop, USB mice, Unix
       domain sockets, and TLS for HTTPS

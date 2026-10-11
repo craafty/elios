@@ -159,6 +159,8 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
     }
     fs::mount::mount_system(disk_root);
     mount_boot_partition(boot_info.boot_partition());
+    // In case DHCP finished before there was a root to write to.
+    net::write_dns_settings();
     if let Ok(name) = fs::lookup("/", "/etc/hostname", true) {
         let mut buffer = [0; 64];
         let len = name.read_at(0, &mut buffer).unwrap_or(0);

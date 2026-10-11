@@ -258,8 +258,6 @@ pub trait Inode: Send + Sync {
     }
 }
 
-pub use self::mount::root;
-
 /// Makes `path` absolute (relative to `cwd`) and removes `.`, `..` and
 /// repeated slashes. Symbolic links are not involved.
 pub fn normalize(cwd: &str, path: &str) -> String {
@@ -311,7 +309,7 @@ fn lookup_depth(
     }
     let full = normalize(cwd, path);
     let components: Vec<&str> = full.split('/').filter(|c| !c.is_empty()).collect();
-    let mut inode = root();
+    let mut inode = mount::try_root().ok_or(Errno::ENOENT)?;
     for (index, name) in components.iter().enumerate() {
         if !credentials.is_root() {
             check_access(credentials, &inode.metadata(), MAY_EXEC)?;

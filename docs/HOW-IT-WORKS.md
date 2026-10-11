@@ -1469,11 +1469,61 @@ but wasn't in the previous one. USB keyboards don't repeat held keys (PS/2
 ones do it themselves), so the driver does: after 500 ms, every 33 ms. It
 also sets the Caps Lock LED.
 
-One kernel thread owns each controller. It sleeps until the controller's
-interrupt (MSI or MSI-X), or until a key is due to repeat; without either
-kind of interrupt, it polls every 10 ms. Boot waits (up to two seconds) for
-the devices present at startup, so the keyboard works by the time the shell
-starts.
+**Storage** (`storage.rs`): USB sticks, card readers and external disks
+nearly all speak the *Bulk-Only Transport*: each command is a 31-byte
+Command Block Wrapper sent to the device's bulk OUT endpoint, carrying a
+SCSI command; then the data on the bulk IN or OUT endpoint; then a 13-byte
+Command Status Wrapper. The SCSI commands are the classic ones: INQUIRY
+(what are you), TEST UNIT READY (retried for a few seconds, with REQUEST
+SENSE, while a disk spins up or a card reader notices its card), READ
+CAPACITY (the 16-byte form beyond 2 TiB), READ and WRITE (10- or 16-byte
+forms), in pieces of up to 64 KiB through one bounce buffer per device.
+Each logical unit with a disk becomes an `sd` disk like a SATA one;
+devices with blocks bigger than 512 bytes have them split and merged.
+Failures follow the specification's recovery: a stalled endpoint is reset
+on the controller (Reset Endpoint, then Set TR Dequeue Pointer to skip what
+was queued) and on the device (CLEAR_FEATURE(ENDPOINT_HALT)); a confused
+device gets a Bulk-Only reset. A stall on endpoint 0 (a device refusing a
+request, which is normal for GET MAX LUN on single-unit devices) is reset
+the same way, or every later request would fail.
+
+This is what makes a live USB stick work on a real PC: the firmware reads
+the stick to start eliboot, but once eliOS takes over the USB controller,
+only eliOS's own driver can read it, and the installer gets its files from
+it.
+
+**Hubs.** A device behind a hub is addressed through a *route string* (the
+hub port numbers on the way, four bits per tier, up to five tiers) plus the
+root port, in its slot context; a low- or full-speed device behind a
+high-speed hub also names the hub and port whose *transaction translator*
+converts its traffic. A hub's own slot context says it's a hub, how many
+ports it has, and its translator's think time. The hub driver reads the hub
+descriptor (USB 3 hubs have their own type, and are told their depth),
+powers every port, and keeps a transfer queued on the hub's interrupt
+endpoint, which completes with a bitmap of ports that changed. A changed
+port has its change bits acknowledged; a new device is reset through the
+hub (`SET_FEATURE(PORT_RESET)`), its speed read from the port status, and
+enumerated like any other; a disconnected one is removed along with
+everything behind it, if it was a hub too. Tested in QEMU with a USB 1.1
+hub; transaction translators and USB 3 hubs follow the specifications but
+QEMU can't emulate them.
+
+**Threads and locking.** Each controller has a kernel thread that handles
+its events, and the controller sits behind a sleeping lock, because disks
+on it are read and written from whatever thread needs them. A disk request
+takes the lock, queues its transfers, and waits for their completion
+events; events for other devices that arrive meanwhile are kept, and the
+controller's thread is woken to handle them. Waiting is on the
+controller's interrupt, not a timer: a USB disk does thousands of small
+transfers (mounting a FAT disk reads its whole FAT), and sleeping a timer
+tick per transfer made mounting the boot stick take three seconds instead
+of a tenth of one. Disks found while the lock is held are registered after
+it's released, since registering reads their partition tables through the
+same controller. The thread otherwise sleeps until the interrupt (MSI or
+MSI-X), a key repeat, or a 100 ms check; without interrupts it polls every
+10 ms. Boot waits (up to two seconds) for the devices present at startup,
+so the keyboard works by the time the shell starts and a USB boot disk can
+be mounted.
 
 ### AHCI (`drivers/ahci.rs`)
 
@@ -1954,6 +2004,9 @@ runs. `--fresh` and `cargo xtask image` start over.
 `--second-disk` adds `target/second-disk.img`, an empty 2 GiB disk on NVMe
 (kept between runs), to partition, format and install to; `--installed`
 boots that disk alone, as a PC would after the USB stick is removed.
+`--usb-stick` attaches the image as a USB stick instead of a SATA disk (the
+firmware boots from USB, and eliOS must find its boot partition over USB,
+as on a real PC), and `--usb-hub` puts the stick and keyboard behind a hub.
 
 A raw disk image rather than an ISO: written to a USB stick it becomes an
 ordinary, writable disk, and QEMU boots it directly.
@@ -2022,10 +2075,10 @@ Current limits, roughly in order of how much they'd matter to a user:
   while another thread's system call is using it makes the kernel fault
   (and panic). Linux avoids this with "exception tables" that turn such
   faults into errors; eliOS will need the same.
-- **USB:** keyboards only, and only on the controller's own ports (no hub
-  support yet); no USB storage or mice. That matters for installing on a
-  real PC: started from a USB stick, eliOS can't yet read the stick, so
-  `/disk` (and the installer's source files) are missing.
+- **USB:** keyboards, storage and hubs; no mice yet (they'd matter with a
+  graphical desktop), and no UAS, the faster USB 3 storage protocol (USB 3
+  disks also speak Bulk-Only, which eliOS uses). USB 3 hubs and
+  transaction translators are untested outside the specifications.
 - **Networking is IPv4 only**, with one network card (Intel e1000
   family), no TLS (so `https` doesn't work), no Unix domain sockets, and
   TCP without congestion control or out-of-order buffering.

@@ -237,10 +237,25 @@ fn run() {
     }
 }
 
-/// Writes the DNS servers where C libraries look for them.
+/// The DNS servers DHCP gave, for /etc/resolv.conf.
+static DNS_SERVERS: SpinLock<Vec<Ipv4>> = SpinLock::new(Vec::new());
+
+/// Writes the DNS servers where C libraries look for them. DHCP may finish
+/// before the root file system is mounted; then it's written once it is
+/// (see [`write_dns_settings`]).
 fn write_resolv_conf(servers: &[Ipv4]) {
+    *DNS_SERVERS.lock() = servers.to_vec();
+    write_dns_settings();
+}
+
+/// Writes /etc/resolv.conf from the DNS servers DHCP gave, if any.
+pub fn write_dns_settings() {
+    let servers = DNS_SERVERS.lock().clone();
+    if servers.is_empty() {
+        return;
+    }
     let mut text = String::from("# Written by eliOS from DHCP\n");
-    for server in servers {
+    for server in &servers {
         text.push_str(&format!("nameserver {server}\n"));
     }
     let Ok(etc) = crate::fs::lookup("/", "/etc", true) else { return };
