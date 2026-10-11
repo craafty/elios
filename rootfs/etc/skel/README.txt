@@ -36,6 +36,15 @@ Users
   ls -l /home              files have owners and permissions
   chmod 600 note.txt       ...which chmod and chown change
 
+Disks
+-----
+
+  lsblk; df                disks, partitions, free space
+  mount /dev/sdb1 /mnt     look at another disk (ext2 or FAT)
+  installer                put eliOS on a disk in this computer, so it
+                           starts without the USB stick (as root; it asks
+                           before changing anything)
+
 The network
 -----------
 
