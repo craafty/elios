@@ -19,6 +19,7 @@
 
 pub mod frames;
 pub mod heap;
+pub mod object;
 pub mod paging;
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -151,7 +152,7 @@ pub enum CacheType {
 
 impl CacheType {
     /// Page table bits selecting this type (see `arch::init_page_attributes`).
-    fn flags(self) -> u64 {
+    pub fn flags(self) -> u64 {
         match self {
             CacheType::WriteCombining => paging::WRITE_THROUGH,
             CacheType::Uncached => paging::WRITE_THROUGH | paging::CACHE_DISABLE,

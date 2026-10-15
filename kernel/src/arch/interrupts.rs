@@ -295,9 +295,15 @@ fn handle_exception(frame: &mut InterruptFrame) {
         debug!("breakpoint at {:#x}", frame.rip);
         return;
     }
-    // Nothing can recover from the rest yet. Once there is userspace, faults
-    // in user code will end the process instead.
     let fault_address = if frame.vector == u64::from(PAGE_FAULT) { Some(super::read_cr2()) } else { None };
+    if let Some(address) = fault_address
+        && address < crate::process::USER_END
+        && crate::process::handle_kernel_fault(frame, address)
+    {
+        return;
+    }
+    // Nothing else in the kernel can be recovered from (faults in user code
+    // were handled before getting here).
     let hint = match fault_address {
         Some(address) => memory::describe_fault_address(address),
         // A double fault with the stack pointer at a guard page is almost

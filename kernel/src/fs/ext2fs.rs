@@ -224,6 +224,8 @@ impl Inode for Node {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        // Mappings made from now on must see the change.
+        crate::memory::object::file_changed(self);
         let mut fs = self.volume.lock();
         // A symbolic link is given its target once, right after creation.
         let written = if self.inode.lock().kind() == ext2::FileType::Symlink {
@@ -239,6 +241,8 @@ impl Inode for Node {
     }
 
     fn truncate(&self, len: u64) -> Result<()> {
+        // Mappings made from now on must see the change.
+        crate::memory::object::file_changed(self);
         let mut fs = self.volume.lock();
         let result = fs.truncate(self.number, len).map_err(error);
         self.reload(&mut fs)?;

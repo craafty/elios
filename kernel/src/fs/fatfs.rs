@@ -155,6 +155,8 @@ impl Inode for Node {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        // Mappings made from now on must see the change.
+        crate::memory::object::file_changed(self);
         let mut fs = self.volume.fs.lock();
         let mut entry = self.entry()?;
         let written = fs.write(&mut entry, offset, buf).map_err(error)?;
@@ -163,6 +165,8 @@ impl Inode for Node {
     }
 
     fn truncate(&self, len: u64) -> Result<()> {
+        // Mappings made from now on must see the change.
+        crate::memory::object::file_changed(self);
         let mut fs = self.volume.fs.lock();
         let mut entry = self.entry()?;
         fs.truncate(&mut entry, len).map_err(error)?;

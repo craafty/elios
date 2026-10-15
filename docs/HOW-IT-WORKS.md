@@ -55,9 +55,10 @@ standard so eliOS can exchange data with the rest of the world.
 
 Smaller principles that come up repeatedly:
 
-- **Simple first, then measured.** Polling disk drivers, eager `fork`
-  copies, a round-robin scheduler: each is the simplest thing that works
-  correctly, with the faster design noted for later.
+- **Simple first, then measured.** Polling disk drivers, a round-robin
+  scheduler (and, until Firefox needed better, eager `fork` copies): each
+  is the simplest thing that works correctly, with the faster design noted
+  for later.
 - **Fail loudly and clearly.** Every CPU fault produces a readable report;
   user faults are explained in the kernel log; the kernel panics rather than
   limping on in a corrupt state.
@@ -616,6 +617,33 @@ Memory below 1 MiB is never handed out: starting other CPUs needs a page
 there (they start in 16-bit mode), and firmware leftovers like to live
 there.
 
+**Owner counts.** A frame can belong to several places at once: a page
+shared by a parent and child after `fork`, or a file's page held by its
+page cache and mapped into every program using the library. Next to the
+bitmap is a 32-bit count per frame (16 MiB for 16 GiB of RAM). `allocate`
+sets it to 1, `share` adds an owner, and `free` drops one and frees the
+frame with the last, so code that frees what it allocated works as
+before, and a frame lives exactly as long as someone uses it.
+
+### Memory objects (`memory/object.rs`)
+
+A memory object is a numbered set of pages that can be mapped into
+address spaces and also read and written like a file. One object backs
+several things at once: an in-memory file's data lives in one (so `read`,
+`write` and every `MAP_SHARED` mapping see the same bytes); `memfd_create`
+and `MAP_SHARED | MAP_ANONYMOUS` memory are objects without a file; and a
+file on a disk gets one as its **page cache**, read from the file a page at
+a time when first needed and shared by every program that maps it (a
+browser's 100 MB library is in memory once, not once per process). Pages
+are made on first use: zeroed, or read from the file. When a disk file is
+written or truncated its page cache is forgotten, so later mappings see
+the change (mappings that already exist keep the old pages, a
+simplification compared with Linux).
+
+Using objects for in-memory files also removed their old 64 MiB limit
+(they were a growable `Vec` each); a write now fails with `ENOSPC` only
+when free memory runs low.
+
 ### The kernel's page tables (`memory/mod.rs`, `memory/paging.rs`)
 
 Early in boot the kernel builds its own page tables and switches to them.
@@ -912,12 +940,26 @@ directory, signal handlers, a process group, and one or more threads.
 
 ### Address spaces (`process/address_space.rs`)
 
-An address space is a set of **areas** (ranges with access rights, kept in
-a `BTreeMap`) plus the page tables. Pages are allocated on first touch: a
-page fault inside an area maps a fresh zeroed page; outside any area (or
-violating its rights) it's a segmentation fault. This "demand paging" means
-reserving memory is free: an 8 MiB stack area costs nothing until used, and
-programs can `mmap` large regions they only partly touch.
+An address space is a set of **areas** (ranges with access rights and a
+*backing*, kept in a `BTreeMap`) plus the page tables. Pages are mapped on
+first touch ("demand paging"), so reserving memory is free: an 8 MiB stack
+area costs nothing until used, and programs can `mmap` large regions or
+files they only partly touch. What a touched page gets depends on the
+backing:
+
+- **private memory** gets a fresh zeroed page;
+- **a memory object** gets the object's page: as it is in a shared mapping
+  (everyone sees the same bytes), or read-only and marked copy-on-write in
+  a private one, so the first write makes the program its own copy;
+- **device memory** (a framebuffer) gets the device's page, with its cache
+  type; such pages have no owner count and are never freed.
+
+Outside any area, or against its rights, a fault is a segmentation fault.
+Copy-on-write and "device" are software bits in the page table entry (bits
+9 and 11, which the CPU ignores). Getting an object's page can mean reading
+a disk, which mustn't happen with the address space's spinlock held, so
+such a fault says which page it needs; the page is fetched with the lock
+released and interrupts on, then installed if the area still wants it.
 
 The top 256 page table entries are copied from the kernel's, so the kernel
 is mapped (supervisor-only) in every address space, and system calls don't
@@ -927,9 +969,16 @@ need to switch page tables.
 
 System calls receive user pointers. Before touching user memory, the kernel
 checks the whole range lies in areas with the needed rights and maps any
-untouched pages (`prepare_access`). After that the access can't fault, and
-the kernel reads or writes through the user address directly (the process's
-address space is the active one).
+untouched pages, copying copy-on-write ones it will write
+(`prepare_access`). Then it reads or writes through the user address
+directly (the process's address space is the active one).
+
+Another thread can change the memory between the check and the access:
+if it calls `fork`, the pages become copy-on-write again, and the kernel's
+write faults. So a page fault in kernel mode at a user address is resolved
+the same way as a program's own (copying the page), and the kernel retries
+the write; a test forks a hundred times while another thread `read`s into
+a buffer.
 
 The alternative, used by Linux, is to let the access fault and have an
 "exception table" turn faults at known instructions into `EFAULT` errors.
@@ -968,13 +1017,17 @@ start.
 
 ### fork, exec, exit, wait
 
-- **`fork`** copies the address space page by page (eager copying),
-  duplicates the file table (sharing the open files, so the position is
-  shared as on Linux), copies the signal state, and starts a thread whose
-  frame is the parent's with rax = 0. Copy-on-write would avoid copying
-  pages that are never written (most of them, before an `exec`); it's a
-  known future optimization. eliOS's own programs are small enough that the
-  copy is quick.
+- **`fork`** shares the address space instead of copying it: every page is
+  mapped in the child too (one more owner), and private writable pages
+  become read-only and copy-on-write in both. Whichever process writes a
+  page first gets a copy; if the other has meanwhile exited (the owner
+  count is 1), the page is simply made writable again. Most pages are never
+  written before an `exec`, so `fork` costs a page table walk, not a copy of
+  the program's memory, which matters for a browser that starts many
+  processes. Shared mappings stay shared. `fork` also duplicates the file
+  table (sharing the open files, so the position is shared as on Linux),
+  copies the signal state, and starts a thread whose frame is the parent's
+  with rax = 0.
 - **`execve`** builds the complete new address space first. Only when that
   succeeded does it discard the old one, so a failed `exec` leaves the
   process intact, as the API requires. It then closes close-on-exec files,
@@ -2365,7 +2418,6 @@ Current limits, roughly in order of how much they'd matter to a user:
   servers. The system image itself is updated by replacing the files on
   the EFI partition; generations cover packages and configuration.
 - **No graphical desktop** (planned, deliberately postponed).
-- **fork copies eagerly**; copy-on-write would make it cheaper.
 - **Disk I/O is polled** and holds the volume lock for whole operations.
 
 ## 26. Reference tables

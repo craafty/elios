@@ -1,16 +1,39 @@
 //! User address spaces.
 //!
 //! An address space is a set of areas (ranges of virtual memory with access
-//! rights) and the page tables mapping them. Pages are allocated on first
-//! touch: a page fault inside an area maps a fresh zeroed page there, so
-//! reserving a large area (a stack, or an `mmap`) costs nothing up front.
+//! rights and something behind them) and the page tables mapping them.
+//! Pages are mapped on first touch, so reserving a large area (a stack, or
+//! an `mmap`) costs nothing up front. What a touched page gets depends on
+//! the area's backing:
+//!
+//! - **Private memory** gets a fresh zeroed page.
+//! - **A memory object** (a file's data or page cache, a memfd, shared
+//!   anonymous memory) gets the object's page. In a shared mapping the
+//!   page is mapped as it is, so everyone mapping the object sees the
+//!   same bytes; in a private one it's mapped read-only and copied on the
+//!   first write ("copy-on-write"), so the program gets its own copy.
+//! - **Device memory** (a framebuffer) gets the device's page.
+//!
+//! `fork` shares every page instead of copying: private pages become
+//! read-only in both processes and are copied by whichever writes first.
+//! A frame's owner count (see `memory::frames`) says when a copy-on-write
+//! page has become the last owner's alone and needn't be copied.
+//!
+//! Getting an object's page may mean reading it from a disk, which can't
+//! happen with the address space's (spin)lock held, so a fault that needs
+//! one returns [`Fault::NeedsPage`]; [`resolve_fault`] fetches the page
+//! with the lock released, then installs it.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use crate::arch::smp;
 use crate::errno::{Errno, Result};
-use crate::memory::paging::{NO_EXECUTE, PageSize, PageTable, USER, WRITABLE};
+use crate::memory::object::MemoryObject;
+use crate::memory::paging::{COPY_ON_WRITE, DEVICE_PAGE, NO_EXECUTE, PageSize, PageTable, USER, WRITABLE};
 use crate::memory::{self, PAGE_SIZE, frames, phys_to_virt};
+use crate::sync::SpinLock;
 
 /// The end of the lower half: user addresses are below this.
 pub const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -24,10 +47,44 @@ pub const PROT_READ: u32 = 1;
 pub const PROT_WRITE: u32 = 2;
 pub const PROT_EXEC: u32 = 4;
 
-#[derive(Debug, Clone, Copy)]
+/// What's behind an area.
+#[derive(Clone)]
+pub enum Backing {
+    /// Private memory: zero-filled pages of the process's own.
+    Anonymous,
+    /// A memory object's pages, starting at byte `offset` of the object.
+    Object { object: Arc<MemoryObject>, offset: u64, shared: bool },
+    /// Device memory from physical address `phys`, with page table cache
+    /// bits `cache`.
+    Device { phys: u64, cache: u64 },
+}
+
+#[derive(Clone)]
 struct Area {
     end: u64,
     protection: u32,
+    backing: Backing,
+}
+
+impl Area {
+    /// Whether pages are shared with others when written (so they're never
+    /// copied on write).
+    fn shared(&self) -> bool {
+        matches!(self.backing, Backing::Object { shared: true, .. } | Backing::Device { .. })
+    }
+}
+
+/// The outcome of a page fault.
+pub enum Fault {
+    Resolved,
+    /// The access isn't allowed (or memory ran out): a segmentation fault.
+    Invalid,
+    /// Page `index` of the object is needed; get it with the lock released
+    /// and call [`AddressSpace::install_page`].
+    NeedsPage {
+        object: Arc<MemoryObject>,
+        index: u64,
+    },
 }
 
 pub struct AddressSpace {
@@ -37,7 +94,7 @@ pub struct AddressSpace {
     /// The heap grown by `brk` runs from `brk_start` to `brk`.
     pub brk_start: u64,
     pub brk: u64,
-    /// Pages currently backed by memory.
+    /// Pages currently mapped.
     resident_pages: u64,
 }
 
@@ -50,6 +107,15 @@ fn page_flags(protection: u32) -> u64 {
         flags |= NO_EXECUTE;
     }
     flags
+}
+
+/// Copies a frame into a fresh one.
+fn copy_frame(source: u64) -> Result<u64> {
+    let frame = frames::allocate().ok_or(Errno::ENOMEM)?;
+    // SAFETY: both are RAM in the direct map; the new one is ours alone and
+    // we hold a reference to the source.
+    unsafe { core::ptr::copy_nonoverlapping(phys_to_virt(source), phys_to_virt(frame), PAGE_SIZE as usize) };
+    Ok(frame)
 }
 
 impl AddressSpace {
@@ -65,17 +131,17 @@ impl AddressSpace {
         self.table.root()
     }
 
-    /// The areas as (start, end, protection), in address order.
-    pub fn areas(&self) -> alloc::vec::Vec<(u64, u64, u32)> {
-        self.areas.iter().map(|(&start, area)| (start, area.end, area.protection)).collect()
+    /// The areas as (start, end, protection, shared), in address order.
+    pub fn areas(&self) -> Vec<(u64, u64, u32, bool)> {
+        self.areas.iter().map(|(&start, area)| (start, area.end, area.protection, area.shared())).collect()
     }
 
     pub fn resident_bytes(&self) -> u64 {
         self.resident_pages * PAGE_SIZE
     }
 
-    fn area_at(&self, address: u64) -> Option<(u64, Area)> {
-        let (&start, &area) = self.areas.range(..=address).next_back()?;
+    fn area_at(&self, address: u64) -> Option<(u64, &Area)> {
+        let (&start, area) = self.areas.range(..=address).next_back()?;
         (address < area.end).then_some((start, area))
     }
 
@@ -83,43 +149,52 @@ impl AddressSpace {
         self.areas.range(..end).next_back().is_some_and(|(_, area)| area.end > start)
     }
 
-    /// Adds an area. Fails if it overlaps an existing one.
+    /// Adds an area of private memory. Fails if it overlaps an existing one.
     pub fn add_area(&mut self, start: u64, end: u64, protection: u32) -> Result<()> {
+        self.add_backed_area(start, end, protection, Backing::Anonymous)
+    }
+
+    /// Adds an area with the given backing.
+    pub fn add_backed_area(&mut self, start: u64, end: u64, protection: u32, backing: Backing) -> Result<()> {
         if !start.is_multiple_of(PAGE_SIZE) || !end.is_multiple_of(PAGE_SIZE) || start >= end || end > USER_END {
             return Err(Errno::EINVAL);
         }
         if self.overlaps(start, end) {
             return Err(Errno::EEXIST);
         }
-        self.areas.insert(start, Area { end, protection });
+        self.areas.insert(start, Area { end, protection, backing });
         Ok(())
     }
 
+    /// Unmaps a page, dropping this address space's reference to it.
+    /// Returns the frame to free (after the TLB is flushed), if it's one.
+    fn unmap_page(&mut self, page: u64) -> Option<u64> {
+        let mapping = self.table.unmap(page)?;
+        self.resident_pages -= 1;
+        (mapping.flags & DEVICE_PAGE == 0).then_some(mapping.phys)
+    }
+
     /// Removes `start..end` from whatever areas cover it, splitting them as
-    /// needed, and frees the pages.
+    /// needed, and unmaps the pages.
     pub fn remove(&mut self, start: u64, end: u64) {
         self.split_at(start);
         self.split_at(end);
-        let doomed: alloc::vec::Vec<u64> = self.areas.range(start..end).map(|(&s, _)| s).collect();
-        let mut freed = alloc::vec::Vec::new();
+        let doomed: Vec<u64> = self.areas.range(start..end).map(|(&s, _)| s).collect();
+        let mut freed = Vec::new();
         for area_start in doomed {
             let area = self.areas.remove(&area_start).unwrap();
             for page in (area_start..area.end).step_by(PAGE_SIZE as usize) {
-                if let Some(mapping) = self.table.unmap(page) {
-                    freed.push(mapping.phys);
-                    self.resident_pages -= 1;
-                }
+                freed.extend(self.unmap_page(page));
             }
         }
-        if !freed.is_empty() {
-            // Other threads of the program may be running on other CPUs.
-            smp::flush_tlb(start, end);
-            freed.into_iter().for_each(frames::free);
-        }
+        // Other threads of the program may be running on other CPUs: the
+        // frames can only go once no CPU can reach them.
+        smp::flush_tlb(start, end);
+        freed.into_iter().for_each(frames::free);
     }
 
     /// Changes the access rights of `start..end`, which must be covered by
-    /// areas.
+    /// areas. Pages that are copy-on-write stay read-only until written.
     pub fn protect(&mut self, start: u64, end: u64, protection: u32) -> Result<()> {
         let mut address = start;
         while address < end {
@@ -128,13 +203,20 @@ impl AddressSpace {
         }
         self.split_at(start);
         self.split_at(end);
-        let starts: alloc::vec::Vec<u64> = self.areas.range(start..end).map(|(&s, _)| s).collect();
+        let starts: Vec<u64> = self.areas.range(start..end).map(|(&s, _)| s).collect();
         for area_start in starts {
             let area = self.areas.get_mut(&area_start).unwrap();
             area.protection = protection;
             let area_end = area.end;
             for page in (area_start..area_end).step_by(PAGE_SIZE as usize) {
-                self.table.set_flags(page, page_flags(protection));
+                if let Some(mapping) = self.table.translate(page) {
+                    let kept = mapping.flags & (COPY_ON_WRITE | DEVICE_PAGE | crate::memory::paging::WRITE_THROUGH);
+                    let mut flags = page_flags(protection) | kept;
+                    if kept & COPY_ON_WRITE != 0 {
+                        flags &= !WRITABLE;
+                    }
+                    self.table.set_flags(page, flags);
+                }
             }
         }
         smp::flush_tlb(start, end);
@@ -143,12 +225,19 @@ impl AddressSpace {
 
     /// Splits the area containing `address` so an area boundary falls there.
     fn split_at(&mut self, address: u64) {
-        if let Some((start, area)) = self.area_at(address)
-            && start != address
-        {
-            self.areas.insert(start, Area { end: address, protection: area.protection });
-            self.areas.insert(address, area);
+        let Some((start, area)) = self.area_at(address) else { return };
+        if start == address {
+            return;
         }
+        let mut upper = area.clone();
+        let distance = address - start;
+        match &mut upper.backing {
+            Backing::Anonymous => {}
+            Backing::Object { offset, .. } => *offset += distance,
+            Backing::Device { phys, .. } => *phys += distance,
+        }
+        self.areas.get_mut(&start).unwrap().end = address;
+        self.areas.insert(address, upper);
     }
 
     /// Finds room for `len` bytes, below the `mmap` ceiling.
@@ -164,10 +253,10 @@ impl AddressSpace {
         top.checked_sub(len).filter(|&start| start >= 0x1_0000_0000)
     }
 
-    /// Resolves a page fault at `address` by mapping a fresh page, if the
-    /// access is allowed there. Returns whether it was resolved.
-    pub fn handle_fault(&mut self, address: u64, write: bool, execute: bool) -> bool {
-        let Some((_, area)) = self.area_at(address) else { return false };
+    /// Handles a page fault at `address` (or prepares a page the kernel is
+    /// about to access for the program).
+    pub fn handle_fault(&mut self, address: u64, write: bool, execute: bool) -> Fault {
+        let Some((start, area)) = self.area_at(address) else { return Fault::Invalid };
         let allowed = if write {
             area.protection & PROT_WRITE != 0
         } else if execute {
@@ -175,11 +264,19 @@ impl AddressSpace {
         } else {
             area.protection != 0
         };
-        let page = address & !(PAGE_SIZE - 1);
         if !allowed {
-            return false;
+            return Fault::Invalid;
         }
+        let page = address & !(PAGE_SIZE - 1);
+        let protection = area.protection;
+        let backing = area.backing.clone();
         if let Some(mapping) = self.table.translate(page) {
+            if write && mapping.flags & COPY_ON_WRITE != 0 {
+                return match self.break_copy_on_write(page, mapping.phys, mapping.flags, protection) {
+                    Ok(()) => Fault::Resolved,
+                    Err(_) => Fault::Invalid,
+                };
+            }
             // The page exists. If its entry allows the access, this CPU had
             // an outdated translation cached (another CPU just mapped or
             // unprotected it): drop it and retry. Otherwise it's a genuine
@@ -188,9 +285,88 @@ impl AddressSpace {
             if permits {
                 crate::arch::flush_tlb_page(page);
             }
-            return permits;
+            return if permits { Fault::Resolved } else { Fault::Invalid };
         }
-        self.map_fresh_page(page, area.protection).is_ok()
+        match backing {
+            Backing::Anonymous => match self.map_fresh_page(page, protection) {
+                Ok(_) => Fault::Resolved,
+                Err(_) => Fault::Invalid,
+            },
+            Backing::Object { object, offset, .. } => {
+                Fault::NeedsPage { object, index: (offset + page - start) / PAGE_SIZE }
+            }
+            Backing::Device { phys, cache } => {
+                let flags = page_flags(protection) | cache | DEVICE_PAGE;
+                if self.table.map(page, phys + page - start, PageSize::Small, flags).is_err() {
+                    return Fault::Invalid;
+                }
+                self.resident_pages += 1;
+                Fault::Resolved
+            }
+        }
+    }
+
+    /// Maps `frame` (page `index` of `object`, with a reference for us) at
+    /// `address`, if that's still what belongs there; in a private area it
+    /// is copied first if `write`, and otherwise mapped copy-on-write.
+    /// Drops the reference if the page isn't needed after all.
+    pub fn install_page(&mut self, address: u64, object: &Arc<MemoryObject>, index: u64, frame: u64, write: bool) {
+        let page = address & !(PAGE_SIZE - 1);
+        let wanted = self.area_at(page).and_then(|(start, area)| match &area.backing {
+            Backing::Object { object: mine, offset, shared }
+                if Arc::ptr_eq(mine, object) && (offset + page - start) / PAGE_SIZE == index =>
+            {
+                Some((area.protection, *shared))
+            }
+            _ => None,
+        });
+        let Some((protection, shared)) = wanted else {
+            frames::free(frame);
+            return;
+        };
+        if self.table.translate(page).is_some() {
+            // Another thread got here first.
+            frames::free(frame);
+            return;
+        }
+        let (frame, flags) = if shared {
+            (frame, page_flags(protection))
+        } else if write {
+            match copy_frame(frame) {
+                Ok(copy) => {
+                    frames::free(frame);
+                    (copy, page_flags(protection))
+                }
+                Err(_) => {
+                    frames::free(frame);
+                    return;
+                }
+            }
+        } else {
+            (frame, page_flags(protection) & !WRITABLE | COPY_ON_WRITE)
+        };
+        if self.table.map(page, frame, PageSize::Small, flags).is_err() {
+            frames::free(frame);
+            return;
+        }
+        self.resident_pages += 1;
+    }
+
+    /// Gives a copy-on-write page to this address space alone: copies it,
+    /// unless nobody else has it any more.
+    fn break_copy_on_write(&mut self, page: u64, frame: u64, flags: u64, protection: u32) -> Result<()> {
+        let kept = flags & crate::memory::paging::WRITE_THROUGH;
+        if frames::owners(frame) == 1 {
+            self.table.set_flags(page, page_flags(protection) | kept);
+        } else {
+            let copy = copy_frame(frame)?;
+            self.table.unmap(page);
+            self.table.map(page, copy, PageSize::Small, page_flags(protection) | kept).map_err(|_| Errno::ENOMEM)?;
+            frames::free(frame);
+        }
+        // Other threads may have the read-only entry cached.
+        smp::flush_tlb(page, page + PAGE_SIZE);
+        Ok(())
     }
 
     fn map_fresh_page(&mut self, page: u64, protection: u32) -> Result<u64> {
@@ -203,21 +379,48 @@ impl AddressSpace {
         Ok(frame)
     }
 
-    /// The frame backing `page`, mapping one if the area allows it. Ignores
-    /// access rights: the kernel can write to read-only areas (to load
-    /// programs, for example).
-    fn frame_for(&mut self, page: u64) -> Result<u64> {
-        if let Some(mapping) = self.table.translate(page) {
-            return Ok(mapping.phys);
+    /// The frame backing `page`, ready to be written by the kernel (copied
+    /// if it was copy-on-write). Ignores access rights: the kernel can
+    /// write to read-only areas (to load programs, for example). Pages of
+    /// objects that live on disk can't be fetched here.
+    fn writable_frame(&mut self, page: u64) -> Result<u64> {
+        loop {
+            if let Some(mapping) = self.table.translate(page) {
+                if mapping.flags & COPY_ON_WRITE == 0 {
+                    return Ok(mapping.phys);
+                }
+                let protection = self.area_at(page).ok_or(Errno::EFAULT)?.1.protection;
+                self.break_copy_on_write(page, mapping.phys, mapping.flags, protection)?;
+                continue;
+            }
+            match self.handle_fault(page, false, false) {
+                Fault::Resolved => {}
+                Fault::Invalid => {
+                    // Not readable: map it anyway (a program image being
+                    // loaded into a read-only area).
+                    let (_, area) = self.area_at(page).ok_or(Errno::EFAULT)?;
+                    if !matches!(area.backing, Backing::Anonymous) {
+                        return Err(Errno::EFAULT);
+                    }
+                    let protection = area.protection;
+                    self.map_fresh_page(page, protection)?;
+                }
+                Fault::NeedsPage { object, index } => {
+                    if object.needs_io() {
+                        return Err(Errno::EFAULT);
+                    }
+                    let frame = object.page(index)?;
+                    self.install_page(page, &object, index, frame, true);
+                }
+            }
         }
-        let (_, area) = self.area_at(page).ok_or(Errno::EFAULT)?;
-        self.map_fresh_page(page, area.protection)
     }
 
     /// Checks that the kernel may access `address..address + len` on the
-    /// program's behalf, and maps any pages not yet touched, so the access
-    /// can't fault.
-    pub fn prepare_access(&mut self, address: u64, len: u64, write: bool) -> Result<()> {
+    /// program's behalf, and maps any pages not yet touched (or copies
+    /// copy-on-write ones it will write), so the access can't fault. If a
+    /// page must be fetched from an object first, returns that.
+    pub fn prepare_access(&mut self, address: u64, len: u64, write: bool) -> Result<Option<(u64, Fault)>> {
         let end = address.checked_add(len).filter(|&end| end <= USER_END).ok_or(Errno::EFAULT)?;
         let mut page = address & !(PAGE_SIZE - 1);
         while page < end {
@@ -226,10 +429,17 @@ impl AddressSpace {
             if area.protection & needed == 0 {
                 return Err(Errno::EFAULT);
             }
-            self.frame_for(page)?;
+            let ready = self.table.translate(page).is_some_and(|mapping| !write || mapping.flags & COPY_ON_WRITE == 0);
+            if !ready {
+                match self.handle_fault(page, write, false) {
+                    Fault::Resolved => {}
+                    Fault::Invalid => return Err(Errno::EFAULT),
+                    fault @ Fault::NeedsPage { .. } => return Ok(Some((page, fault))),
+                }
+            }
             page += PAGE_SIZE;
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Copies `data` to `address`, which needn't be the active address space.
@@ -239,9 +449,9 @@ impl AddressSpace {
             let current = address + done as u64;
             let offset = (current % PAGE_SIZE) as usize;
             let chunk = (PAGE_SIZE as usize - offset).min(data.len() - done);
-            let frame = self.frame_for(current - offset as u64)?;
-            // SAFETY: the frame belongs to this address space; the direct
-            // map reaches it whether or not this space is active.
+            let frame = self.writable_frame(current - offset as u64)?;
+            // SAFETY: the frame belongs to this address space alone; the
+            // direct map reaches it whether or not this space is active.
             unsafe {
                 core::ptr::copy_nonoverlapping(data[done..].as_ptr(), phys_to_virt(frame).add(offset), chunk);
             }
@@ -250,25 +460,37 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// A copy of this address space, page by page (for `fork`).
-    pub fn duplicate(&self) -> Result<Self> {
+    /// A copy of this address space for `fork`, sharing every page: private
+    /// ones become copy-on-write in both.
+    pub fn duplicate(&mut self) -> Result<Self> {
         let mut copy = Self::new()?;
         copy.areas = self.areas.clone();
         copy.brk_start = self.brk_start;
         copy.brk = self.brk;
+        let mut downgraded = false;
         for (virt, mapping) in self.table.user_pages() {
-            let frame = frames::allocate().ok_or(Errno::ENOMEM)?;
-            // SAFETY: both frames are RAM in the direct map; the new one is
-            // ours alone.
-            unsafe {
-                core::ptr::copy_nonoverlapping(phys_to_virt(mapping.phys), phys_to_virt(frame), PAGE_SIZE as usize);
+            let shared = self.area_at(virt).is_some_and(|(_, area)| area.shared());
+            let mut flags = mapping.flags & (USER | WRITABLE | NO_EXECUTE | COPY_ON_WRITE | DEVICE_PAGE);
+            flags |= mapping.flags & crate::memory::paging::WRITE_THROUGH;
+            if !shared && flags & WRITABLE != 0 {
+                flags = flags & !WRITABLE | COPY_ON_WRITE;
+                self.table.set_flags(virt, flags);
+                downgraded = true;
             }
-            let flags = mapping.flags & (USER | WRITABLE | NO_EXECUTE);
-            if copy.table.map(virt, frame, PageSize::Small, flags).is_err() {
-                frames::free(frame);
+            if flags & DEVICE_PAGE == 0 {
+                frames::share(mapping.phys);
+            }
+            if copy.table.map(virt, mapping.phys, PageSize::Small, flags).is_err() {
+                if flags & DEVICE_PAGE == 0 {
+                    frames::free(mapping.phys);
+                }
                 return Err(Errno::ENOMEM);
             }
             copy.resident_pages += 1;
+        }
+        if downgraded {
+            // Other threads of this process must stop writing to them.
+            smp::flush_tlb(0, USER_END);
         }
         Ok(copy)
     }
@@ -286,16 +508,17 @@ impl AddressSpace {
                 return self.brk;
             }
             // Extend the heap area (or create it).
-            let heap = if old_end > self.brk_start { self.area_at(old_end - 1) } else { None };
-            match heap {
-                Some((start, area)) if area.end == old_end => {
-                    self.areas.insert(start, Area { end: new_end, protection: area.protection });
+            let heap = if old_end > self.brk_start { self.area_at(old_end - 1).map(|(start, _)| start) } else { None };
+            let extended = heap.is_some_and(|start| {
+                let area = self.areas.get_mut(&start).unwrap();
+                let extendable = area.end == old_end && matches!(area.backing, Backing::Anonymous);
+                if extendable {
+                    area.end = new_end;
                 }
-                _ => {
-                    if self.add_area(old_end, new_end, PROT_READ | PROT_WRITE).is_err() {
-                        return self.brk;
-                    }
-                }
+                extendable
+            });
+            if !extended && self.add_area(old_end, new_end, PROT_READ | PROT_WRITE).is_err() {
+                return self.brk;
             }
         } else if new_end < old_end {
             self.remove(new_end, old_end);
@@ -308,11 +531,75 @@ impl AddressSpace {
 impl Drop for AddressSpace {
     fn drop(&mut self) {
         for (_, mapping) in self.table.user_pages() {
-            frames::free(mapping.phys);
+            if mapping.flags & DEVICE_PAGE == 0 {
+                frames::free(mapping.phys);
+            }
         }
         // SAFETY: a placeholder that's never used; the real tables are
         // consumed by free_user_tables.
         let table = core::mem::replace(&mut self.table, unsafe { PageTable::from_root(0) });
         table.free_user_tables();
     }
+}
+
+/// Resolves a page fault (or prepares an access) in the address space
+/// behind `space`, fetching object pages with the lock released. Returns
+/// whether the access is now possible.
+pub fn resolve_fault(space: &SpinLock<Option<AddressSpace>>, address: u64, write: bool, execute: bool) -> bool {
+    resolve(space, address, write, execute, true)
+}
+
+/// Like [`resolve_fault`], for a fault the kernel took on a user address.
+/// Unless `may_sleep` (the kernel was running with interrupts on), pages
+/// that would have to be read from a disk can't be fetched.
+pub fn resolve_kernel_fault(
+    space: &SpinLock<Option<AddressSpace>>,
+    address: u64,
+    write: bool,
+    may_sleep: bool,
+) -> bool {
+    resolve(space, address, write, false, may_sleep)
+}
+
+fn resolve(space: &SpinLock<Option<AddressSpace>>, address: u64, write: bool, execute: bool, may_sleep: bool) -> bool {
+    loop {
+        let fault = match space.lock().as_mut() {
+            Some(space) => space.handle_fault(address, write, execute),
+            None => return false,
+        };
+        match fault {
+            Fault::Resolved => return true,
+            Fault::Invalid => return false,
+            Fault::NeedsPage { object, index } => {
+                let frame = if may_sleep {
+                    with_interrupts(|| object.page(index))
+                } else if object.needs_io() {
+                    return false;
+                } else {
+                    object.page(index)
+                };
+                let Ok(frame) = frame else { return false };
+                match space.lock().as_mut() {
+                    Some(space) => space.install_page(address, &object, index, frame, write),
+                    None => {
+                        frames::free(frame);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Runs `f` with interrupts on (reading a page from a disk sleeps), as they
+/// are during a system call; a page fault from user mode arrives with them
+/// off.
+pub fn with_interrupts<R>(f: impl FnOnce() -> R) -> R {
+    let enabled = crate::arch::interrupts_enabled();
+    crate::arch::enable_interrupts();
+    let result = f();
+    if !enabled {
+        crate::arch::disable_interrupts();
+    }
+    result
 }

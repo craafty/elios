@@ -226,6 +226,8 @@ pub fn directory() -> Arc<dyn Inode> {
     let console: Arc<dyn Inode> = tty::console();
     let _ = dev.link("console", console.clone());
     let _ = dev.link("tty", Arc::new(ControllingTerminal { inode: ramfs::next_inode_number(), terminal: console }));
+    // Shared memory files (shm_open), writable by everyone like /tmp.
+    let _ = dev.link("shm", ramfs::Directory::new(super::Attributes::root(0o1777)));
     match DEV.set(dev) {
         Ok(dev) => dev.clone(),
         Err(_) => DEV.get().expect("set by someone else").clone(),

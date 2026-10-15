@@ -14,6 +14,7 @@ pub mod devfs;
 pub mod efivarfs;
 pub mod ext2fs;
 pub mod fatfs;
+pub mod memfd;
 pub mod mount;
 pub mod pipe;
 pub mod procfs;
@@ -212,6 +213,29 @@ pub trait Inode: Send + Sync {
 
     /// Called when the last open file referring to this inode is closed.
     fn on_close(&self, _flags: u32) {}
+
+    /// The memory object holding the file's data, for files that live in
+    /// memory (their pages are mapped directly; other files are mapped
+    /// through a page cache).
+    fn memory_object(&self) -> Option<Arc<crate::memory::object::MemoryObject>> {
+        None
+    }
+
+    /// Adds seals (`fcntl(F_ADD_SEALS)`; only memfds have them).
+    fn add_seals(&self, _seals: u32) -> Result<()> {
+        Err(Errno::EINVAL)
+    }
+
+    /// The seals (`fcntl(F_GET_SEALS)`).
+    fn seals(&self) -> Result<u32> {
+        Err(Errno::EINVAL)
+    }
+
+    /// For devices whose memory programs can map (a framebuffer): its
+    /// physical address, size, and page table cache bits.
+    fn device_memory(&self) -> Option<(u64, u64, u64)> {
+        None
+    }
 
     /// For devices that keep state for each open file (an input device
     /// gives every reader its own queue of events): the inode the new open

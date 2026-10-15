@@ -3,8 +3,10 @@
 use crate::arch::interrupts::InterruptFrame;
 use crate::arch::syscall;
 use crate::errno::{Errno, Result};
-use crate::fs::{self, FileKind};
+use crate::fs::FileKind;
 use crate::memory::PAGE_SIZE;
+use crate::memory::object::{self, MemoryObject};
+use crate::process::address_space::Backing;
 use crate::process::{self, CloneArgs, PROT_EXEC, PROT_READ, PROT_WRITE, Pid, SIGKILL, SigAction, USER_END};
 use crate::process::{credentials, futex, signal, timers, user};
 use crate::{task, time};
@@ -298,26 +300,54 @@ const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 
-/// `mmap`: anonymous memory, or a private copy of part of a file.
+/// `mmap`: private or shared anonymous memory, or a file's pages (shared
+/// with everyone who maps the file, or private and copied on write). See
+/// `process::address_space` for how each is backed.
 pub fn mmap(address: u64, len: u64, protection: u64, flags: u64, fd: u64, offset: u64) -> Result<u64> {
     if len == 0 || !offset.is_multiple_of(PAGE_SIZE) {
         return Err(Errno::EINVAL);
     }
     let len = len.checked_next_multiple_of(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
     let protection = protection as u32 & (PROT_READ | PROT_WRITE | PROT_EXEC);
-    let file = if flags & MAP_ANONYMOUS == 0 {
-        let file = process::current().files.lock().get(fd as usize)?;
-        if file.inode.metadata().kind != FileKind::Regular {
-            return Err(Errno::ENODEV);
+    let shared = flags & MAP_SHARED != 0;
+    let backing = if flags & MAP_ANONYMOUS != 0 {
+        if shared {
+            // Shared with children after fork: an object of its own.
+            let object = MemoryObject::new();
+            object.truncate(len);
+            Backing::Object { object, offset: 0, shared: true }
+        } else {
+            Backing::Anonymous
         }
-        Some(file)
     } else {
-        None
+        let file = process::current().files.lock().get(fd as i32 as usize)?;
+        if !file.readable() {
+            return Err(Errno::EACCES);
+        }
+        if let Some((phys, size, cache)) = file.inode.device_memory() {
+            // Device memory, like a framebuffer.
+            if offset.checked_add(len).is_none_or(|end| end > size) {
+                return Err(Errno::EINVAL);
+            }
+            Backing::Device { phys: phys + offset, cache }
+        } else {
+            if file.inode.metadata().kind != FileKind::Regular {
+                return Err(Errno::ENODEV);
+            }
+            let writing = shared && protection & PROT_WRITE != 0;
+            if writing && !file.writable() {
+                return Err(Errno::EACCES);
+            }
+            let object = match file.inode.memory_object() {
+                Some(object) => object,
+                // Writing to a disk file through memory would need the
+                // pages written back, which isn't done.
+                None if writing => return Err(Errno::ENODEV),
+                None => object::page_cache(&file.inode),
+            };
+            Backing::Object { object, offset, shared }
+        }
     };
-    if flags & MAP_SHARED != 0 && file.as_ref().is_some_and(|f| f.writable()) && protection & PROT_WRITE != 0 {
-        // Writing through to files isn't supported.
-        return Err(Errno::ENODEV);
-    }
 
     let process = process::current();
     let mut space = process.space.lock();
@@ -335,33 +365,13 @@ pub fn mmap(address: u64, len: u64, protection: u64, flags: u64, fd: u64, offset
         let hint_free = address != 0
             && address.is_multiple_of(PAGE_SIZE)
             && address.checked_add(len).is_some_and(|end| end <= USER_END)
-            && space.add_area(address, address + len, protection).is_ok();
+            && space.add_backed_area(address, address + len, protection, backing.clone()).is_ok();
         if hint_free {
-            // add_area already reserved it above.
-            return finish_mmap(space, address, len, protection, file, offset, true);
+            return Ok(address);
         }
         space.find_free(len).ok_or(Errno::ENOMEM)?
     };
-    finish_mmap(space, start, len, protection, file, offset, false)
-}
-
-fn finish_mmap(
-    space: &mut process::AddressSpace,
-    start: u64,
-    len: u64,
-    protection: u32,
-    file: Option<alloc::sync::Arc<fs::OpenFile>>,
-    offset: u64,
-    area_added: bool,
-) -> Result<u64> {
-    if !area_added {
-        space.add_area(start, start + len, protection)?;
-    }
-    if let Some(file) = file {
-        let mut data = alloc::vec![0; len as usize];
-        let count = file.inode.read_at(offset, &mut data)?;
-        space.write(start, &data[..count])?;
-    }
+    space.add_backed_area(start, start + len, protection, backing)?;
     Ok(start)
 }
 

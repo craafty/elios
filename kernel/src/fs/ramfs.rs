@@ -8,6 +8,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::{Attributes, FileKind, Inode, Metadata};
 use crate::errno::{Errno, Result};
+use crate::memory::frames;
+use crate::memory::object::MemoryObject;
 use crate::process::credentials::{Gid, Uid};
 use crate::sync::SpinLock;
 use crate::time;
@@ -70,27 +72,51 @@ pub struct File {
     inode: u64,
     kind: FileKind,
     ownership: Ownership,
-    data: SpinLock<Vec<u8>>,
+    contents: Contents,
+}
+
+enum Contents {
+    /// A regular file's data is a memory object, so programs that map the
+    /// file share its pages (see `memory::object`).
+    Data(Arc<MemoryObject>),
+    Link(SpinLock<Vec<u8>>),
 }
 
 impl File {
     pub fn new(kind: FileKind, attributes: Attributes) -> Arc<Self> {
-        Arc::new(Self {
-            inode: next_inode_number(),
-            kind,
-            ownership: Ownership::new(attributes),
-            data: SpinLock::new(Vec::new()),
-        })
+        let contents = match kind {
+            FileKind::Symlink => Contents::Link(SpinLock::new(Vec::new())),
+            _ => Contents::Data(MemoryObject::new()),
+        };
+        Arc::new(Self { inode: next_inode_number(), kind, ownership: Ownership::new(attributes), contents })
+    }
+
+    fn size(&self) -> u64 {
+        match &self.contents {
+            Contents::Data(object) => object.size(),
+            Contents::Link(target) => target.lock().len() as u64,
+        }
     }
 }
 
-/// Files bigger than this are refused, so one runaway write can't take all
-/// of memory.
-const MAX_FILE_SIZE: u64 = 64 << 20;
+/// Writes that would leave less free memory than this fail with `ENOSPC`,
+/// so one runaway write can't take all of memory.
+const MEMORY_RESERVE: u64 = 32 << 20;
+
+fn check_space(growth: u64) -> Result<()> {
+    if frames::stats().free_bytes < growth.saturating_add(MEMORY_RESERVE) { Err(Errno::ENOSPC) } else { Ok(()) }
+}
 
 impl Inode for File {
     fn metadata(&self) -> Metadata {
-        self.ownership.metadata(self.kind, self.inode, self.data.lock().len() as u64, 1)
+        self.ownership.metadata(self.kind, self.inode, self.size(), 1)
+    }
+
+    fn memory_object(&self) -> Option<Arc<MemoryObject>> {
+        match &self.contents {
+            Contents::Data(object) => Some(object.clone()),
+            Contents::Link(_) => None,
+        }
     }
 
     fn set_permissions(&self, permissions: u32) -> Result<()> {
@@ -109,42 +135,50 @@ impl Inode for File {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let data = self.data.lock();
-        let start = (offset as usize).min(data.len());
-        let count = buf.len().min(data.len() - start);
-        buf[..count].copy_from_slice(&data[start..start + count]);
-        Ok(count)
+        match &self.contents {
+            Contents::Data(object) => object.read(offset, buf),
+            Contents::Link(target) => {
+                let target = target.lock();
+                let start = (offset as usize).min(target.len());
+                let count = buf.len().min(target.len() - start);
+                buf[..count].copy_from_slice(&target[start..start + count]);
+                Ok(count)
+            }
+        }
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
         let end = offset.checked_add(buf.len() as u64).ok_or(Errno::EFBIG)?;
-        if end > MAX_FILE_SIZE {
-            return Err(Errno::EFBIG);
-        }
-        let mut data = self.data.lock();
-        if data.len() < end as usize {
-            data.resize(end as usize, 0);
-        }
-        data[offset as usize..end as usize].copy_from_slice(buf);
-        drop(data);
+        check_space(end.saturating_sub(self.size()))?;
+        let written = match &self.contents {
+            Contents::Data(object) => object.write(offset, buf)?,
+            Contents::Link(target) => {
+                let mut target = target.lock();
+                if target.len() < end as usize {
+                    target.resize(end as usize, 0);
+                }
+                target[offset as usize..end as usize].copy_from_slice(buf);
+                buf.len()
+            }
+        };
         self.ownership.touch();
-        Ok(buf.len())
+        Ok(written)
     }
 
     fn truncate(&self, len: u64) -> Result<()> {
-        if len > MAX_FILE_SIZE {
-            return Err(Errno::EFBIG);
+        match &self.contents {
+            Contents::Data(object) => object.truncate(len),
+            Contents::Link(target) => target.lock().resize(len as usize, 0),
         }
-        self.data.lock().resize(len as usize, 0);
         self.ownership.touch();
         Ok(())
     }
 
     fn read_link(&self) -> Result<String> {
-        if self.kind != FileKind::Symlink {
-            return Err(Errno::EINVAL);
+        match &self.contents {
+            Contents::Link(target) => String::from_utf8(target.lock().clone()).map_err(|_| Errno::EINVAL),
+            Contents::Data(_) => Err(Errno::EINVAL),
         }
-        String::from_utf8(self.data.lock().clone()).map_err(|_| Errno::EINVAL)
     }
 }
 

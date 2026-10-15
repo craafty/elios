@@ -16,6 +16,13 @@ pub const CACHE_DISABLE: u64 = 1 << 4;
 const HUGE: u64 = 1 << 7;
 pub const GLOBAL: u64 = 1 << 8;
 pub const NO_EXECUTE: u64 = 1 << 63;
+/// Software bit (ignored by the CPU): the page is shared with another
+/// address space or a memory object and must be copied before it's
+/// written. Its entry is read-only.
+pub const COPY_ON_WRITE: u64 = 1 << 9;
+/// Software bit: the page is device memory, not a frame from the allocator,
+/// so it has no owner count and is never freed.
+pub const DEVICE_PAGE: u64 = 1 << 11;
 
 const ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 

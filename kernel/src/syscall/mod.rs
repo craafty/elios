@@ -388,6 +388,7 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         293 => files::pipe(a[0], a[1]),
         302 => system::prlimit(a[1], a[3]),
         318 => system::getrandom(a[0], a[1]),
+        319 => files::memfd_create(a[0], a[1]),
         435 => processes::clone3(frame, a[0], a[1]),
         439 => files::access_at(a[0], a[1], a[2], a[3]),
         452 => files::chmod_at(a[0], a[1], a[2], a[3]),

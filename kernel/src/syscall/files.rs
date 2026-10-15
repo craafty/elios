@@ -295,6 +295,25 @@ pub fn pipe(fds: u64, flags: u64) -> Result<u64> {
     Ok(0)
 }
 
+const MFD_CLOEXEC: u64 = 0x1;
+const MFD_ALLOW_SEALING: u64 = 0x2;
+const MFD_NOEXEC_SEAL: u64 = 0x8;
+const MFD_EXEC: u64 = 0x10;
+
+/// `memfd_create`: an anonymous in-memory file (see `fs::memfd`).
+pub fn memfd_create(name: u64, flags: u64) -> Result<u64> {
+    let name = user::read_string(name)?;
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL | MFD_EXEC) != 0 || name.len() > 249 {
+        return Err(Errno::EINVAL);
+    }
+    let credentials = credentials::current();
+    let attributes = fs::Attributes { permissions: 0o777, uid: credentials.euid, gid: credentials.egid };
+    let memfd = fs::memfd::Memfd::new(attributes, flags & (MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL) != 0);
+    let file = OpenFile::new(memfd, alloc::format!("/memfd:{name} (deleted)"), fs::O_RDWR);
+    let fd = process::current().files.lock().insert(file, flags & MFD_CLOEXEC != 0, 0)?;
+    Ok(fd as u64)
+}
+
 pub fn dup(fd: u64) -> Result<u64> {
     let process = process::current();
     let mut files = process.files.lock();
@@ -332,7 +351,19 @@ const F_GETFD: u64 = 1;
 const F_SETFD: u64 = 2;
 const F_GETFL: u64 = 3;
 const F_SETFL: u64 = 4;
+const F_GETLK: u64 = 5;
+const F_SETLK: u64 = 6;
+const F_SETLKW: u64 = 7;
+const F_OFD_GETLK: u64 = 36;
+const F_OFD_SETLK: u64 = 37;
+const F_OFD_SETLKW: u64 = 38;
 const F_DUPFD_CLOEXEC: u64 = 1030;
+const F_SETPIPE_SZ: u64 = 1031;
+const F_GETPIPE_SZ: u64 = 1032;
+const F_ADD_SEALS: u64 = 1033;
+const F_GET_SEALS: u64 = 1034;
+/// `struct flock`'s "unlocked" type.
+const F_UNLCK: i16 = 2;
 const FD_CLOEXEC: u64 = 1;
 
 pub fn fcntl(fd: u64, command: u64, argument: u64) -> Result<u64> {
@@ -350,6 +381,21 @@ pub fn fcntl(fd: u64, command: u64, argument: u64) -> Result<u64> {
             files.get(descriptor(fd)?)?.set_status_flags(argument as u32);
             Ok(0)
         }
+        // Record locks aren't enforced: every lock is granted, and a test
+        // finds nothing in the way. Programs that lock their files (SQLite,
+        // Firefox's profile lock) work as long as one program uses a file,
+        // which is the common case.
+        F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => files.get(descriptor(fd)?).map(|_| 0),
+        F_GETLK | F_OFD_GETLK => {
+            files.get(descriptor(fd)?)?;
+            drop(files);
+            // l_type is the first field of `struct flock`.
+            user::write_value(argument, &F_UNLCK)?;
+            Ok(0)
+        }
+        F_GETPIPE_SZ | F_SETPIPE_SZ => files.get(descriptor(fd)?).map(|_| 65536),
+        F_ADD_SEALS => files.get(descriptor(fd)?)?.inode.add_seals(argument as u32).map(|_| 0),
+        F_GET_SEALS => files.get(descriptor(fd)?)?.inode.seals().map(u64::from),
         _ => Err(Errno::EINVAL),
     }
 }

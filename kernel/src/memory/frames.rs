@@ -4,6 +4,12 @@
 //! bitmap lives at the start of the first free region big enough for it.
 //! Single-frame allocations search onward from the last one (next fit), so
 //! they're usually found in the first word checked.
+//!
+//! Frames can be shared: a page mapped into two processes after `fork`, or
+//! a file's page in the page cache and in every program that maps it. A
+//! count per frame (next to the bitmap) says how many owners it has;
+//! [`share`] adds one, and [`free`] drops one and frees the frame when the
+//! last goes.
 
 use bootinfo::{MemoryKind, MemoryRegion};
 
@@ -17,6 +23,8 @@ const LOW_MEMORY_END: u64 = 1 << 20;
 struct FrameAllocator {
     /// Bit set = frame in use (or not RAM at all).
     bitmap: &'static mut [u64],
+    /// Owners of each frame in use (0 for ones never handed out).
+    counts: &'static mut [u32],
     /// Frames ever made available: free RAM plus what was reclaimed.
     managed: usize,
     free: usize,
@@ -47,24 +55,33 @@ pub fn init(regions: &[MemoryRegion]) {
     let frames = (end / PAGE_SIZE) as usize;
     let words = frames.div_ceil(64);
     let bitmap_bytes = (words * 8) as u64;
+    let counts_bytes = (words * 64 * 4) as u64;
+    let needed = bitmap_bytes + counts_bytes;
 
     let home = regions
         .iter()
         .filter(|r| r.kind == MemoryKind::Usable)
         .map(|r| (r.start.max(LOW_MEMORY_END), r.end()))
-        .find(|&(start, end)| end > start && end - start >= bitmap_bytes)
+        .find(|&(start, end)| end > start && end - start >= needed)
         .expect("no free memory region can hold the frame bitmap");
 
     // SAFETY: the region is free RAM in the direct map, and nothing else
-    // uses it: the allocator is what hands out free RAM.
-    let bitmap = unsafe { core::slice::from_raw_parts_mut(phys_to_virt(home.0).cast::<u64>(), words) };
+    // uses it: the allocator is what hands out free RAM. The counts follow
+    // the bitmap (which is a multiple of 8 bytes long).
+    let (bitmap, counts) = unsafe {
+        (
+            core::slice::from_raw_parts_mut(phys_to_virt(home.0).cast::<u64>(), words),
+            core::slice::from_raw_parts_mut(phys_to_virt(home.0 + bitmap_bytes).cast::<u32>(), words * 64),
+        )
+    };
     bitmap.fill(u64::MAX);
+    counts.fill(0);
 
-    let mut allocator = FrameAllocator { bitmap, managed: 0, free: 0, next: 0 };
+    let mut allocator = FrameAllocator { bitmap, counts, managed: 0, free: 0, next: 0 };
     for region in regions.iter().filter(|r| r.kind == MemoryKind::Usable) {
         allocator.release_range(region.start, region.end());
     }
-    allocator.claim_range(home.0, home.0 + bitmap_bytes.next_multiple_of(PAGE_SIZE));
+    allocator.claim_range(home.0, home.0 + needed.next_multiple_of(PAGE_SIZE));
     *FRAMES.lock() = Some(allocator);
 }
 
@@ -116,6 +133,7 @@ impl FrameAllocator {
             if word != u64::MAX {
                 let frame = index * 64 + word.trailing_ones() as usize;
                 self.mark_used(frame);
+                self.counts[frame] = 1;
                 self.next = index;
                 return Some(frame as u64 * PAGE_SIZE);
             }
@@ -131,7 +149,10 @@ impl FrameAllocator {
                 // Skip past the frame that's in use.
                 Some(used) => start = (used + 1).next_multiple_of(align),
                 None => {
-                    (start..start + count).for_each(|frame| self.mark_used(frame));
+                    for frame in start..start + count {
+                        self.mark_used(frame);
+                        self.counts[frame] = 1;
+                    }
                     return Some(start as u64 * PAGE_SIZE);
                 }
             }
@@ -139,11 +160,25 @@ impl FrameAllocator {
         None
     }
 
+    /// Drops one owner of a frame, freeing it with the last. (Frames that
+    /// were never handed out, like the bootloader's, have no count and are
+    /// freed outright.)
     fn free(&mut self, address: u64) {
         let frame = (address / PAGE_SIZE) as usize;
         assert!(address.is_multiple_of(PAGE_SIZE), "freeing misaligned frame {address:#x}");
         assert!(!self.is_free(frame), "frame {address:#x} freed twice");
+        if self.counts[frame] > 1 {
+            self.counts[frame] -= 1;
+            return;
+        }
+        self.counts[frame] = 0;
         self.mark_free(frame);
+    }
+
+    fn share(&mut self, address: u64) {
+        let frame = (address / PAGE_SIZE) as usize;
+        assert!(self.counts[frame] > 0, "sharing frame {address:#x}, which isn't allocated");
+        self.counts[frame] += 1;
     }
 }
 
@@ -170,9 +205,21 @@ pub fn allocate_contiguous(count: usize, align: usize) -> Option<u64> {
     with(|frames| frames.allocate_contiguous(count, align.max(1)))
 }
 
-/// Returns a frame to the free pool. Panics on a double free.
+/// Drops one owner of a frame, returning it to the free pool when it has
+/// no more. Panics on a double free.
 pub fn free(address: u64) {
     with(|frames| frames.free(address));
+}
+
+/// Adds an owner to an allocated frame (it's now mapped or cached in one
+/// more place); each owner calls [`free`] when done with it.
+pub fn share(address: u64) {
+    with(|frames| frames.share(address));
+}
+
+/// How many owners a frame has: 1 means whoever asks owns it alone.
+pub fn owners(address: u64) -> u32 {
+    with(|frames| frames.counts[(address / PAGE_SIZE) as usize])
 }
 
 /// Adds a range of RAM that was in use (by the bootloader, say) to the free
@@ -216,6 +263,19 @@ mod tests {
             let bytes = unsafe { core::slice::from_raw_parts(phys_to_virt(frame), PAGE_SIZE as usize) };
             assert!(bytes.iter().all(|&b| b == 0));
             free(frame);
+        }
+
+        fn shared_frames_are_freed_by_their_last_owner() {
+            let before = stats().free_bytes;
+            let frame = allocate().unwrap();
+            share(frame);
+            share(frame);
+            assert_eq!(owners(frame), 3);
+            free(frame);
+            free(frame);
+            assert_eq!(stats().free_bytes, before - PAGE_SIZE);
+            free(frame);
+            assert_eq!(stats().free_bytes, before);
         }
 
         fn contiguous_runs_are_aligned_and_free() {

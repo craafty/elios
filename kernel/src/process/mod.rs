@@ -6,7 +6,7 @@
 //! (see `task`) plus a [`UserThread`] record: its id as programs see it, its
 //! signal mask and the like. The process ends when its last thread does.
 
-mod address_space;
+pub mod address_space;
 pub mod credentials;
 pub mod elf;
 pub mod futex;
@@ -417,7 +417,7 @@ pub fn clone(frame: &InterruptFrame, args: &CloneArgs) -> Result<Pid> {
     }
 
     let parent = &me.process;
-    let mut space = parent.space.lock().as_ref().ok_or(Errno::EFAULT)?.duplicate()?;
+    let mut space = parent.space.lock().as_mut().ok_or(Errno::EFAULT)?.duplicate()?;
     let name = parent.name.lock().clone();
     let inherited = Inherited {
         cwd: parent.cwd.lock().clone(),
@@ -753,7 +753,7 @@ pub fn handle_user_exception(frame: &mut InterruptFrame) {
         let address = crate::arch::read_cr2();
         let write = frame.error_code & 2 != 0;
         let execute = frame.error_code & 0x10 != 0;
-        let resolved = process.space.lock().as_mut().is_some_and(|space| space.handle_fault(address, write, execute));
+        let resolved = address_space::resolve_fault(&process.space, address, write, execute);
         if resolved {
             return;
         }
@@ -781,6 +781,18 @@ pub fn handle_user_exception(frame: &mut InterruptFrame) {
         warn!("{} (pid {}): {description} at {:#x}", process.name.lock(), process.pid, frame.rip);
     }
     signal::fault(&thread, frame, signal, address);
+}
+
+/// Handles a page fault the kernel took on a user address while reading or
+/// writing memory for a program. System calls check user memory and map
+/// it before using it, but another thread of the program can change it
+/// meanwhile: a `fork` makes its pages copy-on-write. Returns whether the
+/// fault was resolved (and the access can be retried).
+pub fn handle_kernel_fault(frame: &InterruptFrame, address: u64) -> bool {
+    let Some(process) = task::current_process() else { return false };
+    let write = frame.error_code & 2 != 0;
+    let interrupts_were_on = frame.rflags & (1 << 9) != 0;
+    address_space::resolve_kernel_fault(&process.space, address, write, interrupts_were_on)
 }
 
 /// A snapshot of a process, for `ps`.
@@ -878,7 +890,9 @@ mod tests {
 
         fn linux_c_programs_pass_their_self_tests() {
             // Built by the host's C compiler, if there was one.
-            for program in ["ctest", "sigtest", "threadtest", "nettest", "permtest", "timertest", "hello-c", "hello-dynamic"] {
+            for program in [
+                "ctest", "sigtest", "threadtest", "nettest", "permtest", "timertest", "memtest", "hello-c", "hello-dynamic",
+            ] {
                 let path = alloc::format!("/usr/bin/{program}");
                 if fs::lookup("/", &path, true).is_err() {
                     continue;

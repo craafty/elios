@@ -331,13 +331,14 @@ fn maps(process: &process::Process) -> String {
     let space = process.space.lock();
     let Some(space) = space.as_ref() else { return String::new() };
     let mut text = String::new();
-    for (start, end, protection) in space.areas() {
+    for (start, end, protection, shared) in space.areas() {
         let flag = |bit, c| if protection & bit != 0 { c } else { '-' };
         text.push_str(&format!(
-            "{start:012x}-{end:012x} {}{}{}p 00000000 00:00 0\n",
+            "{start:012x}-{end:012x} {}{}{}{} 00000000 00:00 0\n",
             flag(process::PROT_READ, 'r'),
             flag(process::PROT_WRITE, 'w'),
-            flag(process::PROT_EXEC, 'x')
+            flag(process::PROT_EXEC, 'x'),
+            if shared { 's' } else { 'p' }
         ));
     }
     text

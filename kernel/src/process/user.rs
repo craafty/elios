@@ -8,6 +8,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::address_space;
 use crate::errno::{Errno, Result};
 use crate::task;
 
@@ -18,8 +19,15 @@ pub fn check(address: u64, len: usize, write: bool) -> Result<()> {
         return Ok(());
     }
     let process = task::current_process().ok_or(Errno::EFAULT)?;
-    let mut space = process.space.lock();
-    space.as_mut().ok_or(Errno::EFAULT)?.prepare_access(address, len as u64, write)
+    loop {
+        // A page that must be fetched first (perhaps from a disk) is
+        // fetched without the lock, then the check starts over.
+        let pending = process.space.lock().as_mut().ok_or(Errno::EFAULT)?.prepare_access(address, len as u64, write)?;
+        let Some((page, _)) = pending else { return Ok(()) };
+        if !address_space::resolve_fault(&process.space, page, write, false) {
+            return Err(Errno::EFAULT);
+        }
+    }
 }
 
 pub fn read_value<T: Copy>(address: u64) -> Result<T> {
@@ -50,8 +58,8 @@ pub fn read_bytes(address: u64, len: usize) -> Result<Vec<u8>> {
 
 /// A user buffer the kernel can fill in place (for `read`).
 ///
-/// The slice stays valid while the system call runs: processes have a
-/// single thread, so nothing can unmap it meanwhile.
+/// The slice stays valid while the system call runs unless another thread
+/// of the program unmaps it meanwhile (see "Limits" in HOW-IT-WORKS).
 pub fn buffer_mut(address: u64, len: usize) -> Result<&'static mut [u8]> {
     check(address, len, true)?;
     if len == 0 {
