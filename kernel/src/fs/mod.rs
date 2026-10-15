@@ -16,6 +16,7 @@ pub mod epoll;
 pub mod events;
 pub mod ext2fs;
 pub mod fatfs;
+pub mod fbdev;
 pub mod memfd;
 pub mod mount;
 pub mod pipe;

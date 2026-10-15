@@ -2,5 +2,8 @@ root:x:0:
 tty:x:5:
 disk:x:6:
 wheel:x:10:root
+audio:x:29:
+video:x:44:
+input:x:105:
 users:x:100:
 nogroup:x:65534:

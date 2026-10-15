@@ -85,12 +85,28 @@ cargo xtask run --release     # optimized build
 cargo xtask run --gdb         # wait for a debugger on localhost:1234
 cargo xtask run --trace       # log interrupts and CPU resets to target/qemu.log
 cargo xtask run --cpus 8      # more (or fewer) CPUs; the default is 4
+cargo xtask run --memory 3G   # more memory (the default is 1G)
 cargo xtask run --forward 8080:80  # reach port 80 in eliOS at localhost:8080
 cargo xtask run --second-disk # an empty 2 GiB disk to format, mount, install to
 cargo xtask run --usb-stick   # start from a (virtual) USB stick, as on a real PC
 cargo xtask test              # boot a test kernel and run its tests
 cargo xtask image             # a fresh bootable disk image, target/eliOS.img
 ```
+
+### The desktop
+
+eliOS has a small graphical desktop of its own, `desktop`, which runs
+Wayland programs. Start QEMU with some memory to spare (installed packages
+live in memory on the live system), then in eliOS:
+
+```sh
+eli add foot font-dejavu      # a terminal, and a font for it
+desktop foot                  # the desktop, with a terminal in it
+```
+
+The bar's buttons start a terminal or Firefox (`eli add firefox` first);
+Super+Enter opens a terminal, Super+Tab switches windows, Super+Q closes
+one, and Ctrl+Alt+Backspace goes back to the text console.
 
 ### On real hardware
 
@@ -279,5 +295,10 @@ glyph and rebuild.
       Intel 7260 Wi-Fi driver (firmware loaded, MAC address read, radio
       calibrated) and a Bluetooth probe; next, Wi-Fi networking (scanning,
       WPA2), Bluetooth, and a simple desktop that runs Firefox
-- [ ] **Next:** a graphical desktop, Unix domain sockets, and TLS for
-      HTTPS
+- [x] **Desktop groundwork:** copy-on-write `fork`, shared memory
+      (`memfd`, `MAP_SHARED`, a page cache), `epoll`, `eventfd`,
+      `timerfd`, Unix domain sockets with descriptor passing,
+      pseudo-terminals, `/dev/fb0`
+- [x] **Desktop:** a Wayland compositor of eliOS's own (`desktop`), running
+      Alpine's Wayland programs
+- [ ] **Next:** Firefox, sound, the camera, TLS for HTTPS

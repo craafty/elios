@@ -127,6 +127,11 @@ pub fn open_at(dirfd: u64, path: u64, flags: u64, mode: u64) -> Result<u64> {
         Some(instance) => instance?,
         None => inode,
     };
+    // Opening a terminal makes it the controlling one, if there's none.
+    const O_NOCTTY: u32 = 0o400;
+    if flags & O_NOCTTY == 0 && inode.metadata().kind == FileKind::CharDevice {
+        crate::tty::adopt(&inode);
+    }
     let open = OpenFile::new(inode, full, flags);
     let fd = process::current().files.lock().insert(open, flags & O_CLOEXEC != 0, 0)?;
     Ok(fd as u64)

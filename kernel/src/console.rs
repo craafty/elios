@@ -114,6 +114,9 @@ pub struct Console<'a> {
 
     /// Pixel rows that differ from video memory, as `start..end`.
     dirty: Option<(usize, usize)>,
+
+    /// A graphical program has the screen: text is kept, but not drawn.
+    hidden: bool,
 }
 
 impl<'a> Console<'a> {
@@ -140,6 +143,7 @@ impl<'a> Console<'a> {
             cursor_visible: false,
             cursor_drawn: None,
             dirty: None,
+            hidden: false,
             fb,
         };
         console.clear();
@@ -186,9 +190,23 @@ impl<'a> Console<'a> {
         self.row = y.div_ceil(font::HEIGHT).min(self.rows - 1);
     }
 
+    /// Stops drawing on the screen (a graphical program has it), or starts
+    /// again, redrawing everything.
+    pub fn set_hidden(&mut self, hidden: bool) {
+        self.hidden = hidden;
+        if !hidden {
+            self.cursor_drawn = None;
+            self.mark_dirty(0, self.height);
+            self.flush();
+        }
+    }
+
     /// Copies everything drawn since the last flush to the screen, and
     /// draws the cursor.
     pub fn flush(&mut self) {
+        if self.hidden {
+            return;
+        }
         if let Some(row) = self.cursor_drawn.take() {
             self.mark_dirty(row * font::HEIGHT, (row + 1) * font::HEIGHT);
         }

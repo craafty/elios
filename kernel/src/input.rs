@@ -55,6 +55,9 @@ const QUEUE_LIMIT: usize = 1024;
 /// Linux's character device major number for input devices; evdev files
 /// are minors 64 and up.
 const INPUT_MAJOR: u64 = 13;
+/// The `input` group, whose members (the computer's users) may read input
+/// devices.
+const INPUT_GROUP: u32 = 105;
 
 /// What a device can report, for the `EVIOCGBIT` family of ioctls.
 #[derive(Clone)]
@@ -212,7 +215,11 @@ impl Device {
     }
 
     fn metadata(&self) -> Metadata {
-        Metadata { rdev: self.rdev(), ..Metadata::virtual_file(FileKind::CharDevice, self.inode, 0o660) }
+        Metadata {
+            rdev: self.rdev(),
+            gid: INPUT_GROUP,
+            ..Metadata::virtual_file(FileKind::CharDevice, self.inode, 0o660)
+        }
     }
 
     fn present(self: &Arc<Self>) -> bool {

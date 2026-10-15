@@ -182,6 +182,8 @@ pub fn getpgid(pid: u64) -> Result<u64> {
 pub fn setsid() -> Result<u64> {
     let me = process::current();
     me.set_group(me.pid);
+    // A new session has no controlling terminal until it opens one.
+    *me.terminal.lock() = None;
     Ok(u64::from(me.pid))
 }
 

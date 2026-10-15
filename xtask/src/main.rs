@@ -32,6 +32,7 @@ options:
                forget the firmware's settings (boot entries) (run)
   --no-kvm     emulate the CPU even if hardware virtualization is available
   --cpus N     give the machine N CPUs (default 4)
+  --memory M   give the machine M of memory, like 4G (default 1G)
   --forward H:G  forward TCP port H on this machine to port G in eliOS
   --second-disk  attach target/second-disk.img (an empty 2 GiB NVMe disk,
                kept between runs) to try partitioning and installing
@@ -81,6 +82,8 @@ struct Options {
     no_kvm: bool,
     /// None for the default.
     cpus: Option<usize>,
+    /// Memory in MiB; None for the default (1 GiB).
+    memory: Option<u32>,
     /// TCP ports to forward from the host into eliOS: (host, guest).
     forwards: Vec<(u16, u16)>,
     second_disk: bool,
@@ -158,11 +161,24 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options, Stri
                 let count = args.next().and_then(|count| count.parse().ok()).filter(|&count| (1..=64).contains(&count));
                 options.cpus = Some(count.ok_or("--cpus needs a number from 1 to 64")?);
             }
+            "--memory" => {
+                let mib = args.next().and_then(|text| parse_memory(&text));
+                options.memory = Some(mib.ok_or("--memory needs a size like 4G or 2048M")?);
+            }
             "--" => options.qemu_args.extend(args.by_ref()),
             _ => return Err(format!("unknown option `{arg}`\n\n{USAGE}")),
         }
     }
     Ok(options)
+}
+
+/// A memory size like `4G` or `2048M` (or a number of MiB), in MiB.
+fn parse_memory(text: &str) -> Option<u32> {
+    let (number, scale) = match text.strip_suffix(['G', 'g']) {
+        Some(number) => (number, 1024),
+        None => (text.strip_suffix(['M', 'm']).unwrap_or(text), 1),
+    };
+    number.parse::<u32>().ok().map(|n| n * scale).filter(|&mib| (256..=65536).contains(&mib))
 }
 
 fn workspace_root() -> PathBuf {
@@ -292,6 +308,8 @@ fn build_userland() -> Result<PathBuf, String> {
             "build",
             "--package",
             "eliutils",
+            "--package",
+            "desktop",
             "--target",
             USER_TARGET,
             // Tier 3 target: the standard library is built from source.
@@ -326,6 +344,8 @@ fn build_initrd() -> Result<PathBuf, String> {
     }
     let eliauth = eliutils.with_file_name("eliauth");
     fs::copy(&eliauth, bin.join("eliauth")).map_err(|e| format!("copying eliauth: {e}"))?;
+    let desktop = eliutils.with_file_name("desktop");
+    fs::copy(&desktop, bin.join("desktop")).map_err(|e| format!("copying desktop: {e}"))?;
     for (name, _) in AUTH_APPLETS {
         symlink("eliauth", &bin.join(name))?;
     }
@@ -557,7 +577,8 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
     let mut qemu = Command::new("qemu-system-x86_64");
     let cpus = options.cpus.unwrap_or(DEFAULT_CPUS).to_string();
     // 1 GiB: packages installed on the live system live in memory.
-    qemu.args(["-machine", "q35", "-m", "1G", "-smp", &cpus])
+    let memory = format!("{}M", options.memory.unwrap_or(1024));
+    qemu.args(["-machine", "q35", "-m", &memory, "-smp", &cpus])
         // An Intel network card on QEMU's built-in NAT network ("user"
         // networking: the guest is 10.0.2.15, the host 10.0.2.2, DNS
         // 10.0.2.3), so eliOS can reach the host and the internet.

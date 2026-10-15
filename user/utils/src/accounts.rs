@@ -194,6 +194,9 @@ pub fn adduser(arguments: &[String]) -> i32 {
         shell: "/bin/sh".into(),
     };
     groups.push(Group { name: name.clone(), gid: id, members: Vec::new() });
+    for group in groups.iter_mut().filter(|group| users::SEAT_GROUPS.contains(&group.name.as_str())) {
+        group.members.push(name.clone());
+    }
     if admin {
         match groups.iter_mut().find(|group| group.name == users::ADMIN_GROUP) {
             Some(wheel) => wheel.members.push(name.clone()),

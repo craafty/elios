@@ -128,7 +128,10 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
     }
 
     match boot_info.framebuffer() {
-        Some(fb) => info!("display: {}x{}", fb.width, fb.height),
+        Some(fb) => {
+            info!("display: {}x{}", fb.width, fb.height);
+            fs::fbdev::init(fb);
+        }
         None => warn!("no framebuffer; output is on the serial port only"),
     }
     log_memory(boot_info, reclaimed);

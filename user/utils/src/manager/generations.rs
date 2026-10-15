@@ -197,6 +197,10 @@ fn apply_accounts(config: &Config) -> Result<(), String> {
         }
         None => groups.push(Group { name: users::ADMIN_GROUP.into(), gid: 10, members: admins }),
     }
+    // The devices of the person at the computer: everyone configured.
+    for group in groups.iter_mut().filter(|group| users::SEAT_GROUPS.contains(&group.name.as_str())) {
+        group.members = config.users.iter().map(|user| user.name.clone()).collect();
+    }
     let id_text: String = ids.iter().map(|(name, id)| format!("{name} {id}\n")).collect();
     fs::write(IDS, id_text.as_bytes()).map_err(|error| format!("{IDS}: {error}"))?;
     users::write_users(&accounts).map_err(|error| format!("/etc/passwd: {error}"))?;

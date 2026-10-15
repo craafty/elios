@@ -56,11 +56,17 @@ impl Inode for Device {
     }
 }
 
-/// /dev/tty: the terminal itself, but open to everyone (it's the caller's
-/// own terminal), unlike /dev/console, which belongs to whoever logged in.
+/// /dev/tty: the caller's controlling terminal (the console if it has
+/// none), open to everyone since it's their own.
 struct ControllingTerminal {
     inode: u64,
-    terminal: Arc<dyn Inode>,
+}
+
+impl ControllingTerminal {
+    fn terminal(&self) -> Arc<dyn Inode> {
+        let terminal = crate::task::current_process().and_then(|process| process.terminal.lock().clone());
+        terminal.unwrap_or_else(tty::console)
+    }
 }
 
 impl Inode for ControllingTerminal {
@@ -73,31 +79,31 @@ impl Inode for ControllingTerminal {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        self.terminal.read_at(offset, buf)
+        self.terminal().read_at(offset, buf)
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
-        self.terminal.write_at(offset, buf)
+        self.terminal().write_at(offset, buf)
     }
 
     fn read_stream(&self, buf: &mut [u8], nonblocking: bool) -> Result<usize> {
-        self.terminal.read_stream(buf, nonblocking)
+        self.terminal().read_stream(buf, nonblocking)
     }
 
     fn write_stream(&self, buf: &[u8], nonblocking: bool) -> Result<usize> {
-        self.terminal.write_stream(buf, nonblocking)
+        self.terminal().write_stream(buf, nonblocking)
     }
 
     fn ioctl(&self, request: u64, argument: u64) -> Result<u64> {
-        self.terminal.ioctl(request, argument)
+        self.terminal().ioctl(request, argument)
     }
 
     fn poll(&self, flags: u32) -> u16 {
-        self.terminal.poll(flags)
+        self.terminal().poll(flags)
     }
 
-    fn on_close(&self, flags: u32) {
-        self.terminal.on_close(flags);
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
     }
 }
 
@@ -224,8 +230,9 @@ pub fn directory() -> Arc<dyn Inode> {
         let _ = dev.link(name, Arc::new(Device { inode: ramfs::next_inode_number(), kind }));
     }
     let console: Arc<dyn Inode> = tty::console();
-    let _ = dev.link("console", console.clone());
-    let _ = dev.link("tty", Arc::new(ControllingTerminal { inode: ramfs::next_inode_number(), terminal: console }));
+    let _ = dev.link("console", console);
+    let _ = dev.link("tty", Arc::new(ControllingTerminal { inode: ramfs::next_inode_number() }));
+    let _ = dev.link("ptmx", tty::PtyMultiplexer::new());
     // Shared memory files (shm_open), writable by everyone like /tmp.
     let _ = dev.link("shm", ramfs::Directory::new(super::Attributes::root(0o1777)));
     match DEV.set(dev) {

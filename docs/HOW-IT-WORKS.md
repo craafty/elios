@@ -1495,7 +1495,40 @@ bytes: the keyboard (decoded to the bytes a terminal would send, such as
 `ESC [ A` for the up arrow) and the serial port (so a terminal on the host,
 or a script, can drive eliOS). Output goes to both the screen and serial.
 
+### Pseudo-terminals
+
+A terminal emulator in the desktop (or `ssh`, or `script`) needs a terminal
+that a *program* plays the keyboard and screen of. Opening `/dev/ptmx`
+makes a pair: the program holds the **master** side, and `/dev/pts/N` is
+the **slave**, an ordinary terminal for the shell to run on. It's the same
+line discipline as the console's (it's the same code); only where output
+goes differs. Writing to the master is typing at the terminal; what
+programs write to the slave collects for the master to read, with `\n`
+turned into `\r\n` as terminals expect (`ONLCR`). The window size belongs
+to the terminal, set by the emulator (`TIOCSWINSZ` on the master), and a
+change sends `SIGWINCH` to the foreground group. When the last slave
+descriptor closes (the shell exited), reading the master fails with `EIO`,
+which is how emulators notice; when the master closes, the terminal hangs
+up: its programs get `SIGHUP` and end of file.
+
+Each process has a **controlling terminal**, which `/dev/tty` opens:
+inherited by children, dropped by `setsid`, and taken by opening a
+terminal (or `TIOCSCTTY`) without one. Programs started in a terminal
+emulator then reach their own terminal, not the console.
+
 ## 18. Devices and drivers
+
+### The framebuffer device (`fs/fbdev.rs`)
+
+`/dev/fb0` is Linux's framebuffer device over the screen the bootloader
+found: its size and pixel layout come from the `FBIOGET_VSCREENINFO` and
+`FBIOGET_FSCREENINFO` ioctls, and `mmap` maps the screen's memory itself
+(as device memory, write-combined). While any program has it open for
+writing, the text console stops drawing; it keeps its text and redraws it
+when the last such program closes the device, so a desktop that crashes
+hands the screen back. Members of the `video` group may open it (every
+user of the computer is one, as on desktop Linux systems; `input` and
+`audio` likewise).
 
 ### PS/2 keyboard (`keyboard.rs`)
 
@@ -2216,6 +2249,49 @@ and through the firmware boot entry alongside another system's
 partitions), logs in, and keeps files across reboots. (The first version
 installed a copy of the system on an ext2 root partition; the kernel still
 accepts `root=PARTUUID=...` for that layout.)
+
+### The desktop (`user/desktop`)
+
+`desktop` is eliOS's graphical desktop: a Wayland compositor, written from
+the protocol specification. Programs that speak Wayland (GTK and Qt
+applications, Firefox, terminal emulators like `foot`) connect to its
+socket, `$XDG_RUNTIME_DIR/wayland-0`, and draw their windows into shared
+memory they hand it; it composes them on the screen and sends them input.
+It's one event loop around `epoll`, with a 60 Hz timer for redrawing.
+
+- **The wire protocol** (`wire.rs`): messages are an object id, a size and
+  opcode, and 32-bit-aligned arguments (integers, 24.8 fixed-point
+  numbers, strings, arrays, object ids); file descriptors travel beside
+  them as `SCM_RIGHTS`, in the order messages use them.
+- **Objects** (`server.rs`): each client has a table of objects by id. The
+  globals offered are `wl_compositor`, `wl_subcompositor`, `wl_shm`,
+  `wl_seat`, `wl_output`, `xdg_wm_base` and a stub
+  `wl_data_device_manager`. A client's shared memory pools are mapped
+  (and remapped when they grow); buffers are views into them.
+- **Surfaces** (`surface.rs`): changes are pending until a commit applies
+  them all at once. A committed buffer is *copied* into the surface and
+  released straight away, so clients can reuse it and the desktop never
+  reads memory a client is changing. Subsurfaces (Firefox draws its
+  content into one) follow the parent's commits when synchronized.
+- **The shell** (`shell.rs`): a bar along the top (buttons for a terminal
+  and Firefox, a tab per window, a clock); every window maximized below
+  it, so toolkits leave out shadows and rounded corners; dialogs centered;
+  popup menus where their positioner says, slid to stay on screen; the
+  focused window on top. Frame callbacks are answered after each redraw.
+- **Input**: keyboards and mice are read from `/dev/input` (grabbed, so
+  the text console stops seeing keys). Clients get a keymap, a US layout
+  in XKB's text format (`keymap.rs`), which they compile with
+  libxkbcommon, plus key codes and modifier states. Mice move a pointer
+  with a little acceleration; the arrow is the desktop's own, unless the
+  client under it sets one.
+- **Drawing** (`render.rs`): into a back buffer, blending surfaces with
+  alpha, and only the damaged part is copied to the screen (video memory is
+  slow to read, so it's only written). The bar's text uses the console's
+  font, read from the kernel's source.
+
+Shortcuts: Super+Enter a terminal, Super+F Firefox, Super+Tab the next
+window, Super+Q closes the front one, Ctrl+Alt+Backspace quits back to the
+text console. `desktop PROGRAM` starts a program once it's up.
 
 ### Linux programs
 

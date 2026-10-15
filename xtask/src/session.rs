@@ -93,6 +93,14 @@ pub fn run(mut qemu: Command, steps: &[String], monitor: &Path) -> Result<(), St
             thread::sleep(Duration::from_secs_f64(seconds));
         } else if let Some(key) = step.strip_prefix("@key ") {
             monitor_command(monitor, &format!("sendkey {key}"))?;
+        } else if let Some(text) = step.strip_prefix("@type ") {
+            // Through the keyboard, for programs that read it directly (the
+            // desktop) rather than the serial console.
+            for c in unescape(text).iter().map(|&b| b as char) {
+                let key = qemu_key(c).ok_or_else(|| format!("can't type {c:?}"))?;
+                monitor_command(monitor, &format!("sendkey {key}"))?;
+                thread::sleep(Duration::from_millis(30));
+            }
         } else if let Some(command) = step.strip_prefix("@monitor ") {
             monitor_command(monitor, command)?;
         } else if let Some(path) = step.strip_prefix("@screenshot ") {
@@ -207,4 +215,48 @@ fn transcript(data: &[u8]) -> String {
         }
     }
     result
+}
+
+/// QEMU's `sendkey` name for the key that types `c` (US layout).
+fn qemu_key(c: char) -> Option<String> {
+    const SHIFTED: &str = "!@#$%^&*()_+{}|:\"~<>?";
+    const PLAIN: &str = "1234567890-=[]\\;'`,./";
+    let name = |c: char| -> Option<&'static str> {
+        Some(match c {
+            '1' => "1",
+            '2' => "2",
+            '3' => "3",
+            '4' => "4",
+            '5' => "5",
+            '6' => "6",
+            '7' => "7",
+            '8' => "8",
+            '9' => "9",
+            '0' => "0",
+            '-' => "minus",
+            '=' => "equal",
+            '[' => "bracket_left",
+            ']' => "bracket_right",
+            '\\' => "backslash",
+            ';' => "semicolon",
+            '\'' => "apostrophe",
+            '`' => "grave_accent",
+            ',' => "comma",
+            '.' => "dot",
+            '/' => "slash",
+            _ => return None,
+        })
+    };
+    match c {
+        'a'..='z' => Some(c.to_string()),
+        'A'..='Z' => Some(format!("shift-{}", c.to_ascii_lowercase())),
+        ' ' => Some("spc".into()),
+        '\n' | '\r' => Some("ret".into()),
+        '\t' => Some("tab".into()),
+        c if SHIFTED.contains(c) => {
+            let index = SHIFTED.find(c)?;
+            name(PLAIN.chars().nth(index)?).map(|key| format!("shift-{key}"))
+        }
+        c => name(c).map(String::from),
+    }
 }

@@ -74,6 +74,9 @@ pub struct Process {
     pub credentials: SpinLock<Arc<Credentials>>,
     /// Permission bits taken away from the files it creates.
     umask: AtomicU32,
+    /// The controlling terminal, which `/dev/tty` opens (inherited; a new
+    /// session starts without one).
+    pub terminal: SpinLock<Option<Arc<crate::tty::Tty>>>,
 }
 
 /// Why a process's threads are ending.
@@ -147,6 +150,7 @@ struct Inherited {
     files: FileTable,
     credentials: Arc<Credentials>,
     umask: u32,
+    terminal: Option<Arc<crate::tty::Tty>>,
 }
 
 fn create(parent: Pid, group: Option<Pid>, name: &str, inherited: Inherited) -> Arc<Process> {
@@ -170,6 +174,7 @@ fn create(parent: Pid, group: Option<Pid>, name: &str, inherited: Inherited) -> 
         exit_signal: AtomicU32::new(signal::SIGCHLD),
         credentials: SpinLock::new(inherited.credentials),
         umask: AtomicU32::new(inherited.umask),
+        terminal: SpinLock::new(inherited.terminal),
     });
     PROCESSES.lock().insert(pid, process.clone());
     process
@@ -322,7 +327,13 @@ pub fn start(path: &str, arguments: Vec<String>) -> Result<Pid> {
     for _ in 0..3 {
         files.insert(terminal.clone(), false, 0)?;
     }
-    let inherited = Inherited { cwd: "/".into(), files, credentials: Arc::new(image.credentials), umask: 0o022 };
+    let inherited = Inherited {
+        cwd: "/".into(),
+        files,
+        credentials: Arc::new(image.credentials),
+        umask: 0o022,
+        terminal: Some(crate::tty::console()),
+    };
     let process = create(0, None, base_name(path), inherited);
     *process.executable.lock() = image.path;
     *process.arguments.lock() = image.arguments;
@@ -424,6 +435,7 @@ pub fn clone(frame: &InterruptFrame, args: &CloneArgs) -> Result<Pid> {
         files: parent.files.lock().clone(),
         credentials: parent.credentials.lock().clone(),
         umask: parent.umask(),
+        terminal: parent.terminal.lock().clone(),
     };
     let child = create(parent.pid, Some(parent.group()), &name, inherited);
     *child.signals.lock() = parent.signals.lock().for_child();
@@ -891,7 +903,7 @@ mod tests {
         fn linux_c_programs_pass_their_self_tests() {
             // Built by the host's C compiler, if there was one.
             for program in [
-                "ctest", "sigtest", "threadtest", "nettest", "permtest", "timertest", "memtest", "eventtest", "unixtest",
+                "ctest", "sigtest", "threadtest", "nettest", "permtest", "timertest", "memtest", "eventtest", "unixtest", "ptytest",
                 "hello-c",
                 "hello-dynamic",
             ] {
