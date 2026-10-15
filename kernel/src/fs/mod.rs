@@ -12,6 +12,8 @@
 pub mod cpio;
 pub mod devfs;
 pub mod efivarfs;
+pub mod epoll;
+pub mod events;
 pub mod ext2fs;
 pub mod fatfs;
 pub mod memfd;
@@ -39,9 +41,17 @@ pub const POLLHUP: u16 = 0x10;
 /// Woken whenever any file might have become ready, so `poll` can recheck.
 pub static POLL_EVENTS: WaitQueue = WaitQueue::new();
 
+/// Counts wakeups of [`POLL_EVENTS`] (see `epoll` for what it's for).
+static POLL_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Tells waiting `poll` calls that something changed.
 pub fn notify_poll() {
+    POLL_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Release);
     POLL_EVENTS.wake_all();
+}
+
+pub fn poll_generation() -> u64 {
+    POLL_GENERATION.load(core::sync::atomic::Ordering::Acquire)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +223,12 @@ pub trait Inode: Send + Sync {
 
     /// Called when the last open file referring to this inode is closed.
     fn on_close(&self, _flags: u32) {}
+
+    /// For files that become ready by themselves at a set time (timerfds):
+    /// that time, as a timer tick, so `poll` can wake up for it.
+    fn poll_deadline(&self) -> Option<u64> {
+        None
+    }
 
     /// The memory object holding the file's data, for files that live in
     /// memory (their pages are mapped directly; other files are mapped

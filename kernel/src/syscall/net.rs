@@ -1,11 +1,13 @@
-//! Socket system calls: the Linux API over eliOS's TCP/IP stack.
+//! Socket system calls: the Linux API over eliOS's TCP/IP stack, and Unix
+//! domain sockets (`net::unix`).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::errno::{Errno, Result};
-use crate::fs::{O_NONBLOCK, O_RDWR, OpenFile};
+use crate::fs::{Inode, O_NONBLOCK, O_RDWR, OpenFile};
 use crate::net::socket::{self, AF_INET, Endpoint, SocketFile};
+use crate::net::unix::{self, AF_UNIX};
 use crate::net::{self, Ipv4};
 use crate::process::{self, user};
 
@@ -17,6 +19,51 @@ const MSG_TRUNC: u32 = 0x20;
 const MSG_DONTWAIT: u64 = 0x40;
 const MSG_WAITALL: u64 = 0x100;
 const MSG_NOSIGNAL: u64 = 0x4000;
+
+/// The Unix socket `fd` refers to, if it is one.
+fn unix_socket(fd: u64) -> Result<Option<(Arc<OpenFile>, Arc<unix::Socket>)>> {
+    let file = process::current().files.lock().get(fd as i32 as usize)?;
+    let socket = file.inode.as_any().and_then(|any| any.downcast_ref::<unix::SocketFile>()).map(|f| f.socket.clone());
+    Ok(socket.map(|socket| (file, socket)))
+}
+
+/// Reads a `struct sockaddr_un`.
+fn read_unix_address(address: u64, length: u64) -> Result<unix::Address> {
+    if !(2..=110).contains(&length) {
+        return Err(Errno::EINVAL);
+    }
+    unix::Address::parse(&user::read_bytes(address, length as usize)?)
+}
+
+/// Writes a socket address (as bytes) to a buffer whose size is at
+/// `length` (and becomes the full size).
+fn write_address_bytes(address: u64, length: u64, bytes: &[u8]) -> Result<()> {
+    if address == 0 || length == 0 {
+        return Ok(());
+    }
+    let room: u32 = user::read_value(length)?;
+    user::write_bytes(address, &bytes[..bytes.len().min(room as usize)])?;
+    user::write_value(length, &(bytes.len() as u32))
+}
+
+/// A send on a Unix socket, raising `SIGPIPE` for a broken connection as
+/// Linux does (unless `MSG_NOSIGNAL`).
+fn unix_send(
+    file: &OpenFile,
+    socket: &unix::Socket,
+    data: &[u8],
+    files: Vec<Arc<OpenFile>>,
+    destination: Option<&unix::Address>,
+    flags: u64,
+) -> Result<u64> {
+    match socket.send(data, files, destination, nonblocking(file, flags)) {
+        Err(Errno::EPIPE) if flags & MSG_NOSIGNAL == 0 => {
+            process::send_signal_to_self(process::SIGPIPE);
+            Err(Errno::EPIPE)
+        }
+        result => result.map(|count| count as u64),
+    }
+}
 
 /// Runs `f` with the socket `fd` refers to.
 fn with_socket<R>(fd: u64, f: impl FnOnce(&OpenFile, &SocketFile) -> Result<R>) -> Result<R> {
@@ -30,7 +77,7 @@ fn nonblocking(file: &OpenFile, flags: u64) -> bool {
 }
 
 /// Installs a socket as a new file descriptor.
-fn install(socket: Arc<SocketFile>, flags: u64) -> Result<u64> {
+fn install(socket: Arc<dyn Inode>, flags: u64) -> Result<u64> {
     let status = O_RDWR | if flags & SOCK_NONBLOCK != 0 { O_NONBLOCK } else { 0 };
     let file = OpenFile::new(socket, "socket:".into(), status);
     process::current().files.lock().insert(file, flags & SOCK_CLOEXEC != 0, 0).map(|fd| fd as u64)
@@ -72,25 +119,70 @@ fn write_address(address: u64, length: u64, endpoint: Endpoint) -> Result<()> {
 }
 
 pub fn socket(domain: u64, kind: u64, protocol: u64) -> Result<u64> {
+    if domain == AF_UNIX {
+        if protocol != 0 {
+            return Err(Errno::EPROTONOSUPPORT);
+        }
+        let socket = unix::Socket::new(unix::Kind::from_type(kind & 0xF)?);
+        return install(unix::SocketFile::new(socket), kind);
+    }
     let socket = socket::create(domain, kind & 0xF, protocol)?;
     install(socket, kind)
 }
 
+/// `socketpair`: two connected Unix sockets.
+pub fn socketpair(domain: u64, kind: u64, protocol: u64, fds: u64) -> Result<u64> {
+    if domain != AF_UNIX {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    if protocol != 0 {
+        return Err(Errno::EPROTONOSUPPORT);
+    }
+    let (one, two) = unix::Socket::pair(unix::Kind::from_type(kind & 0xF)?);
+    let first = install(unix::SocketFile::new(one), kind)?;
+    let second = match install(unix::SocketFile::new(two), kind) {
+        Ok(fd) => fd,
+        Err(error) => {
+            let _ = process::current().files.lock().close(first as usize);
+            return Err(error);
+        }
+    };
+    user::write_value(fds, &[first as i32, second as i32])?;
+    Ok(0)
+}
+
 pub fn bind(fd: u64, address: u64, length: u64) -> Result<u64> {
+    if let Some((_, socket)) = unix_socket(fd)? {
+        socket.bind(read_unix_address(address, length)?)?;
+        return Ok(0);
+    }
     let endpoint = read_address(address, length)?;
     with_socket(fd, |_, socket| socket::bind(socket, endpoint)).map(|_| 0)
 }
 
 pub fn connect(fd: u64, address: u64, length: u64) -> Result<u64> {
+    if let Some((file, socket)) = unix_socket(fd)? {
+        socket.connect(&read_unix_address(address, length)?, nonblocking(&file, 0))?;
+        return Ok(0);
+    }
     let endpoint = read_address(address, length)?;
     with_socket(fd, |file, socket| socket::connect(socket, endpoint, nonblocking(file, 0))).map(|_| 0)
 }
 
 pub fn listen(fd: u64, backlog: u64) -> Result<u64> {
+    if let Some((_, socket)) = unix_socket(fd)? {
+        return socket.listen(backlog as i32 as usize).map(|()| 0);
+    }
     with_socket(fd, |_, socket| socket::listen(socket, backlog as i32 as usize)).map(|_| 0)
 }
 
 pub fn accept(fd: u64, address: u64, length: u64, flags: u64) -> Result<u64> {
+    if let Some((file, socket)) = unix_socket(fd)? {
+        let connection = socket.accept(nonblocking(&file, 0))?;
+        let peer = connection.peer_address().unwrap_or(unix::Address::Unnamed);
+        write_address_bytes(address, length, &peer.encode())?;
+        return install(unix::SocketFile::new(connection), flags);
+    }
     let (connection, remote) = with_socket(fd, |file, socket| socket::accept(socket, nonblocking(file, 0)))?;
     write_address(address, length, remote)?;
     install(connection, flags)
@@ -98,6 +190,10 @@ pub fn accept(fd: u64, address: u64, length: u64, flags: u64) -> Result<u64> {
 
 pub fn send_to(fd: u64, buffer: u64, length: u64, flags: u64, address: u64, address_length: u64) -> Result<u64> {
     let data = user::buffer(buffer, length as usize)?;
+    if let Some((file, socket)) = unix_socket(fd)? {
+        let destination = if address == 0 { None } else { Some(read_unix_address(address, address_length)?) };
+        return unix_send(&file, &socket, data, Vec::new(), destination.as_ref(), flags);
+    }
     let destination = if address == 0 { None } else { Some(read_address(address, address_length)?) };
     with_socket(fd, |file, socket| {
         socket::send(socket, data, destination, nonblocking(file, flags), flags & MSG_NOSIGNAL != 0)
@@ -107,6 +203,14 @@ pub fn send_to(fd: u64, buffer: u64, length: u64, flags: u64, address: u64, addr
 
 pub fn receive_from(fd: u64, buffer: u64, length: u64, flags: u64, address: u64, address_length: u64) -> Result<u64> {
     let buf = user::buffer_mut(buffer, length as usize)?;
+    if let Some((file, socket)) = unix_socket(fd)? {
+        let received = socket.receive(buf, nonblocking(&file, flags), flags & MSG_PEEK != 0)?;
+        if address != 0 {
+            write_address_bytes(address, address_length, &received.from.encode())?;
+        }
+        // Files sent along are lost on a plain receive, as on Linux.
+        return Ok(if flags & MSG_TRUNC as u64 != 0 && received.truncated { length } else { received.count as u64 });
+    }
     let (count, from) = with_socket(fd, |file, socket| receive_all(file, socket, buf, flags))?;
     if let Some(from) = from {
         write_address(address, address_length, from)?;
@@ -157,11 +261,101 @@ fn iovecs(header: &MessageHeader) -> Result<Vec<(u64, usize)>> {
         .collect()
 }
 
+const SOL_SOCKET_LEVEL: i32 = 1;
+const SCM_RIGHTS: i32 = 1;
+const SCM_CREDENTIALS: i32 = 2;
+const MSG_CTRUNC: u32 = 0x8;
+const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
+
+/// The files a `sendmsg`'s control messages carry (`SCM_RIGHTS`).
+fn control_files(header: &MessageHeader) -> Result<Vec<Arc<OpenFile>>> {
+    let mut files = Vec::new();
+    if header.control == 0 || header.control_length < 16 {
+        return Ok(files);
+    }
+    let control = user::read_bytes(header.control, header.control_length.min(64 * 1024) as usize)?;
+    let mut offset = 0;
+    while offset + 16 <= control.len() {
+        let length = u64::from_le_bytes(control[offset..offset + 8].try_into().unwrap()) as usize;
+        let level = i32::from_le_bytes(control[offset + 8..offset + 12].try_into().unwrap());
+        let kind = i32::from_le_bytes(control[offset + 12..offset + 16].try_into().unwrap());
+        if length < 16 || offset + length > control.len() {
+            return Err(Errno::EINVAL);
+        }
+        if level == SOL_SOCKET_LEVEL && kind == SCM_RIGHTS {
+            let process = process::current();
+            let table = process.files.lock();
+            for fd in control[offset + 16..offset + length].as_chunks::<4>().0 {
+                files.push(table.get(i32::from_le_bytes(*fd) as usize)?);
+            }
+        }
+        offset += length.next_multiple_of(8);
+    }
+    if files.len() > unix::MAX_FILES_PER_MESSAGE {
+        return Err(Errno::EINVAL);
+    }
+    Ok(files)
+}
+
+/// Writes a `recvmsg`'s control messages: received files (installed as
+/// new descriptors) and the sender's credentials if asked for. Returns
+/// the length written and whether some didn't fit.
+fn write_control(
+    header: &MessageHeader,
+    received: &unix::Received,
+    pass_credentials: bool,
+    flags: u64,
+) -> Result<(u64, bool)> {
+    let room = if header.control == 0 { 0 } else { header.control_length as usize };
+    let mut control = Vec::new();
+    let mut truncated = false;
+    if !received.files.is_empty() {
+        let fitting = room.saturating_sub(16) / 4;
+        truncated |= fitting < received.files.len();
+        let mut fds = Vec::new();
+        {
+            let process = process::current();
+            let mut table = process.files.lock();
+            for file in received.files.iter().take(fitting) {
+                fds.push(table.insert(file.clone(), flags & MSG_CMSG_CLOEXEC != 0, 0)? as i32);
+            }
+        }
+        if !fds.is_empty() {
+            let length = 16 + 4 * fds.len();
+            control.extend_from_slice(&(length as u64).to_le_bytes());
+            control.extend_from_slice(&SOL_SOCKET_LEVEL.to_le_bytes());
+            control.extend_from_slice(&SCM_RIGHTS.to_le_bytes());
+            fds.iter().for_each(|fd| control.extend_from_slice(&fd.to_le_bytes()));
+            control.resize(length.next_multiple_of(8), 0);
+        }
+    }
+    if pass_credentials {
+        if room >= control.len() + 28 {
+            control.extend_from_slice(&28u64.to_le_bytes());
+            control.extend_from_slice(&SOL_SOCKET_LEVEL.to_le_bytes());
+            control.extend_from_slice(&SCM_CREDENTIALS.to_le_bytes());
+            control.extend_from_slice(&received.sender.bytes());
+            control.resize(control.len().next_multiple_of(8), 0);
+        } else {
+            truncated = true;
+        }
+    }
+    let length = control.len().min(room);
+    user::write_bytes(header.control, &control[..length])?;
+    Ok((length as u64, truncated))
+}
+
 pub fn send_message(fd: u64, message: u64, flags: u64) -> Result<u64> {
     let header: MessageHeader = user::read_value(message)?;
     let mut data = Vec::new();
     for (base, length) in iovecs(&header)? {
         data.extend_from_slice(user::buffer(base, length)?);
+    }
+    if let Some((file, socket)) = unix_socket(fd)? {
+        let files = control_files(&header)?;
+        let destination =
+            if header.name == 0 { None } else { Some(read_unix_address(header.name, u64::from(header.name_length))?) };
+        return unix_send(&file, &socket, &data, files, destination.as_ref(), flags);
     }
     let destination =
         if header.name == 0 { None } else { Some(read_address(header.name, u64::from(header.name_length))?) };
@@ -175,6 +369,28 @@ pub fn receive_message(fd: u64, message: u64, flags: u64) -> Result<u64> {
     let mut header: MessageHeader = user::read_value(message)?;
     let vectors = iovecs(&header)?;
     let total: usize = vectors.iter().map(|&(_, length)| length).sum();
+    if let Some((file, socket)) = unix_socket(fd)? {
+        let mut data = alloc::vec![0; total];
+        let received = socket.receive(&mut data, nonblocking(&file, flags), flags & MSG_PEEK != 0)?;
+        let mut copied = 0;
+        for (base, length) in vectors {
+            let chunk = length.min(received.count - copied);
+            user::write_bytes(base, &data[copied..copied + chunk])?;
+            copied += chunk;
+        }
+        if header.name != 0 {
+            let bytes = received.from.encode();
+            let room = (header.name_length as usize).min(bytes.len());
+            user::write_bytes(header.name, &bytes[..room])?;
+            header.name_length = bytes.len() as u32;
+        }
+        let pass = socket.pass_credentials.load(core::sync::atomic::Ordering::Relaxed);
+        let (control_length, control_truncated) = write_control(&header, &received, pass, flags)?;
+        header.control_length = control_length;
+        header.flags = if received.truncated { MSG_TRUNC } else { 0 } | if control_truncated { MSG_CTRUNC } else { 0 };
+        user::write_value(message, &header)?;
+        return Ok(copied as u64);
+    }
     // One byte extra tells whether a datagram was cut short.
     let mut data = alloc::vec![0; total + 1];
     let (count, from) = with_socket(fd, |file, socket| receive_all(file, socket, &mut data, flags))?;
@@ -203,15 +419,24 @@ pub fn receive_message(fd: u64, message: u64, flags: u64) -> Result<u64> {
 }
 
 pub fn shutdown(fd: u64, how: u64) -> Result<u64> {
+    if let Some((_, socket)) = unix_socket(fd)? {
+        return socket.shutdown(how).map(|()| 0);
+    }
     with_socket(fd, |_, socket| socket::shutdown(socket, how)).map(|_| 0)
 }
 
 pub fn get_socket_name(fd: u64, address: u64, length: u64) -> Result<u64> {
+    if let Some((_, socket)) = unix_socket(fd)? {
+        return write_address_bytes(address, length, &socket.local_address().encode()).map(|()| 0);
+    }
     let endpoint = with_socket(fd, |_, socket| socket::local_endpoint(socket))?;
     write_address(address, length, endpoint).map(|_| 0)
 }
 
 pub fn get_peer_name(fd: u64, address: u64, length: u64) -> Result<u64> {
+    if let Some((_, socket)) = unix_socket(fd)? {
+        return write_address_bytes(address, length, &socket.peer_address()?.encode()).map(|()| 0);
+    }
     let endpoint = with_socket(fd, |_, socket| socket::remote_endpoint(socket))?;
     write_address(address, length, endpoint).map(|_| 0)
 }
@@ -223,7 +448,11 @@ const SO_SNDBUF: u64 = 7;
 const SO_RCVBUF: u64 = 8;
 const SO_RCVTIMEO: u64 = 20;
 const SO_SNDTIMEO: u64 = 21;
+const SO_PASSCRED: u64 = 16;
+const SO_PEERCRED: u64 = 17;
 const SO_ACCEPTCONN: u64 = 30;
+const SO_PROTOCOL: u64 = 38;
+const SO_DOMAIN: u64 = 39;
 const IPPROTO_TCP: u64 = 6;
 const TCP_NODELAY: u64 = 1;
 const TCP_MAXSEG: u64 = 2;
@@ -231,6 +460,13 @@ const TCP_MAXSEG: u64 = 2;
 /// `setsockopt`: timeouts are honored; other options are accepted and have
 /// no effect (eliOS has no Nagle delay, fixed buffers, and so on).
 pub fn set_option(fd: u64, level: u64, name: u64, value: u64, length: u64) -> Result<u64> {
+    if let Some((_, socket)) = unix_socket(fd)? {
+        if level == SOL_SOCKET && name == SO_PASSCRED && length >= 4 {
+            let on: i32 = user::read_value(value)?;
+            socket.pass_credentials.store(on != 0, core::sync::atomic::Ordering::Relaxed);
+        }
+        return Ok(0);
+    }
     with_socket(fd, |_, socket| {
         if level == SOL_SOCKET && (name == SO_RCVTIMEO || name == SO_SNDTIMEO) {
             if length < 16 {
@@ -246,12 +482,45 @@ pub fn set_option(fd: u64, level: u64, name: u64, value: u64, length: u64) -> Re
 }
 
 pub fn get_option(fd: u64, level: u64, name: u64, value: u64, length: u64) -> Result<u64> {
+    if let Some((_, socket)) = unix_socket(fd)? {
+        let room: u32 = user::read_value(length)?;
+        if level == SOL_SOCKET && name == SO_PEERCRED {
+            let credentials = socket.peer_credentials().ok_or(Errno::ENOTCONN)?;
+            let bytes = credentials.bytes();
+            let count = (room as usize).min(bytes.len());
+            user::write_bytes(value, &bytes[..count])?;
+            user::write_value(length, &(count as u32))?;
+            return Ok(0);
+        }
+        let result: i32 = match (level, name) {
+            (SOL_SOCKET, SO_TYPE) => socket.kind.as_type(),
+            (SOL_SOCKET, SO_DOMAIN) => AF_UNIX as i32,
+            (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => 256 * 1024,
+            (SOL_SOCKET, SO_ACCEPTCONN) => i32::from(socket.is_listening()),
+            (SOL_SOCKET, SO_PASSCRED) => i32::from(socket.pass_credentials.load(core::sync::atomic::Ordering::Relaxed)),
+            _ => 0,
+        };
+        if room < 4 {
+            return Err(Errno::EINVAL);
+        }
+        user::write_value(value, &result)?;
+        user::write_value(length, &4u32)?;
+        return Ok(0);
+    }
     with_socket(fd, |_, socket| {
         let result: i32 = match (level, name) {
             (SOL_SOCKET, SO_ERROR) => socket::take_error(socket).map_or(0, |error| error as i32),
             (SOL_SOCKET, SO_TYPE) => socket.kind as i32,
             (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => 64 * 1024,
             (SOL_SOCKET, SO_ACCEPTCONN) => i32::from(socket::is_listening(socket)),
+            (SOL_SOCKET, SO_DOMAIN) => AF_INET as i32,
+            (SOL_SOCKET, SO_PROTOCOL) => {
+                if socket.kind == socket::SOCK_STREAM {
+                    6
+                } else {
+                    17
+                }
+            }
             (IPPROTO_TCP, TCP_NODELAY) => 1,
             (IPPROTO_TCP, TCP_MAXSEG) => 1460,
             _ => 0,

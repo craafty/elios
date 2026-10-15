@@ -1445,9 +1445,33 @@ counting twice.
 
 Each inode reports its readiness (for pipes it depends on which end, so the
 open file's flags are passed in). Waiting uses one global wait queue that's
-woken whenever any terminal or pipe changes; `poll` rechecks every
-descriptor. That's simpler than per-file wait lists and cheap at eliOS's
-scale. `select` and `pselect6` are translated into the same mechanism.
+woken whenever any file changes; `poll` rechecks every descriptor. That's
+simpler than per-file wait lists and cheap at eliOS's scale. `select` and
+`pselect6` are translated into the same mechanism.
+
+### Event files and epoll (`fs/events.rs`, `fs/epoll.rs`)
+
+Event loops (GLib's, libwayland's, Firefox's) wait for more than sockets
+and pipes. An **eventfd** is a 64-bit counter: writes add, a read takes
+the total (or one, in semaphore mode) and waits while it's zero; threads
+and processes use it to wake each other. A **timerfd** is a timer read
+like a file: a read returns how many periods have passed since the last
+one. Its expiry is computed from the clock when asked, so it needs no
+timer of its own; instead files can tell `poll` when they'll become ready
+by themselves (`Inode::poll_deadline`), and every wait includes that in
+its deadline.
+
+**epoll** keeps a set of watched files and waits for all of them with the
+same global wait queue as `poll`. Entries hold the open file weakly, so
+closing a file's last descriptor drops it from every set, as on Linux. An
+epoll set is itself readable when something in it is ready, so sets can
+be nested. One-shot entries go quiet after one report until re-armed.
+*Edge-triggered* entries should be reported once per change, which would
+need every file to count its changes; instead the wait queue counts its
+wakeups (a "generation"), and an edge-triggered entry is reported at most
+once per generation while ready. Programs following the edge-triggered
+contract (read until `EAGAIN`) see every event, now and then with an extra
+one, and an always-writable socket doesn't make `epoll_wait` spin.
 
 ## 17. The terminal
 
@@ -1989,6 +2013,33 @@ ioctls on any socket (address, netmask, flags, MAC, MTU...), and
 `/proc/net/dev`, `route`, `arp`, `tcp` and `udp` in Linux's formats. That's
 all BusyBox's `ifconfig`, `route` and `netstat` need.
 
+### Unix domain sockets (`net/unix.rs`)
+
+Connections between programs on one machine: the Wayland protocol, D-Bus
+and Firefox's processes all use them. A socket is named by a path (bound
+to a socket file in an in-memory directory, through which `connect` finds
+it), by an *abstract* name (a leading NUL byte; a global table, not the
+file system), or not at all (`socketpair`). Streams, sequenced packets
+and datagrams are supported.
+
+Each socket has a queue of messages received. A connecting socket makes
+the listener's end of the connection itself and puts it in the listener's
+backlog for `accept`. A sender waits while the receiver's queue holds
+256 KiB; a stream's send goes in pieces if it must. A stream reads as one
+run of bytes across messages, except that it stops before a message that
+carries files, so files arrive with the bytes they were sent with.
+
+**Passing files** (`SCM_RIGHTS` control messages) is the reason Wayland
+works: a client puts the descriptor of the shared memory it draws into in
+a message, and the compositor receives a descriptor for the same open
+file. The open files travel inside the message (holding a reference), and
+`recvmsg` installs them in the receiver's table, close-on-exec if
+`MSG_CMSG_CLOEXEC` asks. `SO_PEERCRED` says which process and user is on
+the other end (taken when the connection was made), and `SO_PASSCRED`
+adds the sender's to each message. Closing a socket gives its peer end of
+file (and `EPIPE`/`SIGPIPE` to writers); connections waiting in a closed
+listener's backlog are closed too.
+
 ### Name lookup
 
 `libeli`'s resolver (`user/eli/src/net.rs`) tries a dotted address, then
@@ -2411,8 +2462,9 @@ Current limits, roughly in order of how much they'd matter to a user:
 - **Wi-Fi** is at its first stage (firmware loaded, settings read, radio
   calibrated on the Intel 7260); it can't connect yet.
 - **Networking is IPv4 only**, with one network card (Intel e1000
-  family), no TLS (so `https` doesn't work), no Unix domain sockets, and
-  TCP without congestion control or out-of-order buffering.
+  family), no TLS (so `https` doesn't work), and TCP without congestion
+  control or out-of-order buffering. Unix sockets live only in in-memory
+  directories (not on ext2 or FAT).
 - **Packages:** install scripts aren't run, and without TLS, programs
   that need HTTPS (git cloning from GitHub, for one) can't reach those
   servers. The system image itself is updated by replacing the files on

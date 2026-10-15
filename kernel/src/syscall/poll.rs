@@ -1,10 +1,14 @@
-//! Waiting for files to become ready: `poll`, `ppoll`, `select` and
-//! `pselect6`.
+//! Waiting for files to become ready: `poll`, `ppoll`, `select`,
+//! `pselect6` and `epoll`; and the event files waited for: `eventfd` and
+//! `timerfd`.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::errno::{Errno, Result};
-use crate::fs::{self, POLLERR, POLLHUP, POLLIN, POLLOUT};
+use crate::fs::epoll::{self, Epoll};
+use crate::fs::events::{Clock, EventFd, TimerFd};
+use crate::fs::{self, O_CLOEXEC, O_NONBLOCK, OpenFile, POLLERR, POLLHUP, POLLIN, POLLOUT};
 use crate::process::{self, user};
 use crate::time;
 
@@ -25,7 +29,16 @@ struct PollFd {
 /// ready.
 fn wait(entries: &mut [PollFd], deadline: Option<u64>) -> Result<u64> {
     let process = process::current();
-    let ready = fs::POLL_EVENTS.wait_until_deadline(deadline, || {
+    // Files that become ready at a set time (timerfds) need a wakeup then.
+    let files_deadline = {
+        let files = process.files.lock();
+        entries.iter().filter_map(|entry| files.get(entry.fd as usize).ok()?.inode.poll_deadline()).min()
+    };
+    let effective = match (deadline, files_deadline) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let ready = fs::POLL_EVENTS.wait_until_deadline(effective, || {
         if process::signal_pending() {
             return Some(Err(Errno::EINTR));
         }
@@ -48,6 +61,8 @@ fn wait(entries: &mut [PollFd], deadline: Option<u64>) -> Result<u64> {
     });
     match ready {
         Some(result) => result,
+        // A timerfd came due: look again.
+        None if deadline.is_none_or(|deadline| time::ticks() < deadline) => wait(entries, deadline),
         None => {
             entries.iter_mut().for_each(|entry| entry.returned = 0);
             Ok(0)
@@ -166,4 +181,145 @@ pub fn select(count: u64, read: u64, write: u64, except: u64, timeout: u64, time
         }
     }
     Ok(total)
+}
+
+fn insert_file(inode: Arc<dyn fs::Inode>, name: &str, flags: u32) -> Result<u64> {
+    let file = OpenFile::new(inode, alloc::string::String::from(name), fs::O_RDWR | (flags & O_NONBLOCK));
+    let fd = process::current().files.lock().insert(file, flags & O_CLOEXEC != 0, 0)?;
+    Ok(fd as u64)
+}
+
+/// `epoll_create1` (and `epoll_create`, whose size is ignored).
+pub fn epoll_create(flags: u64) -> Result<u64> {
+    let flags = flags as u32;
+    if flags & !O_CLOEXEC != 0 {
+        return Err(Errno::EINVAL);
+    }
+    insert_file(Epoll::new(), "anon_inode:[eventpoll]", flags)
+}
+
+fn epoll_of(file: &Arc<OpenFile>) -> Result<&Epoll> {
+    file.inode.as_any().and_then(|any| any.downcast_ref::<Epoll>()).ok_or(Errno::EINVAL)
+}
+
+pub fn epoll_ctl(epfd: u64, op: u64, fd: u64, event: u64) -> Result<u64> {
+    let process = process::current();
+    let (epoll_file, file) = {
+        let files = process.files.lock();
+        (files.get(epfd as i32 as usize)?, files.get(fd as i32 as usize)?)
+    };
+    let epoll = epoll_of(&epoll_file)?;
+    let (events, data) = if op as u32 == epoll::CTL_DEL {
+        (0, 0)
+    } else {
+        // struct epoll_event is packed: a u32 of events, then 8 bytes of data.
+        let events: u32 = user::read_value(event)?;
+        let data: u64 = user::read_value(event + 4)?;
+        (events & epoll::VALID_EVENTS, data)
+    };
+    epoll.control(op as u32, fd as i32, &file, events, data).map(|()| 0)
+}
+
+/// `epoll_wait`, `epoll_pwait` (the signal mask isn't applied) and
+/// `epoll_pwait2` (`timeout` is a timespec address, if `timespec`).
+pub fn epoll_wait(epfd: u64, events: u64, max: u64, timeout: u64, timespec: bool) -> Result<u64> {
+    let max = max as i32;
+    if max <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    let file = process::current().files.lock().get(epfd as i32 as usize)?;
+    let epoll = epoll_of(&file)?;
+    let deadline = if timespec {
+        timespec_deadline(timeout)?
+    } else {
+        let ms = timeout as i32;
+        (ms >= 0).then(|| deadline_after_ms(ms as u64))
+    };
+    let ready = loop {
+        let effective = match (deadline, epoll.deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let result = fs::POLL_EVENTS.wait_until_deadline(effective, || {
+            if process::signal_pending() {
+                return Some(Err(Errno::EINTR));
+            }
+            let ready = epoll.collect(max as usize, fs::poll_generation());
+            (!ready.is_empty()).then_some(Ok(ready))
+        });
+        match result {
+            Some(result) => break result?,
+            None if deadline.is_none_or(|deadline| time::ticks() < deadline) => continue,
+            None => break Vec::new(),
+        }
+    };
+    for (index, &(state, data)) in ready.iter().enumerate() {
+        let address = events + index as u64 * 12;
+        user::write_value(address, &state)?;
+        user::write_value(address + 4, &data)?;
+    }
+    Ok(ready.len() as u64)
+}
+
+const EFD_SEMAPHORE: u32 = 1;
+
+/// `eventfd2` (and `eventfd`, with no flags).
+pub fn eventfd(initial: u64, flags: u64) -> Result<u64> {
+    let flags = flags as u32;
+    if flags & !(EFD_SEMAPHORE | O_NONBLOCK | O_CLOEXEC) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    insert_file(EventFd::new(initial as u32 as u64, flags & EFD_SEMAPHORE != 0), "anon_inode:[eventfd]", flags)
+}
+
+pub fn timerfd_create(clock: u64, flags: u64) -> Result<u64> {
+    let flags = flags as u32;
+    if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // CLOCK_REALTIME and its alarm variant; CLOCK_MONOTONIC and the
+    // boot-time ones (the same thing here: eliOS doesn't suspend).
+    let clock = match clock {
+        0 | 8 => Clock::Realtime,
+        1 | 7 | 9 => Clock::Monotonic,
+        _ => return Err(Errno::EINVAL),
+    };
+    insert_file(TimerFd::new(clock), "anon_inode:[timerfd]", flags)
+}
+
+fn timer_of(fd: u64) -> Result<Arc<OpenFile>> {
+    let file = process::current().files.lock().get(fd as i32 as usize)?;
+    if file.inode.as_any().is_some_and(|any| any.is::<TimerFd>()) { Ok(file) } else { Err(Errno::EINVAL) }
+}
+
+/// Writes a `struct itimerspec` (interval, then value) in nanoseconds.
+fn write_itimerspec(address: u64, (value, interval): (u64, u64)) -> Result<()> {
+    let split = |nanos: u64| [nanos / 1_000_000_000, nanos % 1_000_000_000];
+    let [a, b] = split(interval);
+    let [c, d] = split(value);
+    user::write_value(address, &[a, b, c, d])
+}
+
+const TFD_TIMER_ABSTIME: u64 = 1;
+
+pub fn timerfd_settime(fd: u64, flags: u64, new: u64, old: u64) -> Result<u64> {
+    let file = timer_of(fd)?;
+    let timer = file.inode.as_any().and_then(|any| any.downcast_ref::<TimerFd>()).ok_or(Errno::EINVAL)?;
+    let spec: [i64; 4] = user::read_value(new)?;
+    if spec.iter().any(|&part| part < 0) || spec[1] >= 1_000_000_000 || spec[3] >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    let nanos = |seconds: i64, nanoseconds: i64| seconds as u64 * 1_000_000_000 + nanoseconds as u64;
+    let previous = timer.set(nanos(spec[2], spec[3]), nanos(spec[0], spec[1]), flags & TFD_TIMER_ABSTIME != 0);
+    if old != 0 {
+        write_itimerspec(old, previous)?;
+    }
+    Ok(0)
+}
+
+pub fn timerfd_gettime(fd: u64, current: u64) -> Result<u64> {
+    let file = timer_of(fd)?;
+    let timer = file.inode.as_any().and_then(|any| any.downcast_ref::<TimerFd>()).ok_or(Errno::EINVAL)?;
+    write_itimerspec(current, timer.get())?;
+    Ok(0)
 }

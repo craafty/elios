@@ -891,7 +891,9 @@ mod tests {
         fn linux_c_programs_pass_their_self_tests() {
             // Built by the host's C compiler, if there was one.
             for program in [
-                "ctest", "sigtest", "threadtest", "nettest", "permtest", "timertest", "memtest", "hello-c", "hello-dynamic",
+                "ctest", "sigtest", "threadtest", "nettest", "permtest", "timertest", "memtest", "eventtest", "unixtest",
+                "hello-c",
+                "hello-dynamic",
             ] {
                 let path = alloc::format!("/usr/bin/{program}");
                 if fs::lookup("/", &path, true).is_err() {

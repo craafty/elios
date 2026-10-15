@@ -21,6 +21,7 @@ mod icmp;
 pub mod socket;
 mod tcp;
 mod udp;
+pub mod unix;
 
 use alloc::collections::VecDeque;
 use alloc::format;
