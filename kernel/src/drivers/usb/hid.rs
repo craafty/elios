@@ -1,6 +1,6 @@
-//! USB keyboards, through the HID "boot protocol" that every USB keyboard
-//! supports (it exists so firmware can use keyboards without parsing HID
-//! report descriptors).
+//! USB keyboards and mice, through the HID "boot protocol" that every USB
+//! keyboard and most mice support (it exists so firmware can use them
+//! without parsing HID report descriptors).
 //!
 //! A boot keyboard reports its whole state in 8 bytes whenever it changes:
 //! a byte of modifier keys, a reserved byte, and up to six keys held down,
@@ -10,7 +10,11 @@
 
 use alloc::vec::Vec;
 
+use crate::input::{self, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, EV_KEY, EV_REL, REL_WHEEL, REL_X, REL_Y};
 use crate::keyboard::Key;
+
+/// An input event: type, code, value (see [`input`]).
+pub type InputEvent = (u16, u16, i32);
 
 const REPEAT_DELAY_MS: u64 = 500;
 const REPEAT_INTERVAL_MS: u64 = 33;
@@ -41,11 +45,29 @@ pub struct BootKeyboard {
 
 impl BootKeyboard {
     /// Takes a report received at tick `now`, adding newly pressed keys to
-    /// `keys`. Returns whether the LEDs should change (Caps Lock toggled).
-    pub fn report(&mut self, report: &[u8], now: u64, keys: &mut Vec<Key>) -> bool {
+    /// `keys` (for the terminal) and presses and releases to `events` (for
+    /// the input device). Returns whether the LEDs should change (Caps Lock
+    /// toggled).
+    pub fn report(&mut self, report: &[u8], now: u64, keys: &mut Vec<Key>, events: &mut Vec<InputEvent>) -> bool {
         let Some(&[modifiers, _, ref current @ ..]) = report.get(..8) else { return false };
         if current.contains(&ROLLOVER_ERROR) {
             return false;
+        }
+        for bit in 0..8 {
+            if (modifiers ^ self.modifiers) & 1 << bit != 0 {
+                let code = input::usb_key(0xE0 + bit).expect("modifiers all have key codes");
+                events.push((EV_KEY, code, i32::from(modifiers >> bit & 1)));
+            }
+        }
+        for &usage in self.pressed.iter().filter(|&&usage| usage > ROLLOVER_ERROR && !current.contains(&usage)) {
+            if let Some(code) = input::usb_key(usage) {
+                events.push((EV_KEY, code, 0));
+            }
+        }
+        for &usage in current.iter().filter(|&&usage| usage > ROLLOVER_ERROR && !self.pressed.contains(&usage)) {
+            if let Some(code) = input::usb_key(usage) {
+                events.push((EV_KEY, code, 1));
+            }
         }
         let mut leds_changed = false;
         for &usage in current.iter().filter(|&&usage| usage > ROLLOVER_ERROR) {
@@ -130,6 +152,33 @@ impl BootKeyboard {
     }
 }
 
+/// A boot-protocol mouse. Its reports are a byte of buttons (left, right,
+/// middle), then signed X and Y movement, and on most mice a signed wheel
+/// movement.
+#[derive(Default)]
+pub struct BootMouse {
+    buttons: u8,
+}
+
+impl BootMouse {
+    pub fn report(&mut self, report: &[u8], events: &mut Vec<InputEvent>) {
+        let Some(&buttons) = report.first() else { return };
+        for (bit, code) in [(0, BTN_LEFT), (1, BTN_RIGHT), (2, BTN_MIDDLE)] {
+            if (buttons ^ self.buttons) & 1 << bit != 0 {
+                events.push((EV_KEY, code, i32::from(buttons >> bit & 1)));
+            }
+        }
+        self.buttons = buttons;
+        let movement = |index: usize| report.get(index).map_or(0, |&byte| i32::from(byte as i8));
+        for (index, axis) in [(1, REL_X), (2, REL_Y), (3, REL_WHEEL)] {
+            let value = movement(index);
+            if value != 0 {
+                events.push((EV_REL, axis, value));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
@@ -139,7 +188,7 @@ mod tests {
     fn feed(keyboard: &mut BootKeyboard, reports: &[[u8; 8]]) -> Vec<Key> {
         let mut keys = Vec::new();
         for report in reports {
-            keyboard.report(report, 0, &mut keys);
+            keyboard.report(report, 0, &mut keys, &mut Vec::new());
         }
         keys
     }
@@ -172,13 +221,32 @@ mod tests {
         fn held_keys_repeat() {
             let mut keyboard = BootKeyboard::default();
             let mut keys = Vec::new();
-            keyboard.report(&[0, 0, 0x04, 0, 0, 0, 0, 0], 1000, &mut keys);
+            keyboard.report(&[0, 0, 0x04, 0, 0, 0, 0, 0], 1000, &mut keys, &mut Vec::new());
             assert_eq!(keyboard.repeat(1100), None);
             assert_eq!(keyboard.repeat(1500), Some(Key::Char('a')));
             assert_eq!(keyboard.repeat(1510), None);
             assert_eq!(keyboard.next_repeat(), Some(1533));
-            keyboard.report(&[0; 8], 1520, &mut keys);
+            keyboard.report(&[0; 8], 1520, &mut keys, &mut Vec::new());
             assert_eq!(keyboard.next_repeat(), None);
+        }
+
+        fn reports_become_input_events() {
+            let mut keyboard = BootKeyboard::default();
+            let mut events = Vec::new();
+            // Shift+a, then a released (Shift held), then everything released.
+            for report in [[0x02, 0, 0x04, 0, 0, 0, 0, 0], [0x02, 0, 0, 0, 0, 0, 0, 0], [0; 8]] {
+                keyboard.report(&report, 0, &mut Vec::new(), &mut events);
+            }
+            assert_eq!(events, vec![(EV_KEY, 42, 1), (EV_KEY, 30, 1), (EV_KEY, 30, 0), (EV_KEY, 42, 0)]);
+
+            let mut mouse = BootMouse::default();
+            let mut events = Vec::new();
+            mouse.report(&[0x01, 5, 0xFE, 1], &mut events);
+            mouse.report(&[0x00, 0, 0, 0], &mut events);
+            let expected = vec![
+                (EV_KEY, BTN_LEFT, 1), (EV_REL, REL_X, 5), (EV_REL, REL_Y, -2), (EV_REL, REL_WHEEL, 1), (EV_KEY, BTN_LEFT, 0),
+            ];
+            assert_eq!(events, expected);
         }
     }
 }

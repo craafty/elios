@@ -594,8 +594,8 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
     // The serial port is a second console in this terminal. With
     // signal=off, Ctrl+C goes to eliOS instead of stopping QEMU.
     qemu.args(["-chardev", "stdio,id=console,signal=off", "-serial", "chardev:console"])
-        // A USB controller with a keyboard. QEMU types into the keyboard
-        // added last, so the window's keystrokes arrive over USB.
+        // A USB controller with a keyboard and mouse. QEMU types into the
+        // keyboard added last, so the window's keystrokes arrive over USB.
         .args(["-device", "qemu-xhci,id=xhci"]);
     // Behind a hub (on root port 1) when asked: QEMU names hub ports 1.1,
     // 1.2 and so on.
@@ -606,6 +606,8 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
     if options.usb_stick && !options.installed {
         qemu.arg("-device").arg(format!("usb-storage,bus=xhci.0,drive=live,bootindex=0{}", place(1)));
     }
+    // A USB mouse, so mice get tested; the window's pointer goes to it.
+    qemu.arg("-device").arg(format!("usb-mouse,bus=xhci.0{}", place(3)));
     qemu.arg("-device")
         .arg(format!("usb-kbd,bus=xhci.0{}", place(2)))
         // A triple fault should stop the machine, not quietly reboot it.

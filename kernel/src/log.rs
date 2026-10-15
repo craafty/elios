@@ -3,7 +3,10 @@
 //! screen readable.
 //!
 //! Output is also kept in an in-memory log, so messages printed before the
-//! console existed can be shown on it afterwards.
+//! console existed can be shown on it afterwards. A second, larger log keeps
+//! everything including debug messages, as plain text, for
+//! [`logfile`](crate::logfile) to save to disk: on a laptop without a serial
+//! port, that file is the only record of what happened.
 
 use core::fmt::{self, Write as _};
 
@@ -34,6 +37,55 @@ impl fmt::Write for Log {
 }
 
 static LOG: SpinLock<Log> = SpinLock::new(Log { bytes: [0; LOG_SIZE], start: 0, len: 0 });
+
+const FULL_LOG_SIZE: usize = 512 * 1024;
+
+/// Everything logged, debug messages included, without color escapes. Bytes
+/// are numbered from the start of boot, so a reader can ask for what it
+/// hasn't seen yet.
+struct FullLog {
+    bytes: [u8; FULL_LOG_SIZE],
+    /// How many bytes have ever been written.
+    written: u64,
+    /// Inside an escape sequence being dropped: 1 after ESC, 2 after `ESC [`.
+    escape: u8,
+}
+
+impl fmt::Write for FullLog {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for &byte in s.as_bytes() {
+            match (self.escape, byte) {
+                (0, 0x1B) => self.escape = 1,
+                (0, _) => {
+                    self.bytes[(self.written % FULL_LOG_SIZE as u64) as usize] = byte;
+                    self.written += 1;
+                }
+                (1, b'[') => self.escape = 2,
+                // The final byte of a control sequence (or a two-byte escape).
+                (1, _) | (2, 0x40..=0x7E) => self.escape = 0,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+static FULL_LOG: SpinLock<FullLog> = SpinLock::new(FullLog { bytes: [0; FULL_LOG_SIZE], written: 0, escape: 0 });
+
+/// Appends the full log from byte `from` onwards to `out`, and returns the
+/// position to continue from next time. Bytes overwritten before they were
+/// read are replaced by a note saying how many were lost.
+pub fn full_since(from: u64, out: &mut alloc::vec::Vec<u8>) -> u64 {
+    let log = FULL_LOG.lock();
+    let oldest = log.written.saturating_sub(FULL_LOG_SIZE as u64);
+    if from < oldest {
+        out.extend_from_slice(alloc::format!("\n[... {} bytes of log lost ...]\n", oldest - from).as_bytes());
+    }
+    for position in from.max(oldest)..log.written {
+        out.push(log.bytes[(position % FULL_LOG_SIZE as u64) as usize]);
+    }
+    log.written
+}
 
 /// Writes the whole log so far to `out`.
 pub fn replay(out: &mut impl fmt::Write) {
@@ -84,6 +136,7 @@ pub fn write_terminal(text: &str) {
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     let _ = LOG.lock().write_fmt(args);
+    let _ = FULL_LOG.lock().write_fmt(args);
     serial::write_fmt(args);
     console::with(|console| {
         let _ = console.write_fmt(args);
@@ -97,6 +150,7 @@ pub fn _log(level: Level, args: fmt::Arguments) {
     let (seconds, micros) = (uptime / 1_000_000_000, uptime % 1_000_000_000 / 1000);
     let line = format_args!("\x1B[90m{seconds:>4}.{micros:06}\x1B[0m {} {args}\n", level.tag());
     if level == Level::Debug {
+        let _ = FULL_LOG.lock().write_fmt(line);
         serial::write_fmt(line);
     } else {
         _print(line);

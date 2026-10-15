@@ -22,12 +22,13 @@ use alloc::vec::Vec;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use super::hid::BootKeyboard;
+use super::hid::{BootKeyboard, BootMouse};
 use super::storage::{self, Found, Status, UsbDisk};
 use super::{Descriptors, InterruptInterface, KEYBOARDS, SETTLED, SetupPacket, StorageInterface};
 use crate::arch::{apic, interrupts};
 use crate::drivers::block;
 use crate::drivers::pci;
+use crate::input;
 use crate::keyboard::{self, Key};
 use crate::memory::{self, CacheType, PAGE_SIZE, frames, phys_to_virt};
 use crate::sync::{Mutex, SpinLock};
@@ -242,14 +243,37 @@ struct Event {
     endpoint: u8,
 }
 
-/// A HID keyboard's interrupt endpoint.
-struct KeyboardEndpoint {
+/// A HID keyboard's or mouse's interrupt endpoint.
+struct HidEndpoint {
     interface: u8,
     endpoint: u8,
     ring: Ring,
     buffer: Dma,
     packet_size: u16,
-    state: BootKeyboard,
+    state: HidState,
+    /// Its /dev/input file.
+    input: Arc<input::Device>,
+}
+
+enum HidState {
+    Keyboard(BootKeyboard),
+    Mouse(BootMouse),
+}
+
+impl HidEndpoint {
+    fn keyboard(&mut self) -> Option<&mut BootKeyboard> {
+        match &mut self.state {
+            HidState::Keyboard(keyboard) => Some(keyboard),
+            HidState::Mouse(_) => None,
+        }
+    }
+}
+
+/// A Bluetooth controller's event endpoint, where HCI events arrive.
+struct BluetoothEndpoint {
+    endpoint: u8,
+    ring: Ring,
+    buffer: Dma,
 }
 
 /// A mass storage device's bulk endpoints and buffers.
@@ -310,8 +334,9 @@ struct Device {
     output: Dma,
     input: Dma,
     control: Ring,
-    keyboard: Option<KeyboardEndpoint>,
+    hid: Vec<HidEndpoint>,
     storage: Option<StorageEndpoints>,
+    bluetooth: Option<BluetoothEndpoint>,
 }
 
 pub struct Controller {
@@ -343,6 +368,7 @@ pub fn probe(devices: &[pci::Device]) -> usize {
     for device in devices.iter().filter(|d| d.class == 0x0C && d.subclass == 0x03 && d.interface == 0x30) {
         let Some(base) = device.memory_bar(0) else { continue };
         device.enable_bus_mastering();
+        route_intel_ports(device);
         let name = format!("usb{count}");
         if device.enable_msi(apic::local_id(), XHCI_VECTOR) {
             interrupts::set_handler(XHCI_VECTOR, |_| {
@@ -362,6 +388,36 @@ pub fn probe(devices: &[pci::Device]) -> usize {
         count += 1;
     }
     count
+}
+
+/// Intel's 7-, 8- and 9-series chipsets (Panther Point, Lynx Point,
+/// Wildcat Point: Ivy Bridge to Broadwell PCs, like the ThinkPad T440p)
+/// have both an xHCI controller and older EHCI ones, and every port starts
+/// out wired to EHCI, so the firmware's drivers work. An xHCI driver must
+/// switch them over: USB 2 devices through XUSB2PR, and USB 3 through
+/// USB3_PSSEN. The masks next to each say which ports the firmware allows
+/// to move. Without this, built-in devices (Bluetooth, the camera) and USB
+/// 2 devices in most sockets stay on a controller eliOS doesn't drive.
+fn route_intel_ports(device: &pci::Device) {
+    const XUSB2PR: u8 = 0xD0;
+    const XUSB2PRM: u8 = 0xD4;
+    const USB3_PSSEN: u8 = 0xD8;
+    const USB3PRM: u8 = 0xDC;
+    const SWITCHABLE: [u16; 5] = [0x1E31, 0x8C31, 0x9C31, 0x8CB1, 0x9CB1];
+    if device.vendor != 0x8086 || !SWITCHABLE.contains(&device.device) {
+        return;
+    }
+    let usb3 = device.read(USB3PRM);
+    device.write(USB3_PSSEN, usb3);
+    let usb2 = device.read(XUSB2PRM);
+    device.write(XUSB2PR, usb2);
+    debug!(
+        "usb: routed Intel ports to xHCI: USB 3 {:#x} (now {:#x}), USB 2 {:#x} (now {:#x})",
+        usb3,
+        device.read(USB3_PSSEN),
+        usb2,
+        device.read(XUSB2PR)
+    );
 }
 
 impl Controller {
@@ -501,10 +557,8 @@ impl Controller {
                     controller.handle(event, &mut keys);
                 }
                 let now = time::ticks();
-                for device in controller.devices.values_mut() {
-                    if let Some(keyboard) = &mut device.keyboard
-                        && let Some(key) = keyboard.state.repeat(now)
-                    {
+                for hid in controller.devices.values_mut().flat_map(|device| device.hid.iter_mut()) {
+                    if let Some(key) = hid.keyboard().and_then(|keyboard| keyboard.repeat(now)) {
                         keys.push(key);
                     }
                 }
@@ -512,7 +566,12 @@ impl Controller {
                 // interrupts) the next poll; and look now and then anyway,
                 // in case another thread took the event the interrupt was
                 // for.
-                let repeat = controller.devices.values().filter_map(|d| d.keyboard.as_ref()?.state.next_repeat()).min();
+                let repeat = controller
+                    .devices
+                    .values_mut()
+                    .flat_map(|device| device.hid.iter_mut())
+                    .filter_map(|hid| hid.keyboard()?.next_repeat())
+                    .min();
                 let poll = if INTERRUPTS.load(Ordering::Relaxed) { now + 100 } else { now + 10 };
                 repeat.map_or(poll, |repeat| repeat.min(poll))
             };
@@ -575,34 +634,43 @@ impl Controller {
             self.on_hub_change(event);
             return;
         }
-        let Some(keyboard) = &mut device.keyboard else { return };
-        if event.endpoint != keyboard.endpoint {
-            return;
-        }
+        let Some(hid) = device.hid.iter_mut().find(|hid| hid.endpoint == event.endpoint) else { return };
         if matches!(event.completion, COMPLETION_SUCCESS | COMPLETION_SHORT_PACKET) {
-            let length = usize::from(keyboard.packet_size).saturating_sub(event.residual as usize);
+            let length = usize::from(hid.packet_size).saturating_sub(event.residual as usize);
             // SAFETY: the buffer holds a page; the controller is done with
             // it until the next transfer is queued.
-            let report = unsafe { core::slice::from_raw_parts(keyboard.buffer.pointer::<u8>(0), length.min(64)) };
-            let leds_changed = keyboard.state.report(report, time::ticks(), keys);
-            let (interface, leds) = (keyboard.interface, keyboard.state.leds());
-            self.queue_report(event.slot);
-            if leds_changed {
+            let report = unsafe { core::slice::from_raw_parts(hid.buffer.pointer::<u8>(0), length.min(64)) };
+            let mut events = Vec::new();
+            let leds = match &mut hid.state {
+                HidState::Keyboard(keyboard) => {
+                    keyboard.report(report, time::ticks(), keys, &mut events).then(|| keyboard.leds())
+                }
+                HidState::Mouse(mouse) => {
+                    mouse.report(report, &mut events);
+                    None
+                }
+            };
+            if !events.is_empty() {
+                hid.input.report(&events);
+            }
+            let interface = hid.interface;
+            self.queue_report(event.slot, event.endpoint);
+            if let Some(leds) = leds {
                 let setup = SetupPacket::class_interface_out(0x09, 0x0200, interface, 1);
                 let _ = self.control_transfer(event.slot, setup, Some(&mut [leds]));
             }
         } else {
-            debug!("usb: keyboard transfer failed (completion code {})", event.completion);
-            self.queue_report(event.slot);
+            debug!("usb: HID transfer failed (completion code {})", event.completion);
+            self.queue_report(event.slot, event.endpoint);
         }
     }
 
-    /// Asks the keyboard on `slot` for its next report.
-    fn queue_report(&mut self, slot: u8) {
-        let Some(keyboard) = self.devices.get_mut(&slot).and_then(|d| d.keyboard.as_mut()) else { return };
+    /// Asks the keyboard or mouse endpoint on `slot` for its next report.
+    fn queue_report(&mut self, slot: u8, endpoint: u8) {
+        let Some(device) = self.devices.get_mut(&slot) else { return };
+        let Some(hid) = device.hid.iter_mut().find(|hid| hid.endpoint == endpoint) else { return };
         let control = TRB_NORMAL << 10 | TRB_INTERRUPT_ON_COMPLETION | TRB_INTERRUPT_ON_SHORT;
-        keyboard.ring.push(keyboard.buffer.phys, u32::from(keyboard.packet_size), control);
-        let endpoint = keyboard.endpoint;
+        hid.ring.push(hid.buffer.phys, u32::from(hid.packet_size), control);
         self.ring_doorbell(slot, endpoint);
     }
 
@@ -810,8 +878,9 @@ impl Controller {
             output: Dma::new(1).ok_or("out of memory")?,
             input: Dma::new(1).ok_or("out of memory")?,
             control: Ring::new().ok_or("out of memory")?,
-            keyboard: None,
+            hid: Vec::new(),
             storage: None,
+            bluetooth: None,
             hub: None,
         };
         self.device_contexts.write64(usize::from(slot) * 8, device.output.phys);
@@ -881,24 +950,164 @@ impl Controller {
         let descriptors = Descriptors::parse(&configuration);
         let port = self.devices[&slot].port;
         let description = product_name.unwrap_or_else(|| format!("{vendor:04x}:{product:04x}"));
+        let interfaces: Vec<String> = descriptors
+            .interfaces
+            .iter()
+            .map(|i| format!("{}:{:02x}.{:02x}.{:02x}", i.number, i.class, i.subclass, i.protocol))
+            .collect();
+        debug!(
+            "usb: {}: port {port}: {vendor:04x}:{product:04x} class {:02x} speed {speed}, interfaces {}",
+            self.name,
+            device_descriptor[4],
+            interfaces.join(" ")
+        );
 
         if let Some(hub) = descriptors.hub() {
             self.control_transfer(slot, SetupPacket::set_configuration(descriptors.configuration), None)?;
             // Protocol 2: a transaction translator per port.
             self.start_hub(slot, &hub, device_descriptor[6] == 2)?;
             info!("usb: {}: port {port}: {description}: hub", self.name);
-        } else if let Some(keyboard) = descriptors.boot_keyboard() {
+        } else if descriptors.boot_keyboard().is_some() || descriptors.boot_mouse().is_some() {
             self.control_transfer(slot, SetupPacket::set_configuration(descriptors.configuration), None)?;
-            self.start_keyboard(slot, &keyboard)?;
-            info!("usb: {}: port {port}: {description}: keyboard", self.name);
+            let id =
+                [input::BUS_USB, vendor, product, u16::from_le_bytes([device_descriptor[12], device_descriptor[13]])];
+            let mut kinds = Vec::new();
+            if let Some(keyboard) = descriptors.boot_keyboard() {
+                self.start_hid(slot, &keyboard, true, &description, id)?;
+                kinds.push("keyboard");
+            }
+            if let Some(mouse) = descriptors.boot_mouse() {
+                self.start_hid(slot, &mouse, false, &description, id)?;
+                kinds.push("mouse");
+            }
+            info!("usb: {}: port {port}: {description}: {}", self.name, kinds.join(" and "));
         } else if let Some(interface) = descriptors.storage() {
             self.control_transfer(slot, SetupPacket::set_configuration(descriptors.configuration), None)?;
             self.start_storage(slot, &interface)?;
             info!("usb: {}: port {port}: {description}: storage", self.name);
+        } else if let Some(bluetooth) = descriptors.bluetooth() {
+            self.control_transfer(slot, SetupPacket::set_configuration(descriptors.configuration), None)?;
+            info!("usb: {}: port {port}: {description}: Bluetooth", self.name);
+            // Only a probe so far: a controller that doesn't answer stays
+            // attached, just unused.
+            if let Err(error) = self.start_bluetooth(slot, &bluetooth, vendor) {
+                warn!("bluetooth: {description}: {error}");
+            }
         } else {
             info!("usb: {}: port {port}: {description} (no driver)", self.name);
         }
         Ok(())
+    }
+
+    /// Sets up a Bluetooth controller's event endpoint and asks it who it
+    /// is. (There's no Bluetooth stack yet; this identifies the hardware,
+    /// including, for Intel's, which firmware patch it wants.)
+    fn start_bluetooth(&mut self, slot: u8, found: &InterruptInterface, vendor: u16) -> Result<(), String> {
+        let speed = self.devices[&slot].speed;
+        let endpoint = (found.address & 0xF) * 2 + 1;
+        let packet_size = found.packet_size.clamp(8, 64);
+        let interval = if speed >= SPEED_HIGH {
+            u32::from(found.interval.clamp(1, 16) - 1)
+        } else {
+            let microframes = u32::from(found.interval.max(1)) * 8;
+            (31 - microframes.leading_zeros()).clamp(3, 10)
+        };
+        let ring = Ring::new().ok_or("out of memory")?;
+        self.configure_endpoints(slot, &[(endpoint, ENDPOINT_INTERRUPT_IN, packet_size, interval, ring.start())])?;
+        let buffer = Dma::new(1).ok_or("out of memory")?;
+        self.devices.get_mut(&slot).unwrap().bluetooth = Some(BluetoothEndpoint { endpoint, ring, buffer });
+
+        self.hci_command(slot, 0x0C03, &[])?; // Reset
+        let version = self.hci_command(slot, 0x1001, &[])?; // Read Local Version Information
+        let address = self.hci_command(slot, 0x1009, &[])?; // Read BD_ADDR
+        let field = |data: &[u8], index: usize| data.get(index).copied().unwrap_or(0);
+        let bd_addr: Vec<String> = (1..7).rev().map(|index| format!("{:02x}", field(&address, index))).collect();
+        info!(
+            "bluetooth: address {}, HCI version {}, manufacturer {:#06x}, LMP subversion {:#06x}",
+            bd_addr.join(":"),
+            field(&version, 1),
+            u16::from_le_bytes([field(&version, 5), field(&version, 6)]),
+            u16::from_le_bytes([field(&version, 7), field(&version, 8)])
+        );
+        if vendor == 0x8087 {
+            // Intel's "read version": which firmware patch file fits.
+            let intel = self.hci_command(slot, 0xFC05, &[])?;
+            let v = |index: usize| field(&intel, index);
+            info!(
+                "bluetooth: Intel hardware {:x}.{:x}.{:x}, firmware {:x}.{:x}.{:x}.{:x}.{:x}, patch file \
+                 intel/ibt-hw-{:x}.{:x}.{:x}-fw-{:x}.{:x}.{:x}.{:x}.{:x}.bseq",
+                v(1),
+                v(2),
+                v(3),
+                v(4),
+                v(5),
+                v(6),
+                v(7),
+                v(8),
+                v(1),
+                v(2),
+                v(3),
+                v(4),
+                v(5),
+                v(6),
+                v(7),
+                v(8)
+            );
+        }
+        Ok(())
+    }
+
+    /// Sends an HCI command (a class request on endpoint 0) and waits for
+    /// its Command Complete event; returns the event's return parameters
+    /// (starting with the status). Other events are skipped.
+    fn hci_command(&mut self, slot: u8, opcode: u16, parameters: &[u8]) -> Result<Vec<u8>, String> {
+        let mut packet = Vec::from(opcode.to_le_bytes());
+        packet.push(parameters.len() as u8);
+        packet.extend_from_slice(parameters);
+        let setup = SetupPacket { request_type: 0x20, request: 0, value: 0, index: 0, length: packet.len() as u16 };
+        self.control_transfer(slot, setup, Some(&mut packet))?;
+        for _ in 0..8 {
+            let event = self.hci_event(slot)?;
+            let (code, data) = (event.first().copied(), event.get(2..).unwrap_or(&[]));
+            match code {
+                // Command Complete: number of commands allowed, opcode,
+                // then the return parameters.
+                Some(0x0E) if data.get(1..3) == Some(&opcode.to_le_bytes()) => {
+                    let result = Vec::from(&data[3..]);
+                    return match result.first() {
+                        Some(0) => Ok(result),
+                        status => Err(format!("HCI command {opcode:#06x} failed: status {status:?}")),
+                    };
+                }
+                // Command Status with an error: the command was refused.
+                Some(0x0F) if data.first().is_some_and(|&status| status != 0) => {
+                    return Err(format!("HCI command {opcode:#06x} refused: status {:#04x}", data[0]));
+                }
+                _ => debug!("bluetooth: event {:02x?}", event),
+            }
+        }
+        Err(format!("no reply to HCI command {opcode:#06x}"))
+    }
+
+    /// Reads one HCI event from the event endpoint.
+    fn hci_event(&mut self, slot: u8) -> Result<Vec<u8>, String> {
+        const LENGTH: u32 = 512;
+        let device = self.devices.get_mut(&slot).ok_or("no such device")?;
+        let bluetooth = device.bluetooth.as_mut().ok_or("not a Bluetooth controller")?;
+        let control = TRB_NORMAL << 10 | TRB_INTERRUPT_ON_COMPLETION | TRB_INTERRUPT_ON_SHORT;
+        bluetooth.ring.push(bluetooth.buffer.phys, LENGTH, control);
+        let endpoint = bluetooth.endpoint;
+        self.ring_doorbell(slot, endpoint);
+        let event = self
+            .wait_event(2000, |e| e.kind == TRB_TRANSFER_EVENT && e.slot == slot && e.endpoint == endpoint)
+            .ok_or("no HCI event")?;
+        if !matches!(event.completion, COMPLETION_SUCCESS | COMPLETION_SHORT_PACKET) {
+            return Err(format!("HCI event transfer failed (completion code {})", event.completion));
+        }
+        let received = (LENGTH as usize).saturating_sub(event.residual as usize);
+        let bluetooth = self.devices[&slot].bluetooth.as_ref().expect("checked above");
+        // SAFETY: the controller wrote `received` bytes to the page.
+        Ok(unsafe { core::slice::from_raw_parts(bluetooth.buffer.pointer::<u8>(0), received) }.to_vec())
     }
 
     /// Configures endpoints of a device (adding to any configured before):
@@ -937,36 +1146,64 @@ impl Controller {
         Ok(())
     }
 
-    fn start_keyboard(&mut self, slot: u8, keyboard: &super::InterruptInterface) -> Result<(), String> {
+    /// Starts a boot-protocol keyboard or mouse interface: its interrupt
+    /// endpoint, and a /dev/input device.
+    fn start_hid(
+        &mut self,
+        slot: u8,
+        found: &super::InterruptInterface,
+        is_keyboard: bool,
+        name: &str,
+        id: [u16; 4],
+    ) -> Result<(), String> {
         // Boot protocol, and reports only when something changes.
-        self.control_transfer(slot, SetupPacket::class_interface_out(0x0B, 0, keyboard.interface, 0), None)?;
-        let _ = self.control_transfer(slot, SetupPacket::class_interface_out(0x0A, 0, keyboard.interface, 0), None);
+        self.control_transfer(slot, SetupPacket::class_interface_out(0x0B, 0, found.interface, 0), None)?;
+        let _ = self.control_transfer(slot, SetupPacket::class_interface_out(0x0A, 0, found.interface, 0), None);
 
         // The interrupt endpoint. Its context index is 2n + 1 for IN
         // endpoint n.
         let speed = self.devices[&slot].speed;
-        let endpoint = (keyboard.address & 0xF) * 2 + 1;
-        let packet_size = keyboard.packet_size.clamp(8, 64);
+        let endpoint = (found.address & 0xF) * 2 + 1;
+        let packet_size = found.packet_size.clamp(8, 64);
         let interval = if speed >= SPEED_HIGH {
-            u32::from(keyboard.interval.clamp(1, 16) - 1)
+            u32::from(found.interval.clamp(1, 16) - 1)
         } else {
             // In frames (1 ms); the context counts in 125 µs units, as a
             // power of two.
-            let microframes = u32::from(keyboard.interval.max(1)) * 8;
+            let microframes = u32::from(found.interval.max(1)) * 8;
             (31 - microframes.leading_zeros()).clamp(3, 10)
         };
         let ring = Ring::new().ok_or("out of memory")?;
         self.configure_endpoints(slot, &[(endpoint, ENDPOINT_INTERRUPT_IN, packet_size, interval, ring.start())])?;
 
         let buffer = Dma::new(1).ok_or("out of memory")?;
-        let state = BootKeyboard::default();
-        let interface = keyboard.interface;
-        self.devices.get_mut(&slot).unwrap().keyboard =
-            Some(KeyboardEndpoint { interface, endpoint, ring, buffer, packet_size, state });
-        let leds = SetupPacket::class_interface_out(0x09, 0x0200, interface, 1);
-        let _ = self.control_transfer(slot, leds, Some(&mut [0x01]));
-        self.queue_report(slot);
-        KEYBOARDS.fetch_add(1, Ordering::Relaxed);
+        let interface = found.interface;
+        let (state, capabilities) = if is_keyboard {
+            let capabilities = input::Capabilities {
+                keys: input::keyboard_keys(),
+                relative: Vec::new(),
+                leds: alloc::vec![0, 1, 2],
+                properties: 0,
+            };
+            (HidState::Keyboard(BootKeyboard::default()), capabilities)
+        } else {
+            let capabilities = input::Capabilities {
+                keys: alloc::vec![input::BTN_LEFT, input::BTN_RIGHT, input::BTN_MIDDLE],
+                relative: alloc::vec![input::REL_X, input::REL_Y, input::REL_WHEEL],
+                leds: Vec::new(),
+                properties: input::PROP_POINTER,
+            };
+            (HidState::Mouse(BootMouse::default()), capabilities)
+        };
+        let input = input::register(name, id, capabilities);
+        let hid = HidEndpoint { interface, endpoint, ring, buffer, packet_size, state, input };
+        self.devices.get_mut(&slot).unwrap().hid.push(hid);
+        if is_keyboard {
+            let leds = SetupPacket::class_interface_out(0x09, 0x0200, interface, 1);
+            let _ = self.control_transfer(slot, leds, Some(&mut [0x01]));
+            KEYBOARDS.fetch_add(1, Ordering::Relaxed);
+        }
+        self.queue_report(slot, endpoint);
         Ok(())
     }
 
@@ -1480,9 +1717,8 @@ impl Controller {
 
     fn remove_devices(&mut self, port: u8, slots: Vec<u8>) {
         for slot in slots {
-            if self.devices[&slot].keyboard.is_some() {
-                KEYBOARDS.fetch_sub(1, Ordering::Relaxed);
-            }
+            let keyboards = self.devices[&slot].hid.iter().filter(|hid| matches!(hid.state, HidState::Keyboard(_)));
+            KEYBOARDS.fetch_sub(keyboards.count(), Ordering::Relaxed);
             let _ = self.command(0, TRB_DISABLE_SLOT << 10 | u32::from(slot) << 24);
             self.forget(slot);
             info!("usb: {}: port {port}: device removed", self.name);
@@ -1495,8 +1731,12 @@ impl Controller {
         self.device_contexts.write64(usize::from(slot) * 8, 0);
         if let Some(device) = self.devices.remove(&slot) {
             let mut pages = alloc::vec![device.output.phys, device.input.phys, device.control.memory.phys];
-            if let Some(keyboard) = device.keyboard {
-                pages.extend([keyboard.ring.memory.phys, keyboard.buffer.phys]);
+            for hid in device.hid {
+                input::unregister(&hid.input);
+                pages.extend([hid.ring.memory.phys, hid.buffer.phys]);
+            }
+            if let Some(bluetooth) = device.bluetooth {
+                pages.extend([bluetooth.ring.memory.phys, bluetooth.buffer.phys]);
             }
             if let Some(hub) = device.hub {
                 pages.extend([hub.ring.memory.phys, hub.buffer.phys]);

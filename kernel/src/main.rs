@@ -22,9 +22,12 @@ mod errno;
 mod font;
 mod framebuffer;
 mod fs;
+mod input;
 mod keyboard;
+mod logfile;
 mod logo;
 mod memory;
+mod mouse;
 mod net;
 mod power;
 mod process;
@@ -143,7 +146,13 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
         count => info!("smp: running on {count} CPUs"),
     }
     match keyboard::init() {
-        Ok(()) => info!("keyboard: PS/2 ready"),
+        Ok(()) => {
+            info!("keyboard: PS/2 ready");
+            match mouse::init() {
+                Ok(()) => info!("mouse: PS/2 ready"),
+                Err(error) => debug!("mouse: {error}"),
+            }
+        }
         Err(error) => warn!("keyboard: {error}"),
     }
 
@@ -160,6 +169,7 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
     fs::mount::mount_system(disk_root);
     mount_data_partition();
     mount_boot_partition(boot_info.boot_partition());
+    logfile::start(!disk_root && cmdline::get("data").is_none());
     // In case DHCP finished before there was a root to write to.
     net::write_dns_settings();
     if let Ok(name) = fs::lookup("/", "/etc/hostname", true) {

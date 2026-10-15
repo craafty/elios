@@ -123,6 +123,10 @@ pub fn open_at(dirfd: u64, path: u64, flags: u64, mode: u64) -> Result<u64> {
     if flags & O_TRUNC != 0 && flags & O_ACCMODE != O_RDONLY && kind == FileKind::Regular {
         inode.truncate(0)?;
     }
+    let inode = match inode.open_instance(flags) {
+        Some(instance) => instance?,
+        None => inode,
+    };
     let open = OpenFile::new(inode, full, flags);
     let fd = process::current().files.lock().insert(open, flags & O_CLOEXEC != 0, 0)?;
     Ok(fd as u64)

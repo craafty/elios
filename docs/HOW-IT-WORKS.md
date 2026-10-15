@@ -395,6 +395,21 @@ kernel logs things before that. When the console starts, it replays the
 buffer, so the screen shows the whole boot. The same buffer backs `dmesg`
 (through an eliOS system call).
 
+**The log on disk (`logfile.rs`).** Laptops have no serial port, and
+problems with drivers for real hardware (Wi-Fi, Ethernet, touchpads) only
+show up on the machine that has it. So a second, 512 KiB ring keeps
+*everything*, debug messages included, as plain text (color escapes
+stripped as it's written), with bytes numbered from boot so a reader can
+ask for what it hasn't seen. A kernel thread appends what's new to
+`/disk/logs/boot.log` every two seconds, and once more before a restart or
+power off; the previous boot's log is renamed to `previous-boot.log`. A
+hang loses at most two seconds, and the stick can be read on any other
+computer. It's on for the live system and off for installed ones (whose
+`/disk` is the computer's EFI partition), and `savelog`/`savelog=0` on
+the command line override that. Writing happens in the thread, never in
+the logging call: logging can happen anywhere, including with spinlocks
+held, and disk I/O sleeps.
+
 ## 6. The CPU: descriptor tables and interrupts
 
 ### GDT and TSS (`arch/gdt.rs`)
@@ -1416,7 +1431,50 @@ the handler tiny keeps interrupts short.
 
 Both this and the USB keyboard driver turn keys into `Key` values and hand
 them to `keyboard::send_key`, which sends the terminal the bytes a terminal
-would (`ESC [ A` for the up arrow, and so on).
+would (`ESC [ A` for the up arrow, and so on). They also report every
+press and release to their input device (below).
+
+### PS/2 mice (`mouse.rs`)
+
+Laptops wire their touchpads and pointing sticks to the keyboard
+controller's second ("auxiliary") port, speaking the PS/2 mouse protocol;
+on the ThinkPad T440p the touchpad passes the TrackPoint's movements
+through, so one device carries both. Bytes from either port arrive at the
+same data register; bit 5 of the status register says which port a byte
+came from, and each port has its own interrupt (1 and 12), so each handler
+takes only its own bytes. Setup is done by polling, with the mouse's
+interrupt off: reset (the self-test answers `AA 00`, after up to a second),
+defaults, then the IntelliMouse "knock" (sample rates 200, 100, 80), after
+which a wheel mouse reports ID 3 and sends 4-byte packets. Packets are
+three bytes (buttons and sign bits, X, Y) plus the wheel; bit 3 of the
+first byte is always set, which is how the decoder resynchronizes after a
+lost byte. Y counts upward in PS/2 and downward in Linux, and the wheel
+the other way round, so both are flipped.
+
+Touchpads have richer protocols of their own (absolute positions, several
+fingers, gestures); those are for later. In plain mouse mode the touchpad
+moves the pointer and taps or clicks are the left button.
+
+### Input devices (`input.rs`)
+
+Graphical programs, and the libraries they use, read input the way Linux
+presents it: `/dev/input/eventN` files ("evdev") that read as a stream of
+24-byte `struct input_event`s (time, type, code, value), grouped by
+`SYN_REPORT` events. Key codes are Linux's (`KEY_A` is 30); conveniently
+they started out as scancode set 1, so PS/2 keys translate by identity
+apart from the `E0`-prefixed ones, and USB keys through the HID usage
+table. Mice report `REL_X`, `REL_Y`, `REL_WHEEL` and the `BTN_` codes.
+
+Each open file needs its own queue (two readers each see every event), so
+the VFS gained a hook: `Inode::open_instance` lets a device return a fresh
+inode for each `open`, and the device keeps weak references to its
+readers. The ioctls libraries use to identify devices are there: name,
+ID, which event types and codes it can produce (`EVIOCGBIT`), properties
+(`INPUT_PROP_POINTER`), keys held, and the clock for timestamps. A reader
+can *grab* a device (`EVIOCGRAB`) to get its events alone; when a
+keyboard is grabbed, `send_key` stops typing at the text console, which is
+how a graphical session will take the keyboard over. A reader that falls
+behind by 1024 events gets `SYN_DROPPED`, as on Linux.
 
 ### PCI (`drivers/pci.rs`)
 
@@ -1463,6 +1521,16 @@ size, which can differ on full-speed devices) and the configuration
 descriptor with its interfaces and endpoints. Ports that change later
 (plug and unplug) arrive as events and are handled the same way.
 
+**Intel's two controllers.** Intel's 7-, 8- and 9-series chipsets (Ivy
+Bridge to Broadwell PCs, like the ThinkPad T440p) have an xHCI controller
+*and* older EHCI ones, and every port starts out wired to EHCI so firmware
+drivers work. Before resetting the xHCI controller, the driver moves the
+ports over: USB 2 through the `XUSB2PR` configuration register and USB 3
+through `USB3_PSSEN`, each to what the mask register beside it allows.
+Without this, the built-in Bluetooth and camera, and USB 2 devices in
+most sockets (the USB stick eliOS started from, say), would stay on a
+controller eliOS doesn't drive.
+
 **Keyboards** (`hid.rs`) are driven through the HID *boot protocol*, a
 fixed 8-byte report every USB keyboard supports so that firmware can use
 them without parsing HID report descriptors: a byte of modifier keys and
@@ -1472,6 +1540,21 @@ completed transfer is a report. A key press is a key that's in a report
 but wasn't in the previous one. USB keyboards don't repeat held keys (PS/2
 ones do it themselves), so the driver does: after 500 ms, every 33 ms. It
 also sets the Caps Lock LED.
+
+**Mice** use the boot protocol too: a byte of buttons and signed X, Y and
+(on most) wheel movement. A device can have several HID interfaces (a
+wireless receiver is often a keyboard and a mouse), so each device keeps a
+list of HID endpoints, each with its own `/dev/input` device. Mice whose
+interface isn't boot-capable need HID report descriptors parsed, which is
+for later.
+
+**Bluetooth** controllers are USB devices too (class `E0`), including the
+one on Intel's 7260 Wi-Fi card. So far eliOS only identifies them: it
+sends HCI commands (a class request on endpoint 0) and reads the
+answering events from the interrupt endpoint, logging the controller's
+address and version, and for Intel's, which firmware patch it needs. The
+Bluetooth stack proper (patching, pairing, L2CAP, HID and audio profiles)
+is to come.
 
 **Storage** (`storage.rs`): USB sticks, card readers and external disks
 nearly all speak the *Bulk-Only Transport*: each command is a 31-byte
@@ -1691,6 +1774,60 @@ both layouts are tried).
 A kernel thread waits for the card's interrupt (MSI, where the card has
 it; the 82540EM doesn't, so then it polls every 2 ms) and hands each
 received frame to the stack.
+
+**The chipset versions** (I217 and I218, in Haswell and Broadwell
+chipsets: the ThinkPad T440p has an I217-LM) use the same rings and
+registers, but the PHY, the part that talks to the cable, is a separate
+chip. It's connected to the MAC by a fast link for packets and a slow one
+(SMBus) that Intel's management engine uses while the computer sleeps,
+and firmware can leave it on the slow link or powered down, where it
+ignores the MAC. Before the reset, the driver checks the PHY answers (by
+reading its ID over MDIO, through the `MDIC` register); if not, it tries
+forcing SMBus mode, then power-cycles the PHY with the `LANPHYPC` pin.
+MAC and PHY are then reset together (unless the management engine forbids
+resetting the PHY), the driver waits for the PHY to load its configuration
+from flash, sets the bits Intel's documentation requires after a reset,
+and restarts autonegotiation. PHY registers above 15 are paged, and every
+PHY access takes a semaphore shared with the management engine. The steps
+follow Intel's hardware as Linux's e1000e driver uses it; QEMU can't
+emulate these chips, so this part is tested on real hardware.
+
+### Wi-Fi: Intel 7260 (`drivers/intel_wifi/`)
+
+The ThinkPad T440p's Wi-Fi card is an Intel Wireless 7260 (its Bluetooth
+half is a USB device; see USB above). Like all current Wi-Fi cards it
+runs firmware of its own, which does the radio work and much of 802.11;
+that firmware is closed, comes from Intel through the linux-firmware
+collection, and is in the initrd at `/lib/firmware` with its licence. The
+driver itself is eliOS's.
+
+**The firmware file** (`firmware.rs`) is a header and a list of TLVs:
+code sections for each image (each with the address in the card's memory
+it loads at), the radio configuration, calibration triggers, and
+capability bits.
+
+**The transport** (`transport.rs`) is the card's PCIe interface: memory-
+mapped registers, plus registers and memory deeper in the card reached
+through address/data pairs while the driver holds the card awake. Bringing
+it up: take ownership (the management engine may be using it), reset,
+power up the basic functions with the workarounds Intel specifies for this
+family, then set up the queues. Received data arrives in 4 KiB buffers
+from a ring of 256 descriptors, with the card writing its progress to a
+status block; commands go through transmit queue 0, a ring of 256
+descriptors each pointing at up to 20 buffers, which the card's scheduler
+serves. Firmware is copied in by the DMA engine's service channel, in
+chunks of up to 128 KiB, then the card's processor is released and the
+firmware says it's alive.
+
+**Stage one** (where this is now) runs the *init* image: it starts the
+scheduler for the command queue, configures Bluetooth coexistence, reads
+the card's NVM (its MAC address and settings) with `NVM_ACCESS` commands,
+and calibrates the radio, keeping the results for the *runtime* image.
+Everything is polled and every step is logged, because the only way to
+test it is on the real card: the log saved to the USB stick shows how far
+it got, the card's registers and the firmware's error log if it failed.
+Next come the runtime image, scanning, joining a network (802.11
+authentication and association), WPA2's handshake, and data.
 
 ### The stack (`net/mod.rs`)
 
@@ -2213,10 +2350,13 @@ Current limits, roughly in order of how much they'd matter to a user:
   while another thread's system call is using it makes the kernel fault
   (and panic). Linux avoids this with "exception tables" that turn such
   faults into errors; eliOS will need the same.
-- **USB:** keyboards, storage and hubs; no mice yet (they'd matter with a
-  graphical desktop), and no UAS, the faster USB 3 storage protocol (USB 3
-  disks also speak Bulk-Only, which eliOS uses). USB 3 hubs and
-  transaction translators are untested outside the specifications.
+- **USB:** keyboards, mice (boot protocol only), storage and hubs; no UAS,
+  the faster USB 3 storage protocol (USB 3 disks also speak Bulk-Only,
+  which eliOS uses), and Bluetooth controllers are only identified. USB 3
+  hubs and transaction translators are untested outside the
+  specifications.
+- **Wi-Fi** is at its first stage (firmware loaded, settings read, radio
+  calibrated on the Intel 7260); it can't connect yet.
 - **Networking is IPv4 only**, with one network card (Intel e1000
   family), no TLS (so `https` doesn't work), no Unix domain sockets, and
   TCP without congestion control or out-of-order buffering.

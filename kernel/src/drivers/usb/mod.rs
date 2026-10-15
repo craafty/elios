@@ -1,5 +1,6 @@
 //! USB: the host controller driver (xHCI), and drivers for the devices on
-//! it: keyboards and storage (USB sticks and disks).
+//! it: keyboards, mice and storage (USB sticks and disks), and so far a
+//! first look at Bluetooth controllers.
 //!
 //! Every USB device is set up the same way, through its endpoint 0 with
 //! "control transfers": a setup packet saying what's wanted, optionally some
@@ -199,6 +200,17 @@ impl Descriptors {
         self.interrupt_interface(|i| i.class == 3 && i.subclass == 1 && i.protocol == 1)
     }
 
+    /// HID boot-protocol mouse interfaces (protocol 2), as for keyboards.
+    pub fn boot_mouse(&self) -> Option<InterruptInterface> {
+        self.interrupt_interface(|i| i.class == 3 && i.subclass == 1 && i.protocol == 2)
+    }
+
+    /// A Bluetooth controller's interface (class 0xE0, "wireless
+    /// controller", subclass 1, protocol 1) and its event endpoint.
+    pub fn bluetooth(&self) -> Option<InterruptInterface> {
+        self.interrupt_interface(|i| i.class == 0xE0 && i.subclass == 1 && i.protocol == 1)
+    }
+
     /// A hub's interface (class 9) and its status change endpoint.
     pub fn hub(&self) -> Option<InterruptInterface> {
         self.interrupt_interface(|i| i.class == 9)
@@ -233,10 +245,13 @@ mod tests {
             assert_eq!((keyboard.interface, keyboard.address, keyboard.packet_size, keyboard.interval), (1, 0x81, 8, 10));
         }
 
-        fn usb_keyboards_come_up() {
-            // QEMU gets a USB keyboard (see xtask), found during boot.
+        fn usb_keyboards_and_mice_come_up() {
+            // QEMU gets a USB keyboard and mouse (see xtask), found during
+            // boot, each with a /dev/input file.
             if probe_count() > 0 {
                 assert!(keyboard_count() > 0, "no USB keyboard came up");
+                assert!(crate::input::find("QEMU USB Mouse").is_some(), "no USB mouse came up");
+                assert!(crate::fs::lookup("/", "/dev/input/event2", true).is_ok());
             }
         }
     }

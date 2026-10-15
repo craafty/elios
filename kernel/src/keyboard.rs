@@ -1,29 +1,35 @@
 //! PS/2 keyboard support: the i8042 controller and scancode decoding.
 //!
 //! The interrupt handler only queues raw scancodes; decoding happens later,
-//! outside interrupt context, through [`Decoder`].
+//! outside interrupt context, through [`Decoder`] (for the text console)
+//! and [`input::Set1Decoder`] (for /dev/input).
+//!
+//! The controller's second port is the mouse's: see [`crate::mouse`].
 //!
 //! Many modern machines have no real PS/2 port; their USB keyboards appear
 //! here if the firmware emulates PS/2, and through the USB driver
 //! (`drivers::usb`) otherwise. Both feed the terminal through [`send_key`].
 
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::interrupts::{self, IRQ_BASE, InterruptFrame};
 use crate::arch::{apic, inb, outb};
-use crate::sync::ByteQueue;
+use crate::sync::{ByteQueue, Once};
 use crate::task::{self, WaitQueue};
-use crate::tty;
+use crate::{input, tty};
 
 const DATA: u16 = 0x60;
 const STATUS: u16 = 0x64;
 const COMMAND: u16 = 0x64;
 
-const STATUS_OUTPUT_FULL: u8 = 1 << 0;
+pub const STATUS_OUTPUT_FULL: u8 = 1 << 0;
 const STATUS_INPUT_FULL: u8 = 1 << 1;
+/// The byte waiting came from the second (mouse) port.
+pub const STATUS_FROM_MOUSE: u8 = 1 << 5;
 
-const READ_CONFIG: u8 = 0x20;
-const WRITE_CONFIG: u8 = 0x60;
+pub const READ_CONFIG: u8 = 0x20;
+pub const WRITE_CONFIG: u8 = 0x60;
 const ENABLE_FIRST_PORT: u8 = 0xAE;
 #[cfg(test)]
 const WRITE_FIRST_PORT_OUTPUT: u8 = 0xD2;
@@ -38,6 +44,8 @@ const KEYBOARD_VECTOR: u8 = IRQ_BASE + KEYBOARD_IRQ;
 static SCANCODES: ByteQueue<256> = ByteQueue::new();
 static INPUT: WaitQueue = WaitQueue::new();
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+/// The keyboard's /dev/input device.
+static DEVICE: Once<Arc<input::Device>> = Once::new();
 
 /// Configures the controller to interrupt on keypresses and routes its IRQ.
 pub fn init() -> Result<(), &'static str> {
@@ -63,10 +71,24 @@ pub fn init() -> Result<(), &'static str> {
     send_command(ENABLE_FIRST_PORT)?;
 
     interrupts::set_handler(KEYBOARD_VECTOR, on_interrupt);
-    apic::route_isa_irq(KEYBOARD_IRQ, KEYBOARD_VECTOR)
+    apic::route_isa_irq(KEYBOARD_IRQ, KEYBOARD_VECTOR)?;
+    let capabilities = input::Capabilities {
+        keys: input::keyboard_keys(),
+        relative: alloc::vec::Vec::new(),
+        leds: alloc::vec![0, 1, 2],
+        properties: 0,
+    };
+    let _ = DEVICE.set(input::register("AT Translated Set 2 keyboard", [input::BUS_I8042, 1, 1, 0xAB41], capabilities));
+    Ok(())
 }
 
 fn on_interrupt(_frame: &mut InterruptFrame) {
+    // SAFETY: reading the status register has no side effects.
+    let status = unsafe { inb(STATUS) };
+    if status & STATUS_OUTPUT_FULL == 0 || status & STATUS_FROM_MOUSE != 0 {
+        // Nothing for us (the mouse's interrupt will collect its byte).
+        return;
+    }
     // SAFETY: the controller has a byte for us; reading it acknowledges it.
     let scancode = unsafe { inb(DATA) };
     if !SCANCODES.push(scancode) {
@@ -90,8 +112,15 @@ pub fn read_scancode() -> u8 {
 pub fn start_terminal_input() {
     task::spawn("keyboard", || {
         let mut decoder = Decoder::default();
+        let mut keys = input::Set1Decoder::default();
         loop {
-            if let Some(key) = decoder.feed(read_scancode()) {
+            let scancode = read_scancode();
+            if let Some((code, pressed)) = keys.feed(scancode)
+                && let Some(device) = DEVICE.get()
+            {
+                device.report(&[(input::EV_KEY, code, i32::from(pressed))]);
+            }
+            if let Some(key) = decoder.feed(scancode) {
                 send_key(key);
             }
         }
@@ -99,8 +128,12 @@ pub fn start_terminal_input() {
 }
 
 /// Types a key at the terminal, as the bytes a terminal sends for it. Any
-/// keyboard (PS/2 or USB) ends up here.
+/// keyboard (PS/2 or USB) ends up here, unless a program (a graphical
+/// session) has grabbed the keyboard's input device.
 pub fn send_key(key: Key) {
+    if input::keyboard_grabbed() {
+        return;
+    }
     let mut utf8 = [0; 4];
     let bytes: &[u8] = match key {
         Key::Char(c) => c.encode_utf8(&mut utf8).as_bytes(),
@@ -144,21 +177,21 @@ fn wait_for_input_space() -> Result<(), &'static str> {
     Err("PS/2 controller is not responding")
 }
 
-fn send_command(command: u8) -> Result<(), &'static str> {
+pub fn send_command(command: u8) -> Result<(), &'static str> {
     wait_for_input_space()?;
     // SAFETY: a documented controller command.
     unsafe { outb(COMMAND, command) };
     Ok(())
 }
 
-fn write_data(byte: u8) -> Result<(), &'static str> {
+pub fn write_data(byte: u8) -> Result<(), &'static str> {
     wait_for_input_space()?;
     // SAFETY: the parameter for the command just sent.
     unsafe { outb(DATA, byte) };
     Ok(())
 }
 
-fn read_data() -> Result<u8, &'static str> {
+pub fn read_data() -> Result<u8, &'static str> {
     for _ in 0..100_000 {
         // SAFETY: reading status, then data once it's available.
         unsafe {

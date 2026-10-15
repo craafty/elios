@@ -123,6 +123,7 @@ pub fn reboot(magic: u64, command: u64) -> Result<u64> {
     if ![REBOOT_CMD_RESTART, REBOOT_CMD_POWER_OFF, REBOOT_CMD_HALT].contains(&command) {
         return Err(Errno::EINVAL);
     }
+    crate::logfile::flush();
     // Disks are left consistent and marked cleanly unmounted.
     crate::fs::mount::shut_down();
     match command {

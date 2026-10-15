@@ -49,11 +49,13 @@ fn write32(bus: u8, slot: u8, function: u8, offset: u8, value: u32) {
 }
 
 impl Device {
-    fn read(&self, offset: u8) -> u32 {
+    /// Reads 32-bit configuration register `offset` (a multiple of 4).
+    pub fn read(&self, offset: u8) -> u32 {
         read32(self.bus, self.slot, self.function, offset)
     }
 
-    fn write(&self, offset: u8, value: u32) {
+    /// Writes 32-bit configuration register `offset` (a multiple of 4).
+    pub fn write(&self, offset: u8, value: u32) {
         write32(self.bus, self.slot, self.function, offset, value);
     }
 

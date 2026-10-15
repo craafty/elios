@@ -213,6 +213,13 @@ pub trait Inode: Send + Sync {
     /// Called when the last open file referring to this inode is closed.
     fn on_close(&self, _flags: u32) {}
 
+    /// For devices that keep state for each open file (an input device
+    /// gives every reader its own queue of events): the inode the new open
+    /// file should refer to instead of this one. `None` means this one.
+    fn open_instance(&self, _flags: u32) -> Option<Result<Arc<dyn Inode>>> {
+        None
+    }
+
     /// Moves entry `old_name` of this directory to `new_name` in
     /// `new_parent`, replacing what's there. The default works for
     /// file systems that can link any inode into any directory.

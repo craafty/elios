@@ -119,6 +119,14 @@ cargo xtask run --second-disk     # then, inside eliOS: installer
 cargo xtask run --installed       # boot the installed disk on its own
 ```
 
+**Logs from real hardware.** A machine without a serial port can't show
+the kernel's debug output, so the live system saves its whole log to the
+stick it started from: `logs/boot.log` on the stick's (FAT) partition,
+with the previous boot's in `logs/previous-boot.log`. It's brought up to
+date every two seconds, so it survives a hang; read it on any other
+computer. (`savelog=0` in `\EFI\eliOS\cmdline.txt` turns it off, and
+`savelog` turns it on for an installed system.)
+
 Real machines vary far more than QEMU. Keyboards work over PS/2 or USB,
 and eliOS reads and writes the USB stick it started from (directly or
 through a hub), so files saved to `/disk` stay on the stick. It reads and writes
@@ -160,10 +168,13 @@ may work too, but QEMU is the one eliOS is tested on.
   owners and permission bits on every file, the sticky bit, umask, and
   setuid programs, all with Linux's rules.
 - **Devices:** framebuffer console (with ANSI escape codes and its own 8x16
-  font), USB (an xHCI driver, with keyboards, storage and hubs), PS/2
-  keyboards, serial port, Local and
+  font), USB (an xHCI driver, with keyboards, mice, storage and hubs), PS/2
+  keyboards and mice (laptop touchpads and TrackPoints), Linux-style input
+  devices (`/dev/input/event*`), serial port, Local and
   I/O APICs, PIT/TSC/APIC timers, CMOS clock, PCI with MSI/MSI-X, AHCI and
-  NVMe, Intel e1000 network cards, ACPI power management.
+  NVMe, Intel e1000 network cards (including the I217/I218 built into
+  Haswell and Broadwell laptops), ACPI power management. Being brought up
+  on real hardware: Intel's 7260 Wi-Fi card and its Bluetooth.
 - **Networking:** eliOS's own TCP/IP stack (Ethernet, ARP, IPv4, ICMP, UDP,
   TCP), DHCP, loopback, and the Linux socket API, so programs like
   BusyBox's `wget` and `netstat` work unmodified.
@@ -262,5 +273,11 @@ glyph and rebuild.
       partition, a UEFI boot entry through the firmware's runtime services
 - [x] **System manager:** `system.conf`, packages from Alpine, generations,
       rollback, a boot menu of generations
-- [ ] **Next:** a graphical desktop, USB mice, Unix
-      domain sockets, and TLS for HTTPS
+- [ ] **Laptop (ThinkPad T440p):** the log saved to the USB stick, USB
+      ports routed to xHCI on Intel 8-series chipsets, PS/2 and USB mice
+      and `/dev/input`, the I217 Ethernet, and the first stage of the
+      Intel 7260 Wi-Fi driver (firmware loaded, MAC address read, radio
+      calibrated) and a Bluetooth probe; next, Wi-Fi networking (scanning,
+      WPA2), Bluetooth, and a simple desktop that runs Firefox
+- [ ] **Next:** a graphical desktop, Unix domain sockets, and TLS for
+      HTTPS

@@ -91,6 +91,15 @@ pub fn uptime_nanos() -> u64 {
     (u128::from(elapsed) * 1_000_000_000 / u128::from(hz)) as u64
 }
 
+/// Waits `micros` microseconds without sleeping, for hardware that needs
+/// a short pause between register accesses.
+pub fn delay_us(micros: u64) {
+    let end = uptime_nanos() + micros * 1000;
+    while uptime_nanos() < end {
+        core::hint::spin_loop();
+    }
+}
+
 /// Wall-clock time in nanoseconds since the Unix epoch.
 pub fn unix_nanos() -> u64 {
     BOOT_UNIX_TIME.load(Ordering::Relaxed) * 1_000_000_000 + uptime_nanos()
