@@ -92,6 +92,12 @@ impl Stack {
             client.state = State::Discovering;
         }
         let message = if client.state == State::Discovering { DISCOVER } else { REQUEST };
+        // The first few attempts are logged, for machines whose network
+        // can only be debugged from the log.
+        if client.attempts <= 6 {
+            let name = if message == DISCOVER { "discover" } else { "request" };
+            debug!("net: DHCP: sending a {name} (attempt {})", client.attempts);
+        }
         self.send_dhcp(message);
     }
 
@@ -163,6 +169,7 @@ impl Stack {
 
         match (self.dhcp.state, message) {
             (State::Discovering, OFFER) => {
+                debug!("net: DHCP: offered {address} by {}", server.unwrap_or(Ipv4::ANY));
                 let client = &mut self.dhcp;
                 client.offered = address;
                 client.server = server.unwrap_or(Ipv4::ANY);

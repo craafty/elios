@@ -14,7 +14,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::pci;
 use crate::arch::{apic, interrupts};
@@ -27,9 +27,12 @@ const CTRL: u64 = 0x0000;
 const STATUS: u64 = 0x0008;
 const EERD: u64 = 0x0014;
 const CTRL_EXT: u64 = 0x0018;
+const FEXTNVM: u64 = 0x0028;
 const MDIC: u64 = 0x0020;
 const FEXTNVM3: u64 = 0x003C;
 const EXTCNF_CTRL: u64 = 0x0F00;
+const EXTCNF_SIZE: u64 = 0x0F08;
+const PHY_CTRL: u64 = 0x0F10;
 const PBECCSTS: u64 = 0x100C;
 const KABGTXD: u64 = 0x3004;
 const TXDCTL0: u64 = 0x3828;
@@ -57,6 +60,12 @@ const TDT: u64 = 0x3818;
 const MTA: u64 = 0x5200;
 const RAL0: u64 = 0x5400;
 const RAH0: u64 = 0x5404;
+/// Statistics counters (cleared when read): CRC errors, missed packets,
+/// good packets received and transmitted.
+const CRCERRS: u64 = 0x4000;
+const MPC: u64 = 0x4010;
+const GPRC: u64 = 0x4074;
+const GPTC: u64 = 0x4080;
 
 const CTRL_GIO_MASTER_DISABLE: u32 = 1 << 2;
 const CTRL_SET_LINK_UP: u32 = 1 << 6;
@@ -67,6 +76,7 @@ const CTRL_LANPHYPC_VALUE: u32 = 1 << 17;
 const CTRL_MEMORY_ERROR_HANDLING: u32 = 1 << 19;
 const CTRL_RESET: u32 = 1 << 26;
 const CTRL_PHY_RESET: u32 = 1 << 31;
+const STATUS_FULL_DUPLEX: u32 = 1 << 0;
 const STATUS_LINK_UP: u32 = 1 << 1;
 const STATUS_LAN_INIT_DONE: u32 = 1 << 9;
 const STATUS_PHY_RESET_ASSERTED: u32 = 1 << 10;
@@ -75,6 +85,11 @@ const CTRL_EXT_PHY_POWER_CYCLE_DONE: u32 = 1 << 2;
 const CTRL_EXT_FORCE_SMBUS: u32 = 1 << 11;
 const CTRL_EXT_PHY_POWER_DOWN: u32 = 1 << 20;
 const EXTCNF_CTRL_SOFTWARE_FLAG: u32 = 1 << 5;
+/// Software, not the hardware, applies the PHY's configuration from the
+/// NVM after a reset.
+const FEXTNVM_SOFTWARE_CONFIG: u32 = 1 << 27;
+const PHY_CTRL_D0_LOW_POWER_LINK: u32 = 1 << 1;
+const PHY_CTRL_GIGABIT_DISABLE: u32 = 1 << 6;
 /// The management engine's firmware is running (and owns some of the PHY).
 const FWSM_FIRMWARE_VALID: u32 = 1 << 15;
 /// Clear while the management engine forbids resetting the PHY.
@@ -118,7 +133,15 @@ const PHY_CONTROL: (u16, u8) = (0, 0);
 const PHY_ID1: (u16, u8) = (0, 2);
 const PHY_ID2: (u16, u8) = (0, 3);
 const PHY_AUTONEG_ADVERTISE: (u16, u8) = (0, 4);
+const PHY_STATUS: (u16, u8) = (0, 1);
+const PHY_PARTNER_ABILITY: (u16, u8) = (0, 5);
 const PHY_1000T_CONTROL: (u16, u8) = (0, 9);
+const PHY_1000T_STATUS: (u16, u8) = (0, 10);
+/// The I217's own status register: speed, duplex and link as resolved.
+const PHY_STATUS_2: (u16, u8) = (0, 26);
+/// The OEM bits: gigabit disable (bit 6), low-power link up (bit 2) and
+/// restart negotiation (bit 10).
+const PHY_OEM_BITS: (u16, u8) = (768, 25);
 /// Port general configuration; bit 4 is "host wakeup".
 const PHY_PORT_GENERAL: (u16, u8) = (769, 17);
 /// SMBus control; bit 0 forces the PHY's side of the link to SMBus.
@@ -126,9 +149,22 @@ const PHY_SMBUS_CONTROL: (u16, u8) = (769, 23);
 
 static RECEIVED: WaitQueue = WaitQueue::new();
 static USES_INTERRUPTS: AtomicBool = AtomicBool::new(false);
+static INTERRUPTS_SEEN: AtomicU32 = AtomicU32::new(0);
+
+/// How long the receive thread sleeps between checks when it relies on
+/// interrupts (in case they never come) and when it polls, in ms.
+const INTERRUPT_FALLBACK_MS: u64 = 100;
+const POLL_MS: u64 = 2;
+/// How often the link is checked, and for how long after startup the
+/// driver logs its state, in ms (real hardware can't be debugged otherwise).
+const LINK_CHECK_MS: u64 = 1000;
+const POLLED_FRAMES_WARNING: u32 = 10;
+const DIAGNOSTICS_MS: u64 = 120_000;
+const DIAGNOSTICS_EVERY_MS: u64 = 5000;
 
 pub struct E1000 {
     registers: u64,
+    pch: bool,
     mac: [u8; 6],
     /// Descriptor rings (one page each) and the packet buffers they point
     /// at (two per page).
@@ -151,7 +187,10 @@ pub fn probe(devices: &[pci::Device]) {
             Ok(nic) => {
                 let nic = Arc::new(nic);
                 if device.enable_msi(apic::local_id(), NIC_VECTOR) {
-                    interrupts::set_handler(NIC_VECTOR, |_| RECEIVED.wake_all());
+                    interrupts::set_handler(NIC_VECTOR, |_| {
+                        INTERRUPTS_SEEN.fetch_add(1, Ordering::Relaxed);
+                        RECEIVED.wake_all();
+                    });
                     USES_INTERRUPTS.store(true, Ordering::Relaxed);
                     nic.write(IMS, INTERRUPTS);
                 }
@@ -191,6 +230,7 @@ impl E1000 {
         };
         let mut nic = Self {
             registers,
+            pch,
             mac: [0; 6],
             rx_ring: dma_pages(1)?,
             tx_ring: dma_pages(1)?,
@@ -294,17 +334,91 @@ impl E1000 {
         None
     }
 
-    /// Hands received packets to the network stack, forever.
+    /// Hands received packets to the network stack, forever, and watches
+    /// the link. Even with interrupts it wakes now and then, so a machine
+    /// whose interrupts don't arrive still receives (slowly), and says so.
     fn receive_loop(&self) {
+        let start = crate::time::ticks();
+        let mut link = None;
+        let (mut next_link_check, mut next_diagnostics) = (start, start);
+        let (mut received, mut found_by_polling) = (0u32, 0u32);
         loop {
+            let interrupts_before = INTERRUPTS_SEEN.load(Ordering::Relaxed);
             while let Some(frame) = self.next_frame() {
+                received += 1;
                 net::receive(frame);
             }
             // Reading ICR acknowledges the interrupt.
             self.read(ICR);
-            let deadline = (!USES_INTERRUPTS.load(Ordering::Relaxed)).then(|| crate::time::ticks() + 2);
-            RECEIVED.wait_until_deadline(deadline, || self.frame_ready().then_some(()));
+
+            let now = crate::time::ticks();
+            if now >= next_link_check {
+                next_link_check = now + LINK_CHECK_MS;
+                let up = self.link_up();
+                if link != Some(up) {
+                    self.log_link(up);
+                    link = Some(up);
+                    next_diagnostics = now;
+                }
+            }
+            if self.pch && now >= next_diagnostics && now - start < DIAGNOSTICS_MS {
+                next_diagnostics = now + DIAGNOSTICS_EVERY_MS;
+                self.log_diagnostics(received, found_by_polling);
+            }
+
+            let interrupts = USES_INTERRUPTS.load(Ordering::Relaxed);
+            let wait = if interrupts { INTERRUPT_FALLBACK_MS } else { POLL_MS };
+            RECEIVED.wait_until_deadline(Some(crate::time::ticks() + wait), || self.frame_ready().then_some(()));
+            if interrupts && INTERRUPTS_SEEN.load(Ordering::Relaxed) == interrupts_before && self.frame_ready() {
+                // An interrupt can trail its packet a little, so only a
+                // pattern means interrupts are lost.
+                found_by_polling += 1;
+                if found_by_polling == POLLED_FRAMES_WARNING {
+                    warn!("net: e1000: packets are arriving without interrupts; polling for them");
+                }
+            }
         }
+    }
+
+    fn log_link(&self, up: bool) {
+        if !up {
+            info!("net: e1000: link down");
+            return;
+        }
+        let status = self.read(STATUS);
+        let speed = match status >> 6 & 3 {
+            0 => 10,
+            1 => 100,
+            _ => 1000,
+        };
+        let duplex = if status & STATUS_FULL_DUPLEX != 0 { "full" } else { "half" };
+        info!("net: e1000: link up, {speed} Mbit/s, {duplex} duplex");
+    }
+
+    /// One line with everything that says why packets do or don't flow:
+    /// the MAC's view of the link, the PHY's (status is read twice, since
+    /// its link bit latches low), the packet counters and interrupts.
+    fn log_diagnostics(&self, received: u32, found_by_polling: u32) {
+        let phy = |register| self.pch_phy_read(register).map_or(-1, i32::from);
+        let _ = self.pch_phy_read(PHY_STATUS);
+        debug!(
+            "net: e1000 PCH: STATUS {:#x} CTRL {:#x} | PHY control {:#x} status {:#x} partner {:#x} 1000T {:#x} \
+             status2 {:#x} OEM {:#x} | received {} sent {} CRC errors {} missed {} | frames {received}, \
+             interrupts {}, found by polling {found_by_polling}",
+            self.read(STATUS),
+            self.read(CTRL),
+            phy(PHY_CONTROL),
+            phy(PHY_STATUS),
+            phy(PHY_PARTNER_ABILITY),
+            phy(PHY_1000T_STATUS),
+            phy(PHY_STATUS_2),
+            phy(PHY_OEM_BITS),
+            self.read(GPRC),
+            self.read(GPTC),
+            self.read(CRCERRS),
+            self.read(MPC),
+            INTERRUPTS_SEEN.load(Ordering::Relaxed),
+        );
     }
 
     fn frame_ready(&self) -> bool {
@@ -351,12 +465,16 @@ impl E1000 {
 impl E1000 {
     fn pch_reset(&self) {
         debug!(
-            "net: e1000 PCH: before reset: CTRL {:#x} CTRL_EXT {:#x} STATUS {:#x} FWSM {:#x} EXTCNF {:#x}",
+            "net: e1000 PCH: before reset: CTRL {:#x} CTRL_EXT {:#x} STATUS {:#x} FWSM {:#x} EXTCNF {:#x} \
+             EXTCNF_SIZE {:#x} FEXTNVM {:#x} PHY_CTRL {:#x}",
             self.read(CTRL),
             self.read(CTRL_EXT),
             self.read(STATUS),
             self.read(FWSM),
-            self.read(EXTCNF_CTRL)
+            self.read(EXTCNF_CTRL),
+            self.read(EXTCNF_SIZE),
+            self.read(FEXTNVM),
+            self.read(PHY_CTRL)
         );
         self.pch_make_phy_accessible();
 
@@ -404,6 +522,7 @@ impl E1000 {
             if let Some(value) = self.pch_phy_read(PHY_PORT_GENERAL) {
                 self.pch_phy_write(PHY_PORT_GENERAL, value & !(1 << 4));
             }
+            self.pch_configure_oem_bits();
         }
         // Analog front end bias, as Intel specifies.
         self.write(KABGTXD, self.read(KABGTXD) | 0x0005_0000);
@@ -556,6 +675,26 @@ impl E1000 {
             }
         }
         None
+    }
+
+    /// After a PHY reset, when the NVM says software configures the PHY,
+    /// copies the MAC's "gigabit disable" and "low-power link" settings
+    /// into the PHY's OEM bits, which a reset leaves however the PHY likes.
+    fn pch_configure_oem_bits(&self) {
+        if self.read(FEXTNVM) & FEXTNVM_SOFTWARE_CONFIG == 0 {
+            return;
+        }
+        let Some(old) = self.pch_phy_read(PHY_OEM_BITS) else { return };
+        let mac = self.read(PHY_CTRL);
+        let mut value = old & !(1 << 6 | 1 << 2);
+        if mac & PHY_CTRL_GIGABIT_DISABLE != 0 {
+            value |= 1 << 6;
+        }
+        if mac & PHY_CTRL_D0_LOW_POWER_LINK != 0 {
+            value |= 1 << 2;
+        }
+        self.pch_phy_write(PHY_OEM_BITS, value | 1 << 10);
+        debug!("net: e1000 PCH: OEM bits {old:#x} -> {value:#x} (PHY_CTRL {mac:#x})");
     }
 
     /// Bits Intel's documentation says must be set after a reset.

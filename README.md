@@ -306,7 +306,8 @@ glyph and rebuild.
       rollback, a boot menu of generations
 - [ ] **Laptop (ThinkPad T440p):** the log saved to the USB stick, USB
       ports routed to xHCI on Intel 8-series chipsets, PS/2 and USB mice
-      and `/dev/input`, the I217 Ethernet, and the first stage of the
+      and `/dev/input`, the I217 Ethernet (works: gigabit, DHCP), the
+      sound chip (found; not yet heard), and the first stage of the
       Intel 7260 Wi-Fi driver (firmware loaded, MAC address read, radio
       calibrated) and a Bluetooth probe; next, Wi-Fi networking (scanning,
       WPA2), Bluetooth

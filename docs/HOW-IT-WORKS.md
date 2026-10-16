@@ -2056,8 +2056,19 @@ resetting the PHY), the driver waits for the PHY to load its configuration
 from flash, sets the bits Intel's documentation requires after a reset,
 and restarts autonegotiation. PHY registers above 15 are paged, and every
 PHY access takes a semaphore shared with the management engine. The steps
-follow Intel's hardware as Linux's e1000e driver uses it; QEMU can't
-emulate these chips, so this part is tested on real hardware.
+follow Intel's hardware as Linux's e1000e driver uses it. When the NVM
+says software configures the PHY after a reset (`FEXTNVM` bit 27), the
+driver copies the MAC's "gigabit disable" and "low-power link" settings
+into the PHY's OEM bits, which a reset leaves undefined.
+
+QEMU can't emulate these chips, so this part is tested on real hardware
+(it works on the T440p: link at 1000 Mbit/s and DHCP within five seconds
+of power-on), and the driver says what it sees for the log on the stick:
+link changes with speed and duplex, and for two minutes after startup a
+line every five seconds with the MAC's and PHY's view of the link, the
+packet and error counters and the number of interrupts. The receive
+thread also wakes every 100 ms when it relies on interrupts, so a machine
+whose interrupts go missing still gets its packets (and a warning).
 
 ### Wi-Fi: Intel 7260 (`drivers/intel_wifi/`)
 
