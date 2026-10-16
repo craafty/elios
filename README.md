@@ -321,5 +321,8 @@ glyph and rebuild.
       additions, `/proc/sys`, namespaces refused so sandboxes fall back),
       tuned with a sampling profiler (`/proc/PID/profile`): per-file
       `poll` wakeups, a kernel heap cache, damage-only redraws
-- [ ] **Next:** sound, the camera and microphone (for video calls), faster
+- [x] **Sound:** an Intel HD Audio driver (codec routes found like
+      Linux's generic driver, so no per-laptop tables) behind Linux's
+      ALSA interface, so `libasound` programs play and record
+- [ ] **Next:** the camera (for video calls), faster
       clocks (a vDSO), Wi-Fi networking and Bluetooth on the T440p

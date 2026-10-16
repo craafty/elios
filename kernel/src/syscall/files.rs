@@ -240,6 +240,10 @@ const FIOCLEX: u64 = 0x5451;
 /// `ioctl`: a few requests apply to any open file; the rest go to the inode.
 pub fn ioctl(fd: u64, request: u64, argument: u64) -> Result<u64> {
     let file = file(fd)?;
+    // The request is an `unsigned int` to Linux, but musl's `ioctl` takes an
+    // `int`, so requests with the top bit set (most `_IOR`s, like ALSA's)
+    // arrive sign-extended.
+    let request = request as u32 as u64;
     match request {
         FIONBIO => {
             let on: i32 = user::read_value(argument)?;
@@ -251,7 +255,7 @@ pub fn ioctl(fd: u64, request: u64, argument: u64) -> Result<u64> {
             process::current().files.lock().set_close_on_exec(fd as i32 as usize, request == FIOCLEX)?;
             Ok(0)
         }
-        _ => file.inode.ioctl(request, argument),
+        _ => file.inode.ioctl_with_flags(file.flags(), request, argument),
     }
 }
 

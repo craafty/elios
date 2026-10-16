@@ -171,6 +171,7 @@ pub fn create() -> Arc<dyn Inode> {
             ("cmdline".into(), generated(|| format!("{}\n", crate::cmdline::line()))),
             ("net".into(), net_directory()),
             ("sys".into(), sys_directory()),
+            ("asound".into(), directory(|| alloc::vec![("cards".into(), generated(crate::sound::cards_text))])),
         ];
         for info in process::list() {
             entries.push((info.pid.to_string(), process_directory(info.pid)));

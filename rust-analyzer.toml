@@ -1,0 +1,4 @@
+# The kernel, bootloader and user programs are no_std: checking their test
+# targets for the host makes rust-analyzer report a duplicate panic handler.
+[check]
+allTargets = false

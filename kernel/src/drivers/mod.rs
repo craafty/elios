@@ -4,6 +4,7 @@ pub mod ahci;
 pub mod block;
 pub mod dma;
 pub mod e1000;
+pub mod hda;
 pub mod intel_wifi;
 pub mod nvme;
 pub mod pci;
@@ -44,6 +45,7 @@ pub fn init() {
         block::register(disk as Arc<dyn Disk>);
     }
     e1000::probe(&devices);
+    hda::probe(&devices);
     intel_wifi::probe(&devices);
     usb::probe(&devices);
 }

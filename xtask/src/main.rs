@@ -44,6 +44,8 @@ options:
   --usb-stick  attach the disk image as a USB stick instead of a SATA disk
                (as when eliOS is started from a stick on a real PC)
   --usb-hub    put the USB keyboard (and stick) behind a USB hub
+  --audio-wav FILE  record what eliOS plays to FILE.wav (otherwise the
+               sound card's output goes nowhere)
 ";
 
 const DEFAULT_CPUS: usize = 4;
@@ -98,6 +100,8 @@ struct Options {
     usb_hub: bool,
     /// Use a throwaway copy of the firmware's variables (for tests).
     fresh_firmware: bool,
+    /// Where to record the sound card's output.
+    audio_wav: Option<PathBuf>,
     qemu_args: Vec<String>,
 }
 
@@ -161,6 +165,7 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options, Stri
             "--installed" => options.installed = true,
             "--usb-stick" => options.usb_stick = true,
             "--usb-hub" => options.usb_hub = true,
+            "--audio-wav" => options.audio_wav = Some(args.next().ok_or("--audio-wav needs a file name")?.into()),
             "--cpus" => {
                 let count = args.next().and_then(|count| count.parse().ok()).filter(|&count| (1..=64).contains(&count));
                 options.cpus = Some(count.ok_or("--cpus needs a number from 1 to 64")?);
@@ -631,6 +636,13 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
     if options.usb_stick && !options.installed {
         qemu.arg("-device").arg(format!("usb-storage,bus=xhci.0,drive=live,bootindex=0{}", place(1)));
     }
+    // Intel HD Audio, as in a laptop, with QEMU's codec that has a speaker
+    // and a microphone. What's played goes nowhere unless recorded.
+    let audio = match &options.audio_wav {
+        Some(path) => format!("wav,id=sound,path={}", path.display()),
+        None => String::from("none,id=sound"),
+    };
+    qemu.args(["-audiodev", &audio, "-device", "ich9-intel-hda", "-device", "hda-micro,audiodev=sound"]);
     // A USB mouse, so mice get tested; the window's pointer goes to it.
     qemu.arg("-device").arg(format!("usb-mouse,bus=xhci.0{}", place(3)));
     qemu.arg("-device")

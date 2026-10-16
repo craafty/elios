@@ -34,6 +34,7 @@ mod process;
 mod random;
 mod rtc;
 mod serial;
+mod sound;
 mod sync;
 mod syscall;
 mod task;

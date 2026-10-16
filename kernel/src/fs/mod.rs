@@ -289,6 +289,12 @@ pub trait Inode: Send + Sync {
         Err(Errno::ENOTTY)
     }
 
+    /// `ioctl` for devices whose requests depend on how the file was opened
+    /// (a sound device's writes wait unless it's non-blocking).
+    fn ioctl_with_flags(&self, _flags: u32, request: u64, argument: u64) -> Result<u64> {
+        self.ioctl(request, argument)
+    }
+
     /// Which of `POLLIN`, `POLLOUT`, `POLLERR` and `POLLHUP` apply now, for
     /// an open file with these flags. Most things are always ready.
     fn poll(&self, _flags: u32) -> u16 {

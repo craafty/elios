@@ -1954,6 +1954,68 @@ user closes it. The node's destructor notices an inode with no names and
 queues it, and the next operation on the volume frees it (the destructor
 can run where the volume can't be locked).
 
+### Sound (`drivers/hda`, `sound/`)
+
+Video meetings need a speaker and a microphone, and every PC since 2004
+has the same sound hardware interface: Intel's **High Definition Audio**
+(the T440p's chipset has it; QEMU emulates it as `ich9-intel-hda`). It
+has two halves. The *controller* is a PCI device that moves samples
+between memory and the HD Audio link by DMA. The *codecs* on that link
+(a Realtek ALC292 in the T440p) turn them into sound and back.
+
+**The controller** (`drivers/hda/mod.rs`) takes commands for the codecs
+through a ring in memory (the CORB) and puts their answers in another
+(the RIRB). One detail cost a debugging session: the controller counts
+responses up to `RINTCNT` and stops taking commands when it gets there,
+and the count only resets when the "response interrupt" flag is cleared.
+That flag is only raised if it's enabled in `RIRBCTL`, so a driver that
+leaves it off gets one answer and then silence. Linux enables it, and so
+does eliOS now (the interrupt itself stays masked). Sound flows in
+*streams*: a stream descriptor loops over a list of buffers, raising an
+interrupt at the end of each (one per ALSA *period*), and tags the data
+with a stream number the codec's converters listen for. eliOS uses one
+output and one input stream, both 16-bit stereo at 44.1 or 48 kHz.
+
+**The codec** (`drivers/hda/codec.rs`) is a graph of numbered *widgets*:
+converters (DACs and ADCs), mixers and selectors, and *pin complexes*
+(jacks, the built-in speaker and microphone). The firmware describes each
+pin in its "configuration default": a speaker, a headphone jack, a
+microphone, and whether anything is wired to it at all. Like Linux's
+generic codec driver, eliOS searches the graph for a route from each
+useful output pin back to a DAC and from a microphone to an ADC, then
+powers, unmutes and selects along it. So basic sound needs no per-laptop
+tables. Speakers and headphones are both driven, and a thread watches the
+headphone jack's presence detection to mute the speaker while headphones
+are plugged in. The route search is tested against a simulated ALC292
+laid out like the T440p's.
+
+**The interface** (`sound/`) is Linux's ALSA, so `libasound`, and with it
+Firefox, `aplay` and `arecord`, works unchanged. Each card has
+`/dev/snd/controlC0` (what the card is, its mixer controls: playback and
+capture volume and switches) and `pcmC0D0p` and `pcmC0D0c` (playback and
+capture), with Linux's ioctls and structures, and `/proc/asound/cards`.
+A program narrows down the parameters it wants (`HW_REFINE`), sets them,
+prepares the stream, then writes or reads frames. The buffer is a ring
+the device loops over, with two counters running around it: the
+program's position and the hardware's. If the device catches up (nothing
+left to play, no room to record), that's an *xrun*: the stream stops
+with `EPIPE` and the program prepares it again. `libasound` would like
+to map the status records into memory. When that fails it falls back to
+asking with `SYNC_PTR`, which is what eliOS offers. A device that stops
+moving for 10 seconds fails reads and writes with `EIO`, as on Linux,
+instead of hanging the program. The hardware does one format, so
+`/etc/asound.conf` puts ALSA's `plug` layer in front of it, which
+converts any rate, format or channel count in the program.
+
+Two Linux details mattered. musl declares `ioctl`'s request as an `int`,
+so ALSA's requests (most have the top bit set) arrive sign-extended to
+64 bits. Linux truncates them to 32 bits, and eliOS must too. And sound
+devices belong to the `audio` group (29), as on Alpine.
+
+In QEMU, `cargo xtask run --audio-wav FILE` records what eliOS plays (the
+sound card's output otherwise goes nowhere); with that backend QEMU has no
+microphone, so recording only works without it.
+
 ## 19. Networking
 
 `net/`, `drivers/e1000.rs`, `syscall/net.rs`.
@@ -2671,7 +2733,6 @@ Current limits, roughly in order of how much they'd matter to a user:
   that need HTTPS (git cloning from GitHub, for one) can't reach those
   servers. The system image itself is updated by replacing the files on
   the EFI partition; generations cover packages and configuration.
-- **No graphical desktop** (planned, deliberately postponed).
 - **Disk I/O is polled** and holds the volume lock for whole operations.
 
 ## 26. Reference tables

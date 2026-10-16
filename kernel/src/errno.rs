@@ -42,6 +42,9 @@ pub enum Errno {
     ENOSYS = 38,
     ENOTEMPTY = 39,
     ELOOP = 40,
+    /// "File descriptor in bad state": a sound device used in the wrong
+    /// state.
+    EBADFD = 77,
     ENOTSOCK = 88,
     EDESTADDRREQ = 89,
     EMSGSIZE = 90,
@@ -118,6 +121,7 @@ pub fn name(errno: i64) -> &'static str {
         return name;
     }
     match errno {
+        77 => "EBADFD",
         88 => "ENOTSOCK",
         89 => "EDESTADDRREQ",
         90 => "EMSGSIZE",
