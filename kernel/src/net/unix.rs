@@ -24,11 +24,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::errno::{Errno, Result};
-use crate::fs::{self, FileKind, Inode, Metadata, OpenFile, POLLERR, POLLHUP, POLLIN, POLLOUT, ramfs};
+use crate::fs::{self, FileKind, Inode, Metadata, OpenFile, POLLERR, POLLHUP, POLLIN, POLLOUT, PollSource, ramfs};
 use crate::process::credentials::{Gid, Uid};
 use crate::process::{self};
 use crate::sync::SpinLock;
-use crate::task::WaitQueue;
 
 pub const AF_UNIX: u64 = 1;
 const POLLRDHUP: u16 = 0x2000;
@@ -183,14 +182,9 @@ pub struct Socket {
     /// Who created it, for the peer's `SO_PEERCRED`.
     owner: PeerCredentials,
     pub pass_credentials: AtomicBool,
-}
-
-/// Woken whenever any Unix socket changes.
-static CHANGED: WaitQueue = WaitQueue::new();
-
-fn changed() {
-    CHANGED.wake_all();
-    fs::notify_poll();
+    /// Notified when its queue, backlog or connection changes: blocked
+    /// calls on it wait here, as do `poll` and `epoll`.
+    source: Arc<PollSource>,
 }
 
 /// Sockets bound to abstract names.
@@ -203,6 +197,7 @@ impl Socket {
             state: SpinLock::new(State::default()),
             owner: PeerCredentials::current(),
             pass_credentials: AtomicBool::new(false),
+            source: Arc::new(PollSource::new()),
         })
     }
 
@@ -334,6 +329,7 @@ impl Socket {
             state: SpinLock::new(State::default()),
             owner: target.owner,
             pass_credentials: AtomicBool::new(target.pass_credentials.load(Ordering::Relaxed)),
+            source: Arc::new(PollSource::new()),
         });
         let me = PeerCredentials::current();
         {
@@ -344,7 +340,7 @@ impl Socket {
             state.peer_credentials = Some(me);
             state.connected = true;
         }
-        CHANGED.wait_until(|| {
+        target.source.queue().wait_until(|| {
             if process::signal_pending() {
                 return Some(Err(Errno::EINTR));
             }
@@ -365,12 +361,13 @@ impl Socket {
             state.peer_credentials = Some(target.owner);
             state.connected = true;
         }
-        changed();
+        target.source.notify();
+        self.source.notify();
         Ok(())
     }
 
     pub fn accept(&self, nonblocking: bool) -> Result<Arc<Socket>> {
-        CHANGED.wait_until(|| {
+        let connection = self.source.queue().wait_until(|| {
             if process::signal_pending() {
                 return Some(Err(Errno::EINTR));
             }
@@ -382,7 +379,20 @@ impl Socket {
                 Some(connection) => Some(Ok(connection)),
                 None => nonblocking.then_some(Err(Errno::EAGAIN)),
             }
-        })
+        })?;
+        // Room in the backlog for connections waiting to get in.
+        self.source.notify();
+        Ok(connection)
+    }
+
+    /// Wakes whoever waits on this socket or its peer (whose readiness
+    /// depends on this one's queue).
+    fn notify_both(&self) {
+        self.source.notify();
+        let peer = self.state.lock().peer.as_ref().and_then(Weak::upgrade);
+        if let Some(peer) = peer {
+            peer.source.notify();
+        }
     }
 
     /// Sends `data` (with `files` attached to its first byte) to the peer,
@@ -418,7 +428,7 @@ impl Socket {
         let sender = PeerCredentials::current();
         let mut sent = 0;
         loop {
-            let progress = CHANGED.wait_until(|| {
+            let progress = target.source.queue().wait_until(|| {
                 if process::signal_pending() {
                     return Some(Err(Errno::EINTR));
                 }
@@ -446,7 +456,7 @@ impl Socket {
             match progress {
                 Ok(chunk) => {
                     sent += chunk;
-                    changed();
+                    target.source.notify();
                     if sent == data.len() {
                         return Ok(sent);
                     }
@@ -461,7 +471,7 @@ impl Socket {
     /// Receives into `buf`. A stream reads as much as is there (stopping
     /// before a message that carries files); the others read one message.
     pub fn receive(&self, buf: &mut [u8], nonblocking: bool, peek: bool) -> Result<Received> {
-        let received = CHANGED.wait_until(|| {
+        let received = self.source.queue().wait_until(|| {
             if process::signal_pending() {
                 return Some(Err(Errno::EINTR));
             }
@@ -486,7 +496,8 @@ impl Socket {
                 _ => Self::take_message(&mut state, buf, peek),
             }))
         })?;
-        changed();
+        // Room for senders, who wait on this socket and poll their own.
+        self.notify_both();
         Ok(received)
     }
 
@@ -568,10 +579,11 @@ impl Socket {
             state.write_shut |= write;
             state.peer.as_ref().and_then(Weak::upgrade)
         };
-        if write && let Some(peer) = peer {
+        if write && let Some(peer) = &peer {
             peer.state.lock().peer_done = true;
+            peer.source.notify();
         }
-        changed();
+        self.source.notify();
         Ok(())
     }
 
@@ -595,12 +607,13 @@ impl Socket {
         };
         if let Some(peer) = peer {
             peer.state.lock().peer_done = true;
+            peer.source.notify();
         }
         // Not-yet-accepted connections go too (outside the lock: dropping
         // them closes them).
         drop(pending);
         drop(queue);
-        changed();
+        self.source.notify();
     }
 
     pub fn poll(&self) -> u16 {
@@ -684,6 +697,11 @@ impl Inode for SocketFile {
 
     fn poll(&self, _flags: u32) -> u16 {
         self.socket.poll()
+    }
+
+    fn poll_sources(&self, sources: &mut Vec<Arc<PollSource>>, _depth: usize) -> bool {
+        sources.push(self.socket.source.clone());
+        true
     }
 
     fn on_close(&self, _flags: u32) {

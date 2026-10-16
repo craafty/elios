@@ -580,9 +580,13 @@ not to slow the boot noticeably.
 
 The APIC timer then fires every millisecond (1 kHz): the scheduler's tick.
 Every CPU's timer runs at the rate measured on the boot CPU (they share the
-bus clock), and each drives its own CPU's time slices; only the boot CPU's
-advances the tick count. Uptime comes from the TSC, with nanosecond
-resolution.
+bus clock), and each drives its own CPU's time slices; the boot CPU's
+also wakes sleeping threads whose time has come. Uptime comes from the TSC,
+with nanosecond resolution, and so do the kernel's deadlines: a "tick"
+(`time::ticks()`) is a millisecond of TSC time, not a counted interrupt.
+Counting interrupts made time run slow whenever they arrived late (in an
+emulator under load, `alarm(1)` rang after two seconds); now a late
+interrupt simply finds everything that came due meanwhile.
 
 The TSC on older CPUs (and in QEMU's default CPU model) isn't "invariant":
 it can change speed with power states. The kernel warns but uses it anyway;
@@ -752,7 +756,12 @@ allocator. The design:
   its own physical frame (so they needn't be physically contiguous), and are
   unmapped and returned to the frame allocator when freed. The virtual
   ranges are reused first-fit from a list of freed ranges, merged with
-  their neighbors.
+  their neighbors. Unmapping kernel memory means a TLB shootdown, which
+  interrupts every CPU, and system calls allocate buffers of a few pages
+  constantly (a `recvmsg`, a `read`), so freed runs of up to 16 pages are
+  kept mapped, up to 64 pages' worth per length, and handed out again
+  first. Profiling Firefox found this: heap frees were the kernel's top
+  cost.
 
 The trade-off: small-block pages are never returned to the system (blocks
 are only reused), in exchange for a very simple, fast design. Large blocks,
@@ -965,6 +974,14 @@ The top 256 page table entries are copied from the kernel's, so the kernel
 is mapped (supervisor-only) in every address space, and system calls don't
 need to switch page tables.
 
+`madvise(MADV_DONTNEED)` drops a range's pages but keeps the areas: the
+next access gets zeros (private memory) or the file's contents again.
+Memory allocators (scudo, jemalloc) hand freed memory back this way and
+count on it reading as zero afterwards. When `madvise` was ignored,
+Firefox's content process built a hash table in "zeroed" memory full of
+old data and spun forever probing it. Areas also record what's mapped (the
+file's path, `[stack]`, `[heap]`), for `/proc/PID/maps` and fault reports.
+
 ### The kernel touching user memory (`process/user.rs`)
 
 System calls receive user pointers. Before touching user memory, the kernel
@@ -1073,9 +1090,13 @@ variables, semaphores, `pthread_join`, `pthread_once`) is an atomic variable
 in user memory; the kernel is only asked to sleep (`FUTEX_WAIT`: "if the
 variable still holds this value") or to wake sleepers (`FUTEX_WAKE`). The
 check and the enqueue happen under one lock, so a wake that follows a
-change to the variable can't be missed. Waiters live in one list keyed by
-(process, address), and each has its own wait queue, so waking *n* threads
-wakes exactly those. The `_BITSET` variants (used by condition variables)
+change to the variable can't be missed. Waiters live in a map keyed as on
+Linux: a futex in private memory by (process, address), one in shared
+memory (`MAP_SHARED`, memfd, `/dev/shm`) by (memory object, offset), so
+processes that map it at different addresses still meet; that's what
+process-shared mutexes and semaphores need. `FUTEX_PRIVATE_FLAG` skips
+looking. Each waiter has its own wait queue, so waking *n* threads wakes
+exactly those. The `_BITSET` variants (used by condition variables)
 and `REQUEUE`/`CMP_REQUEUE` are supported, with relative or absolute
 timeouts on either clock.
 
@@ -1474,7 +1495,17 @@ allocations changed its memory map between reads, so regenerated content
 shifted under the read position and lines appeared repeated. Like Linux,
 `/proc` files report size 0.
 
-Two files are eliOS's own, for finding where a program is stuck:
+`comm` is the process's name.
+
+Three files are eliOS's own, for finding where a program is stuck or slow.
+`profile` is a sampling profiler: write `1` to start, and every timer tick
+(a thousand a second per CPU) that interrupts the process counts where it
+was, the user instruction pointer, or the system call it was in; reading
+lists the most frequent places as `library+offset` and `[kernel: call]`,
+then the kernel's own addresses (for `addr2line` on `elikernel`). Time with
+interrupts off shows up at the instruction after they're turned back on, so
+kernel samples bunch at the ends of locked sections. It found most of the
+performance problems in this section and the next. The other two:
 `threads` lists each thread with its name and the system call it's in, and
 `stacks` adds where each call came from and the return addresses found on
 the thread's user stack, as `library+offset`. Programs rarely keep frame
@@ -1497,10 +1528,20 @@ carries all of Firefox's inter-process messages.
 ### poll and select
 
 Each inode reports its readiness (for pipes it depends on which end, so the
-open file's flags are passed in). Waiting uses one global wait queue that's
-woken whenever any file changes; `poll` rechecks every descriptor. That's
-simpler than per-file wait lists and cheap at eliOS's scale. `select` and
-`pselect6` are translated into the same mechanism.
+open file's flags are passed in). Pipes, sockets, terminals, event files and
+input devices also have a **poll source** (`fs::PollSource`): a wait queue
+woken when their state may have changed, and a count of those changes.
+`poll` waits on the sources of the files it watches, all at once
+(`WaitQueue::wait_any`), then rechecks them. Files without one (regular
+files are always ready) use a global queue that `fs::notify_poll` wakes.
+
+It used to be only the global queue: any change anywhere woke every
+waiting thread in the system to recheck its files. Firefox has dozens of
+threads waiting at any time, and a profile showed idle processes spending
+their time in `poll` and `epoll_wait`; with per-file sources they don't
+run at all. Network sockets share one source, since the stack doesn't
+track which socket a packet changed. `select` and `pselect6` are
+translated into the same mechanism.
 
 ### Event files and epoll (`fs/events.rs`, `fs/epoll.rs`)
 
@@ -1514,17 +1555,18 @@ timer of its own; instead files can tell `poll` when they'll become ready
 by themselves (`Inode::poll_deadline`), and every wait includes that in
 its deadline.
 
-**epoll** keeps a set of watched files and waits for all of them with the
-same global wait queue as `poll`. Entries hold the open file weakly, so
+**epoll** keeps a set of watched files and waits on their poll sources,
+like `poll`; its own source counts changes to the set, so a wait started
+before another thread's `epoll_ctl` starts over. Entries hold the open
+file weakly, so
 closing a file's last descriptor drops it from every set, as on Linux. An
 epoll set is itself readable when something in it is ready, so sets can
 be nested. One-shot entries go quiet after one report until re-armed.
-*Edge-triggered* entries should be reported once per change, which would
-need every file to count its changes; instead the wait queue counts its
-wakeups (a "generation"), and an edge-triggered entry is reported at most
-once per generation while ready. Programs following the edge-triggered
-contract (read until `EAGAIN`) see every event, now and then with an extra
-one, and an always-writable socket doesn't make `epoll_wait` spin.
+*Edge-triggered* entries are reported once per change: an entry remembers
+its file's change count when reported and isn't reported again until the
+count moves. Programs following the edge-triggered contract (read until
+`EAGAIN`) see every event, and an always-writable socket doesn't make
+`epoll_wait` spin.
 
 ## 17. The terminal
 
@@ -2324,7 +2366,10 @@ It's one event loop around `epoll`, with a 60 Hz timer for redrawing.
 - **Surfaces** (`surface.rs`): changes are pending until a commit applies
   them all at once. A committed buffer is *copied* into the surface and
   released straight away, so clients can reuse it and the desktop never
-  reads memory a client is changing. Subsurfaces (Firefox draws its
+  reads memory a client is changing. Only the damaged rows are copied
+  (Wayland lets a compositor assume the rest of a same-sized buffer is
+  unchanged), and only that part of the screen is redrawn: Firefox
+  scrolling a page redraws a strip, not the window. Subsurfaces (Firefox draws its
   content into one) follow the parent's commits when synchronized.
 - **The shell** (`shell.rs`): a bar along the top (buttons for a terminal
   and Firefox, a tab per window, a clock); every window maximized below

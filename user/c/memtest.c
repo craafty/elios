@@ -12,7 +12,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/futex.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -78,6 +80,13 @@ static sigjmp_buf recover;
 static void on_segv(int signal) {
     (void)signal;
     siglongjmp(recover, 1);
+}
+
+/* An address with nothing mapped there. */
+static void *gone_soon(void) {
+    void *page = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(page, 4096);
+    return page;
 }
 
 int main(void) {
@@ -204,6 +213,55 @@ int main(void) {
         munmap(grown, 4096);
     }
     munmap(blocker, 4096);
+
+    /* madvise(MADV_DONTNEED): allocators count on freed memory reading
+       back as zeros (Firefox's hash tables spun forever without it). */
+    char *advised = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    strcpy(advised, "old");
+    strcpy(advised + 4096, "old too");
+    check("MADV_DONTNEED drops private memory", madvise(advised, 8192, MADV_DONTNEED) == 0);
+    check("... which reads as zeros again", advised[0] == 0 && advised[4096] == 0);
+    advised[0] = 'x';
+    check("... and is still usable", advised[0] == 'x');
+    munmap(advised, 8192);
+    char *together = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    strcpy(together, "shared");
+    madvise(together, 4096, MADV_DONTNEED);
+    check("shared memory keeps its contents", strcmp(together, "shared") == 0);
+    munmap(together, 4096);
+    int backing = open("/tmp/memtest-advice", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    (void)!write(backing, "from the file", 14);
+    char *copy = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, backing, 0);
+    strcpy(copy, "changed");
+    madvise(copy, 4096, MADV_DONTNEED);
+    check("a private file mapping reverts to the file", strcmp(copy, "from the file") == 0);
+    munmap(copy, 4096);
+    close(backing);
+    unlink("/tmp/memtest-advice");
+    check("advice for unmapped memory fails with ENOMEM",
+          madvise(gone_soon(), 4096, MADV_DONTNEED) == -1 && errno == ENOMEM);
+
+    /* A futex in shared memory wakes a waiter in another process (as
+       process-shared mutexes and semaphores need). */
+    int *word = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    *word = 0;
+    pid_t sleeper = fork();
+    if (sleeper == 0) {
+        struct timespec patience = {3, 0};
+        long result = syscall(SYS_futex, word, FUTEX_WAIT, 0, &patience, NULL, 0);
+        _exit(result == 0 && *word == 1 ? 0 : 1);
+    }
+    usleep(100 * 1000);
+    *word = 1;
+    long woken = 0;
+    for (int tries = 0; tries < 50 && woken == 0; tries++) {
+        woken = syscall(SYS_futex, word, FUTEX_WAKE, 1, NULL, NULL, 0);
+        if (woken == 0) usleep(20 * 1000);
+    }
+    int sleeper_status;
+    waitpid(sleeper, &sleeper_status, 0);
+    check("a shared futex wakes another process", woken == 1 && WIFEXITED(sleeper_status) && WEXITSTATUS(sleeper_status) == 0);
+    munmap(word, 4096);
 
     /* Forking while another thread's system call writes to memory. */
     pthread_t reader;

@@ -114,26 +114,27 @@ const FUTEX_WAKE_BITSET: u64 = 10;
 const FUTEX_PRIVATE_FLAG: u64 = 128;
 const FUTEX_CLOCK_REALTIME: u64 = 256;
 
-/// `futex(address, op, value, timeout, address2, value3)`. Every futex is
-/// private to its process, so the private flag changes nothing.
+/// `futex(address, op, value, timeout, address2, value3)`. Without
+/// `FUTEX_PRIVATE_FLAG`, a futex in shared memory is found by what's
+/// mapped there, so processes sharing it meet.
 pub fn futex(address: u64, op: u64, value: u64, timeout: u64, address2: u64, value3: u64) -> Result<u64> {
-    let pid = process::current().pid;
+    let private = op & FUTEX_PRIVATE_FLAG != 0;
     let value = value as u32;
     match op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME) {
         FUTEX_WAIT => {
             let deadline = deadline(timeout, None)?;
-            futex::wait(pid, address, value, u32::MAX, deadline).map(|_| 0)
+            futex::wait(address, private, value, u32::MAX, deadline).map(|_| 0)
         }
         FUTEX_WAIT_BITSET => {
             let clock = if op & FUTEX_CLOCK_REALTIME != 0 { CLOCK_REALTIME } else { CLOCK_MONOTONIC };
             let deadline = deadline(timeout, Some(clock))?;
-            futex::wait(pid, address, value, value3 as u32, deadline).map(|_| 0)
+            futex::wait(address, private, value, value3 as u32, deadline).map(|_| 0)
         }
-        FUTEX_WAKE => futex::wake(pid, address, value, u32::MAX),
-        FUTEX_WAKE_BITSET => futex::wake(pid, address, value, value3 as u32),
+        FUTEX_WAKE => futex::wake(address, private, value, u32::MAX),
+        FUTEX_WAKE_BITSET => futex::wake(address, private, value, value3 as u32),
         // For the requeue operations, the timeout argument is a count.
-        FUTEX_REQUEUE => futex::requeue(pid, address, address2, value, timeout as u32, None),
-        FUTEX_CMP_REQUEUE => futex::requeue(pid, address, address2, value, timeout as u32, Some(value3 as u32)),
+        FUTEX_REQUEUE => futex::requeue(address, address2, private, value, timeout as u32, None),
+        FUTEX_CMP_REQUEUE => futex::requeue(address, address2, private, value, timeout as u32, Some(value3 as u32)),
         _ => Err(Errno::ENOSYS),
     }
 }
@@ -415,6 +416,29 @@ pub fn mmap(address: u64, len: u64, protection: u64, flags: u64, fd: u64, offset
     };
     space.add_named_area(start, start + len, protection, backing, name)?;
     Ok(start)
+}
+
+/// `madvise`: most advice (about access patterns, huge pages, dumps) can
+/// be ignored, but `MADV_DONTNEED` changes what memory reads as, and
+/// allocators depend on it: their freed memory must come back as zeros.
+pub fn madvise(address: u64, len: u64, advice: u64) -> Result<u64> {
+    const MADV_DONTNEED: i32 = 4;
+    // Freeing a shared mapping's backing store (zeroing it) isn't supported.
+    const MADV_REMOVE: i32 = 9;
+    if !address.is_multiple_of(PAGE_SIZE) {
+        return Err(Errno::EINVAL);
+    }
+    let end =
+        address.checked_add(len.next_multiple_of(PAGE_SIZE)).filter(|&end| end <= USER_END).ok_or(Errno::EINVAL)?;
+    if advice as i32 == MADV_REMOVE {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if advice as i32 == MADV_DONTNEED {
+        let process = process::current();
+        let mut space = process.space.lock();
+        space.as_mut().ok_or(Errno::ENOMEM)?.discard(address, end)?;
+    }
+    Ok(0)
 }
 
 /// `mremap`: grows or shrinks a mapping, moving it if allowed

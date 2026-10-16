@@ -7,7 +7,11 @@
 //!
 //! Larger allocations get whole pages in the heap's virtual region, each
 //! backed by its own physical frame, so they needn't be physically
-//! contiguous. Freeing one unmaps it and returns the frames immediately.
+//! contiguous. Freeing one unmaps it and returns the frames, except that
+//! a few freed runs of each length up to 64 KiB are kept mapped for the
+//! next allocation of that length. System calls allocate and free buffers
+//! of a few pages all the time, and unmapping means a TLB shootdown, which
+//! interrupts every CPU.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
@@ -24,6 +28,10 @@ const SIZE_CLASSES: usize = (MAX_BLOCK / MIN_BLOCK).trailing_zeros() as usize + 
 /// Free page ranges remembered for reuse. If more pile up, the extra virtual
 /// space is simply never reused (the physical frames are freed regardless).
 const MAX_FREE_RANGES: usize = 64;
+/// Freed runs of up to this many pages are kept mapped for reuse...
+const CACHED_RUN_PAGES: usize = 16;
+/// ...up to this many pages' worth of each length.
+const CACHE_PAGES_PER_LENGTH: u64 = 64;
 
 struct FreeBlock {
     next: *mut FreeBlock,
@@ -58,6 +66,10 @@ struct Heap {
     free_range_count: usize,
     /// Everything from here to the end of the region is unused.
     next: u64,
+    /// Freed runs kept mapped, by length in pages (minus one), and how
+    /// many each list holds.
+    cached_runs: [*mut FreeBlock; CACHED_RUN_PAGES],
+    cached_counts: [u64; CACHED_RUN_PAGES],
     stats: Stats,
 }
 
@@ -69,6 +81,8 @@ static HEAP: SpinLock<Heap> = SpinLock::new(Heap {
     free_ranges: [PageRange::EMPTY; MAX_FREE_RANGES],
     free_range_count: 0,
     next: HEAP_START,
+    cached_runs: [ptr::null_mut(); CACHED_RUN_PAGES],
+    cached_counts: [0; CACHED_RUN_PAGES],
     stats: Stats { bytes_in_use: 0, bytes_mapped: 0 },
 });
 
@@ -103,13 +117,28 @@ fn pages_for(layout: Layout) -> u64 {
     (layout.size() as u64).div_ceil(PAGE_SIZE)
 }
 
+/// Which cache list a run of `pages` belongs on, if it's cached at all
+/// (runs are page aligned, which covers alignments up to a page).
+fn cached_length(pages: u64, layout: Layout) -> Option<usize> {
+    (pages as usize <= CACHED_RUN_PAGES && layout.align() as u64 <= PAGE_SIZE).then(|| pages as usize - 1)
+}
+
 impl Heap {
     fn allocate(&mut self, layout: Layout) -> *mut u8 {
         match size_class(layout) {
             Some(class) => self.allocate_block(class),
             None => {
                 let pages = pages_for(layout);
-                let block = self.allocate_pages(pages, (layout.align() as u64).max(PAGE_SIZE));
+                let block = match cached_length(pages, layout) {
+                    Some(length) if !self.cached_runs[length].is_null() => {
+                        let block = self.cached_runs[length];
+                        // SAFETY: runs on the list hold a valid link.
+                        self.cached_runs[length] = unsafe { (*block).next };
+                        self.cached_counts[length] -= 1;
+                        block.cast()
+                    }
+                    _ => self.allocate_pages(pages, (layout.align() as u64).max(PAGE_SIZE)),
+                };
                 if !block.is_null() {
                     self.stats.bytes_in_use += pages * PAGE_SIZE;
                 }
@@ -129,8 +158,19 @@ impl Heap {
             }
             None => {
                 let pages = pages_for(layout);
-                self.free_pages(block as u64, pages);
                 self.stats.bytes_in_use -= pages * PAGE_SIZE;
+                if let Some(length) = cached_length(pages, layout)
+                    && (self.cached_counts[length] + 1) * pages <= CACHE_PAGES_PER_LENGTH
+                {
+                    let run = block.cast::<FreeBlock>();
+                    // SAFETY: the run is ours again, mapped, and big enough
+                    // for a link.
+                    unsafe { run.write(FreeBlock { next: self.cached_runs[length] }) };
+                    self.cached_runs[length] = run;
+                    self.cached_counts[length] += 1;
+                    return;
+                }
+                self.free_pages(block as u64, pages);
             }
         }
     }

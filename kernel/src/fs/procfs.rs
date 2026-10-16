@@ -20,6 +20,7 @@ use crate::sync::SpinLock;
 use crate::{net, task, time};
 
 type Generator = Box<dyn Fn() -> String + Send + Sync>;
+type Writer = Box<dyn Fn(&[u8]) -> Result<()> + Send + Sync>;
 /// A directory's entries.
 pub(super) type Listing = Vec<(String, Arc<dyn Inode>)>;
 
@@ -57,6 +58,46 @@ impl Inode for Generated {
         let count = buf.len().min(bytes.len() - start);
         buf[..count].copy_from_slice(&bytes[start..start + count]);
         Ok(count)
+    }
+}
+
+/// A generated file that can also be written, to control something.
+struct Control {
+    file: Generated,
+    write: Writer,
+}
+
+fn control(
+    generate: impl Fn() -> String + Send + Sync + 'static,
+    write: impl Fn(&[u8]) -> Result<()> + Send + Sync + 'static,
+) -> Arc<dyn Inode> {
+    Arc::new(Control {
+        file: Generated {
+            inode: ramfs::next_inode_number(),
+            generate: Box::new(generate),
+            snapshot: SpinLock::new(None),
+        },
+        write: Box::new(write),
+    })
+}
+
+impl Inode for Control {
+    fn metadata(&self) -> Metadata {
+        Metadata { permissions: 0o644, ..self.file.metadata() }
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        self.file.read_at(offset, buf)
+    }
+
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize> {
+        (self.write)(buf)?;
+        Ok(buf.len())
+    }
+
+    /// `echo 1 > file` truncates first; as on Linux, that's ignored.
+    fn truncate(&self, _len: u64) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -401,6 +442,44 @@ fn stacks(process: &process::Process) -> String {
     text
 }
 
+/// eliOS's own /proc/PID/profile: write `1` to start sampling where the
+/// process is at every timer tick (1000 a second per CPU), `0` to stop;
+/// reading gives the most frequent places as `count library+offset`, with
+/// `[kernel: call]` for time in system calls and page faults.
+fn profile(process: &process::Process) -> String {
+    const MOST_PLACES: usize = 300;
+    let Some(samples) = process.profile.lock().clone() else {
+        return String::from("not profiling: write 1 to start\n");
+    };
+    let total: u32 = samples.values().sum();
+    let mut sorted: Vec<(u64, u32)> = samples.into_iter().collect();
+    sorted.sort_by_key(|&(_, count)| core::cmp::Reverse(count));
+    let space = process.space.lock();
+    let mut text = format!("{total} samples\n");
+    for &(address, count) in sorted.iter().take(MOST_PLACES) {
+        let place = match address.checked_sub(process::KERNEL_SAMPLE) {
+            Some(0) => String::from("[kernel: faults and interrupts]"),
+            Some(call) => format!("[kernel: {}]", crate::syscall::call_name(call - 1)),
+            None => match space.as_ref().and_then(|space| space.describe(address)) {
+                Some((name, offset)) => format!("{name}+{offset:#x}"),
+                None => format!("{address:#x}"),
+            },
+        };
+        text.push_str(&format!("{count:>7} {place}\n"));
+    }
+    drop(space);
+    // Where in the kernel, for `addr2line -f -e target/.../elikernel`.
+    if let Some(kernel) = process.kernel_profile.lock().clone() {
+        let mut sorted: Vec<(u64, u32)> = kernel.into_iter().collect();
+        sorted.sort_by_key(|&(_, count)| core::cmp::Reverse(count));
+        text.push_str("in the kernel:\n");
+        for (address, count) in sorted.into_iter().take(MOST_PLACES) {
+            text.push_str(&format!("{count:>7} kernel {address:#x}\n"));
+        }
+    }
+    text
+}
+
 fn process_directory(pid: Pid) -> Arc<dyn Inode> {
     let owner = process::find(pid).map_or((0, 0), |process| {
         let credentials = process.credentials.lock();
@@ -419,6 +498,10 @@ fn process_directory(pid: Pid) -> Arc<dyn Inode> {
             generated(move || target.arguments.lock().iter().map(|a| format!("{a}\0")).collect()),
         ));
         entries.push(("status".into(), generated(move || status(pid))));
+        entries.push((
+            "comm".into(),
+            generated(move || info(pid).map(|info| format!("{}\n", info.name)).unwrap_or_default()),
+        ));
         entries.push(("stat".into(), generated(move || stat(pid))));
         let target = process.clone();
         entries.push(("syscall".into(), generated(move || current_syscall(&target, None))));
@@ -428,6 +511,22 @@ fn process_directory(pid: Pid) -> Arc<dyn Inode> {
         entries.push(("maps".into(), generated(move || maps(&target))));
         let target = process.clone();
         entries.push(("stacks".into(), generated(move || stacks(&target))));
+        let (target, controlled) = (process.clone(), process.clone());
+        entries.push((
+            "profile".into(),
+            control(
+                move || profile(&target),
+                move |bytes| {
+                    let on = match bytes.first() {
+                        Some(b'1') => true,
+                        Some(b'0') => false,
+                        _ => return Err(Errno::EINVAL),
+                    };
+                    process::set_profiling(&controlled, on);
+                    Ok(())
+                },
+            ),
+        ));
         let target = process;
         entries.push((
             "fd".into(),

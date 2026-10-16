@@ -2,25 +2,24 @@
 //! what Linux event loops use instead of `poll` (libwayland's, Firefox's
 //! IPC, libuv's).
 //!
-//! It's built on the same mechanism as `poll`: one wait queue that's woken
-//! whenever any file may have become ready, after which each watched file
-//! is asked its state. An entry refers to the open file weakly, so closing
-//! the last descriptor for a file drops it from every epoll set, as on
-//! Linux.
+//! It's built on the same mechanism as `poll`: a wait on the watched
+//! files' poll sources (see `fs::PollSource`), after which each watched
+//! file is asked its state. An entry refers to the open file weakly, so
+//! closing the last descriptor for a file drops it from every epoll set, as
+//! on Linux.
 //!
-//! **Edge-triggered entries** (`EPOLLET`) should be reported once each
-//! time a file *becomes* ready, which needs every file to count its state
-//! changes. Instead, an edge-triggered entry is reported at most once per
-//! "generation" of the poll wait queue (every wakeup starts a new one).
-//! A program that reads until `EAGAIN`, as the edge-triggered contract
-//! requires, sees every new event, sometimes with a spurious extra report,
-//! and an always-writable socket doesn't make `epoll_wait` spin.
+//! **Edge-triggered entries** (`EPOLLET`) are reported once each time a
+//! file's state changes: the entry remembers its file's change count when
+//! reported, and is reported again only once the count moves. A program
+//! that reads until `EAGAIN`, as the edge-triggered contract requires, sees
+//! every new event, and an always-writable socket doesn't make
+//! `epoll_wait` spin.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use super::{FileKind, Inode, Metadata, OpenFile, POLLERR, POLLHUP, POLLIN, ramfs};
+use super::{FileKind, Inode, Metadata, OpenFile, POLLERR, POLLHUP, POLLIN, PollSource, ramfs};
 use crate::errno::{Errno, Result};
 use crate::sync::SpinLock;
 
@@ -43,7 +42,8 @@ struct Entry {
     file: Weak<OpenFile>,
     events: u32,
     data: u64,
-    /// The poll generation this (edge-triggered) entry was last reported in.
+    /// The file's change count when this (edge-triggered) entry was last
+    /// reported.
     reported: Option<u64>,
 }
 
@@ -51,11 +51,25 @@ pub struct Epoll {
     inode: u64,
     /// Watched files, by descriptor number.
     entries: SpinLock<BTreeMap<i32, Entry>>,
+    /// Notified when the set of watched files changes.
+    source: Arc<PollSource>,
 }
+
+/// How deeply epoll sets watching epoll sets are followed.
+const MOST_NESTING: usize = 4;
 
 impl Epoll {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { inode: ramfs::next_inode_number(), entries: SpinLock::new(BTreeMap::new()) })
+        Arc::new(Self {
+            inode: ramfs::next_inode_number(),
+            entries: SpinLock::new(BTreeMap::new()),
+            source: Arc::new(PollSource::new()),
+        })
+    }
+
+    /// Counts changes to the set of watched files.
+    pub fn membership_changes(&self) -> u64 {
+        self.source.changes()
     }
 
     pub fn control(&self, op: u32, fd: i32, file: &Arc<OpenFile>, events: u32, data: u64) -> Result<()> {
@@ -88,13 +102,16 @@ impl Epoll {
             _ => return Err(Errno::EINVAL),
         }
         drop(entries);
+        self.source.notify();
+        // An epoll set waited for by `poll` (or another epoll set) without
+        // a source of its own: those waiters use the global queue.
         super::notify_poll();
         Ok(())
     }
 
     /// The entries ready now, up to `max`, as (events, data); marks
     /// edge-triggered and one-shot ones as reported.
-    pub fn collect(&self, max: usize, generation: u64) -> Vec<(u32, u64)> {
+    pub fn collect(&self, max: usize) -> Vec<(u32, u64)> {
         let mut ready = Vec::new();
         let mut entries = self.entries.lock();
         entries.retain(|_, entry| entry.file.strong_count() > 0);
@@ -114,10 +131,11 @@ impl Epoll {
                 continue;
             }
             if entry.events & EPOLLET != 0 {
-                if entry.reported == Some(generation) {
+                let changes = super::poll_changes(&*file.inode);
+                if entry.reported == Some(changes) {
                     continue;
                 }
-                entry.reported = Some(generation);
+                entry.reported = Some(changes);
             }
             if entry.events & EPOLLONESHOT != 0 {
                 entry.events &= !READINESS;
@@ -161,6 +179,20 @@ impl Inode for Epoll {
 
     fn poll_deadline(&self) -> Option<u64> {
         self.deadline()
+    }
+
+    /// Its own source (for changes to the set), and the watched files'.
+    fn poll_sources(&self, sources: &mut Vec<Arc<PollSource>>, depth: usize) -> bool {
+        if depth > MOST_NESTING {
+            return false;
+        }
+        sources.push(self.source.clone());
+        let files: Vec<Arc<OpenFile>> = self.entries.lock().values().filter_map(|entry| entry.file.upgrade()).collect();
+        let mut own = true;
+        for file in files {
+            own &= file.inode.poll_sources(sources, depth + 1);
+        }
+        own
     }
 
     fn as_any(&self) -> Option<&dyn core::any::Any> {

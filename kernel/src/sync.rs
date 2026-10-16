@@ -220,6 +220,21 @@ impl<T> Once<T> {
         // SAFETY: ONCE_READY is only published after the value is written.
         (self.state.load(Ordering::Acquire) == ONCE_READY).then(|| unsafe { (*self.value.get()).assume_init_ref() })
     }
+
+    /// The value, made by `make` if this is the first use. A caller that
+    /// loses a race waits for the winner's value.
+    pub fn get_or_init(&self, make: impl FnOnce() -> T) -> &T {
+        if let Some(value) = self.get() {
+            return value;
+        }
+        let _ = self.set(make());
+        loop {
+            if let Some(value) = self.get() {
+                return value;
+            }
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// A fixed-size byte queue for one producer and one consumer, without locks.

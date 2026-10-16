@@ -82,25 +82,39 @@ const FORMAT_ARGB8888: u32 = 0;
 const FORMAT_XRGB8888: u32 = 1;
 
 impl Buffer {
-    /// The buffer's pixels, row by row (`None` if it doesn't fit its pool,
-    /// which a client could arrange by shrinking the file).
-    fn rows(&self) -> Option<Vec<u32>> {
-        let bytes = self.stride.checked_mul(self.height as usize)?;
-        if self.offset.checked_add(bytes)? > self.pool.size || self.stride < self.width as usize * 4 {
+    /// Copies the buffer's pixels into `pixels`, a row at a time. If
+    /// `pixels` already holds a picture this size, only `damage` (buffer
+    /// coordinates) is copied: Wayland lets the compositor assume the rest
+    /// is unchanged. Returns the part copied, or `None` if the buffer
+    /// doesn't fit its pool (which a client could arrange by shrinking the
+    /// file).
+    fn copy_into(&self, pixels: &mut Vec<u32>, damage: Option<Rect>) -> Option<Rect> {
+        let (width, height) = (self.width.max(0) as usize, self.height.max(0) as usize);
+        let bytes = self.stride.checked_mul(height)?;
+        if self.offset.checked_add(bytes)? > self.pool.size || self.stride < width * 4 {
             return None;
         }
-        let mut pixels = Vec::with_capacity((self.width * self.height) as usize);
-        for row in 0..self.height as usize {
-            // SAFETY: the rows lie within the mapping (checked above). The
-            // client may be writing to it, which can only garble its own
-            // picture.
-            let start = unsafe { self.pool.address.add(self.offset + row * self.stride).cast::<u32>() };
-            for column in 0..self.width as usize {
-                // SAFETY: as above.
-                pixels.push(unsafe { start.add(column).read_unaligned() });
+        let whole = Rect::new(0, 0, self.width, self.height);
+        let area = match damage {
+            Some(damage) if pixels.len() == width * height => damage.intersect(&whole),
+            _ => {
+                pixels.clear();
+                pixels.resize(width * height, 0);
+                whole
+            }
+        };
+        for row in area.y..area.y + area.height {
+            let start = row as usize * width + area.x as usize;
+            let target = &mut pixels[start..start + area.width as usize];
+            // SAFETY: the rows lie within the mapping (checked above), and
+            // `target` is as long as the run copied. The client may be
+            // writing to the buffer, which can only garble its own picture.
+            unsafe {
+                let source = self.pool.address.add(self.offset + row as usize * self.stride + area.x as usize * 4);
+                core::ptr::copy_nonoverlapping(source, target.as_mut_ptr().cast::<u8>(), target.len() * 4);
             }
         }
-        Some(pixels)
+        Some(area)
     }
 }
 
@@ -128,6 +142,12 @@ pub struct Client {
     buffers: BTreeMap<u32, Buffer>,
     regions: BTreeMap<u32, Vec<Rect>>,
     positioners: BTreeMap<u32, Positioner>,
+    /// What the last commit changed, for the screen to redraw: each
+    /// surface applied and the part of it that changed (surface
+    /// coordinates; `None` for all of it).
+    pub applied: Vec<(u32, Option<Rect>)>,
+    /// A subsurface moved: its old place needs redrawing too.
+    pub moved: bool,
 }
 
 impl Client {
@@ -142,6 +162,8 @@ impl Client {
             buffers: BTreeMap::new(),
             regions: BTreeMap::new(),
             positioners: BTreeMap::new(),
+            applied: Vec::new(),
+            moved: false,
         }
     }
 
@@ -598,31 +620,50 @@ impl Client {
     /// Applies committed state to a surface, then to its synchronized
     /// children's cached state.
     fn apply(&mut self, id: u32, pending: crate::surface::Pending) {
-        let buffer = match pending.buffer {
-            Some(Some(buffer)) => self.buffers.get(&buffer).map(|b| (buffer, b.rows(), b.width, b.height, b.format)),
-            _ => None,
-        };
         let Some(surface) = self.surfaces.get_mut(&id) else { return };
         if let Some(scale) = pending.scale {
             surface.scale = scale;
         }
-        match (pending.buffer, buffer) {
-            (Some(None), _) => {
+        let scale = surface.scale.max(1);
+        // What changed, in surface coordinates (`None`: all of it).
+        let mut changed = Some(pending.damage.unwrap_or(Rect::new(0, 0, 0, 0)));
+        match pending.buffer {
+            Some(None) => {
                 surface.has_content = false;
                 surface.pixels = Vec::new();
+                changed = None;
             }
-            (Some(Some(_)), Some((buffer, Some(pixels), width, height, format))) => {
-                surface.pixels = pixels;
-                surface.buffer_width = width;
-                surface.width = width / surface.scale;
-                surface.height = height / surface.scale;
-                surface.alpha = format == FORMAT_ARGB8888;
-                surface.has_content = true;
-                // Copied: the client can have the buffer back.
-                self.send(Event::new(buffer, 0));
+            Some(Some(id)) => {
+                if let Some(buffer) = self.buffers.get(&id) {
+                    let same_size = surface.has_content
+                        && surface.buffer_width == buffer.width
+                        && surface.height * scale == buffer.height;
+                    let damage = pending
+                        .damage
+                        .filter(|_| same_size)
+                        .map(|d| Rect::new(d.x * scale, d.y * scale, d.width * scale, d.height * scale));
+                    if let Some(copied) = buffer.copy_into(&mut surface.pixels, damage) {
+                        surface.buffer_width = buffer.width;
+                        surface.width = buffer.width / scale;
+                        surface.height = buffer.height / scale;
+                        surface.alpha = buffer.format == FORMAT_ARGB8888;
+                        surface.has_content = true;
+                        changed = (copied != Rect::new(0, 0, buffer.width, buffer.height)).then(|| {
+                            Rect::new(
+                                copied.x / scale,
+                                copied.y / scale,
+                                copied.width / scale + 1,
+                                copied.height / scale + 1,
+                            )
+                        });
+                        // Copied: the client can have the buffer back.
+                        self.send(Event::new(id, 0));
+                    }
+                }
             }
-            _ => {}
+            None => {}
         }
+        self.applied.push((id, changed));
         let Some(surface) = self.surfaces.get_mut(&id) else { return };
         if let Some(region) = pending.input_region {
             surface.input_region = region;
@@ -638,9 +679,11 @@ impl Client {
             let Some(child_surface) = self.surfaces.get_mut(&child) else { continue };
             if let Role::Subsurface(sub) = &mut child_surface.role
                 && let Some((x, y)) = sub.pending_position.take()
+                && (sub.x, sub.y) != (x, y)
             {
                 sub.x = x;
                 sub.y = y;
+                self.moved = true;
             }
             if let Some(cached) = child_surface.cached.take() {
                 self.apply(child, cached);

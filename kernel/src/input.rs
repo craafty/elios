@@ -21,7 +21,6 @@ use crate::errno::{Errno, Result};
 use crate::fs::{self, FileKind, Inode, Metadata, ramfs};
 use crate::process::{self, user};
 use crate::sync::SpinLock;
-use crate::task::WaitQueue;
 use crate::time;
 
 // Event types.
@@ -87,7 +86,7 @@ pub struct Device {
 pub struct Client {
     device: Arc<Device>,
     queue: SpinLock<VecDeque<Event>>,
-    changed: WaitQueue,
+    changed: Arc<fs::PollSource>,
     /// Report times on the monotonic clock instead of the real-time one.
     monotonic: core::sync::atomic::AtomicBool,
 }
@@ -198,16 +197,14 @@ impl Device {
             }
             queue.push_back(Event { time: now, kind: EV_SYN, code: SYN_REPORT, value: 0 });
             drop(queue);
-            client.changed.wake_all();
+            client.changed.notify();
         }
-        fs::notify_poll();
     }
 
     fn wake_clients(&self) {
         for client in self.clients.lock().iter().filter_map(Weak::upgrade) {
-            client.changed.wake_all();
+            client.changed.notify();
         }
-        fs::notify_poll();
     }
 
     fn rdev(&self) -> u64 {
@@ -242,7 +239,7 @@ impl Inode for Device {
         let client = Arc::new(Client {
             device: device.clone(),
             queue: SpinLock::new(VecDeque::new()),
-            changed: WaitQueue::new(),
+            changed: Arc::new(fs::PollSource::new()),
             monotonic: core::sync::atomic::AtomicBool::new(false),
         });
         device.clients.lock().push(Arc::downgrade(&client));
@@ -387,7 +384,7 @@ impl Inode for Client {
         }
         let monotonic = self.monotonic.load(Ordering::Relaxed);
         let offset = if monotonic { 0 } else { time::unix_nanos() - time::uptime_nanos() };
-        self.changed.wait_until(|| {
+        self.changed.queue().wait_until(|| {
             if process::signal_pending() {
                 return Some(Err(Errno::EINTR));
             }
@@ -423,6 +420,11 @@ impl Inode for Client {
     fn poll(&self, _flags: u32) -> u16 {
         let ready = if self.queue.lock().is_empty() { 0 } else { fs::POLLIN };
         if !self.device.present() { ready | fs::POLLHUP | fs::POLLERR } else { ready | fs::POLLOUT }
+    }
+
+    fn poll_sources(&self, sources: &mut Vec<Arc<fs::PollSource>>, _depth: usize) -> bool {
+        sources.push(self.changed.clone());
+        true
     }
 }
 

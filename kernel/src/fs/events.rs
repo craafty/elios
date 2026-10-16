@@ -4,21 +4,13 @@
 //! these alongside sockets and pipes with `poll` or `epoll`.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{FileKind, Inode, Metadata, POLLIN, POLLOUT, ramfs};
+use super::{FileKind, Inode, Metadata, POLLIN, POLLOUT, PollSource, ramfs};
 use crate::errno::{Errno, Result};
 use crate::sync::SpinLock;
-use crate::task::WaitQueue;
 use crate::{process, time};
-
-/// Woken when any eventfd or timerfd changes.
-static CHANGED: WaitQueue = WaitQueue::new();
-
-fn changed() {
-    CHANGED.wake_all();
-    super::notify_poll();
-}
 
 /// An eventfd: a 64-bit counter. Writes add to it; a read returns it and
 /// resets it to 0 (or, in semaphore mode, returns 1 and decrements), and
@@ -27,11 +19,18 @@ pub struct EventFd {
     inode: u64,
     counter: SpinLock<u64>,
     semaphore: bool,
+    /// Notified when the counter changes.
+    source: Arc<PollSource>,
 }
 
 impl EventFd {
     pub fn new(initial: u64, semaphore: bool) -> Arc<Self> {
-        Arc::new(Self { inode: ramfs::next_inode_number(), counter: SpinLock::new(initial), semaphore })
+        Arc::new(Self {
+            inode: ramfs::next_inode_number(),
+            counter: SpinLock::new(initial),
+            semaphore,
+            source: Arc::new(PollSource::new()),
+        })
     }
 }
 
@@ -52,7 +51,7 @@ impl Inode for EventFd {
         if buf.len() < 8 {
             return Err(Errno::EINVAL);
         }
-        let value = CHANGED.wait_until(|| {
+        let value = self.source.queue().wait_until(|| {
             if process::signal_pending() {
                 return Some(Err(Errno::EINTR));
             }
@@ -71,7 +70,7 @@ impl Inode for EventFd {
             }
         })?;
         buf[..8].copy_from_slice(&value.to_ne_bytes());
-        changed();
+        self.source.notify();
         Ok(8)
     }
 
@@ -80,7 +79,7 @@ impl Inode for EventFd {
         if add == u64::MAX {
             return Err(Errno::EINVAL);
         }
-        CHANGED.wait_until(|| {
+        self.source.queue().wait_until(|| {
             if process::signal_pending() {
                 return Some(Err(Errno::EINTR));
             }
@@ -94,13 +93,18 @@ impl Inode for EventFd {
                 None
             }
         })?;
-        changed();
+        self.source.notify();
         Ok(8)
     }
 
     fn poll(&self, _flags: u32) -> u16 {
         let counter = *self.counter.lock();
         (if counter > 0 { POLLIN } else { 0 }) | (if counter < COUNTER_MAX { POLLOUT } else { 0 })
+    }
+
+    fn poll_sources(&self, sources: &mut Vec<Arc<PollSource>>, _depth: usize) -> bool {
+        sources.push(self.source.clone());
+        true
     }
 }
 
@@ -128,6 +132,9 @@ pub struct TimerFd {
     state: SpinLock<TimerState>,
     /// Woken when the timer is set, so a blocked read re-reads its deadline.
     reset: AtomicBool,
+    /// Notified when it's set or read (expiring is noticed by waiters'
+    /// deadlines; see `poll_deadline`).
+    source: Arc<PollSource>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -166,6 +173,7 @@ impl TimerFd {
             clock,
             state: SpinLock::new(TimerState::default()),
             reset: AtomicBool::new(false),
+            source: Arc::new(PollSource::new()),
         })
     }
 
@@ -185,7 +193,7 @@ impl TimerFd {
         };
         drop(state);
         self.reset.store(true, Ordering::Release);
-        changed();
+        self.source.notify();
         previous
     }
 
@@ -226,7 +234,7 @@ impl Inode for TimerFd {
                     let count = core::mem::take(&mut state.expired);
                     drop(state);
                     buf[..8].copy_from_slice(&count.to_ne_bytes());
-                    super::notify_poll();
+                    self.source.notify();
                     return Ok(8);
                 }
             }
@@ -239,7 +247,7 @@ impl Inode for TimerFd {
             // Sleep until it's due (or it's set again, or a signal).
             self.reset.store(false, Ordering::Release);
             let deadline = self.due_tick();
-            CHANGED.wait_until_deadline(deadline, || {
+            self.source.queue().wait_until_deadline(deadline, || {
                 (process::signal_pending() || self.reset.load(Ordering::Acquire)).then_some(())
             });
         }
@@ -253,6 +261,11 @@ impl Inode for TimerFd {
 
     fn poll_deadline(&self) -> Option<u64> {
         self.due_tick()
+    }
+
+    fn poll_sources(&self, sources: &mut Vec<Arc<PollSource>>, _depth: usize) -> bool {
+        sources.push(self.source.clone());
+        true
     }
 
     fn as_any(&self) -> Option<&dyn core::any::Any> {

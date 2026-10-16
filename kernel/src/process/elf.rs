@@ -33,6 +33,9 @@ pub const INTERPRETER_BASE: u64 = 0x7F00_0000_0000;
 pub struct Program {
     /// The program's own entry point.
     pub entry: u64,
+    /// What its addresses are relative to: where a position-independent
+    /// program was loaded, or 0.
+    pub base: u64,
     /// Where the program headers are in memory (for the AT_PHDR aux entry).
     program_headers: u64,
     program_header_count: u64,
@@ -186,6 +189,7 @@ fn load_object(space: &mut AddressSpace, data: &[u8], base: Option<u64>) -> Resu
     };
     let program = Program {
         entry,
+        base,
         program_headers,
         program_header_count: header_count as u64,
         interpreter,

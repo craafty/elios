@@ -318,6 +318,8 @@ glyph and rebuild.
       Alpine's Wayland programs
 - [x] **Firefox:** Alpine's Firefox browses HTTPS sites in the desktop
       (package triggers, `mremap`, `statx`, `prctl` and `arch_prctl`
-      additions, `/proc/sys`, namespaces refused so sandboxes fall back)
+      additions, `/proc/sys`, namespaces refused so sandboxes fall back),
+      tuned with a sampling profiler (`/proc/PID/profile`): per-file
+      `poll` wakeups, a kernel heap cache, damage-only redraws
 - [ ] **Next:** sound, the camera and microphone (for video calls), faster
       clocks (a vDSO), Wi-Fi networking and Bluetooth on the T440p

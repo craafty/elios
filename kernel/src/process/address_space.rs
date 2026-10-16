@@ -67,6 +67,9 @@ struct Area {
     /// What's mapped, for /proc/PID/maps and fault reports: a file's path,
     /// or a label like `[stack]`.
     name: Option<Arc<str>>,
+    /// For a program image the kernel loaded: what its addresses are
+    /// relative to (0 for one that isn't position-independent).
+    image_base: Option<u64>,
 }
 
 /// An area, as /proc/PID/maps describes it.
@@ -164,11 +167,12 @@ impl AddressSpace {
     }
 
     /// Names the areas that have no name yet (after loading a program
-    /// image, its areas are the unnamed ones).
-    pub fn name_unnamed(&mut self, name: &str) {
+    /// image, its areas are the unnamed ones), loaded at `base`.
+    pub fn name_unnamed(&mut self, name: &str, base: u64) {
         let name: Arc<str> = name.into();
         for area in self.areas.values_mut().filter(|area| area.name.is_none()) {
             area.name = Some(name.clone());
+            area.image_base = Some(base);
         }
     }
 
@@ -191,6 +195,17 @@ impl AddressSpace {
         Some(unsafe { core::ptr::read_volatile(phys_to_virt(mapping.phys + address % PAGE_SIZE) as *const u64) })
     }
 
+    /// The memory object and offset behind `address`, if it's in shared
+    /// memory (which other processes may map too): futexes there are
+    /// identified by it rather than by address.
+    pub fn shared_object_at(&self, address: u64) -> Option<(Arc<MemoryObject>, u64)> {
+        let (start, area) = self.area_at(address)?;
+        match &area.backing {
+            Backing::Object { object, offset, shared: true } => Some((object.clone(), offset + (address - start))),
+            _ => None,
+        }
+    }
+
     /// Whether `address` is in an executable area.
     pub fn executable(&self, address: u64) -> bool {
         self.area_at(address).is_some_and(|(_, area)| area.protection & PROT_EXEC != 0)
@@ -202,6 +217,9 @@ impl AddressSpace {
     pub fn describe(&self, address: u64) -> Option<(Arc<str>, u64)> {
         let (_, area) = self.area_at(address)?;
         let name = area.name.clone()?;
+        if let Some(base) = area.image_base {
+            return Some((name, address - base));
+        }
         let base = self.areas.iter().find(|(_, other)| other.name.as_ref() == Some(&name)).map(|(&start, other)| {
             start
                 - match other.backing {
@@ -250,7 +268,7 @@ impl AddressSpace {
         if self.overlaps(start, end) {
             return Err(Errno::EEXIST);
         }
-        self.areas.insert(start, Area { end, protection, backing, name });
+        self.areas.insert(start, Area { end, protection, backing, name, image_base: None });
         Ok(())
     }
 
@@ -279,6 +297,35 @@ impl AddressSpace {
         // frames can only go once no CPU can reach them.
         smp::flush_tlb(start, end);
         freed.into_iter().for_each(frames::free);
+    }
+
+    /// `madvise(MADV_DONTNEED)`: drops the pages of `start..end`, keeping
+    /// the areas. The next access gets a fresh page: zeros for private
+    /// memory, the file's contents for a file mapping (shared memory keeps
+    /// its contents, which live in its object). Allocators rely on this to
+    /// hand back memory that reads as zero. Fails if part of the range
+    /// isn't mapped.
+    pub fn discard(&mut self, start: u64, end: u64) -> Result<()> {
+        let mut address = start;
+        while address < end {
+            let (_, area) = self.area_at(address).ok_or(Errno::ENOMEM)?;
+            address = area.end;
+        }
+        let mut freed = Vec::new();
+        let mut page = start;
+        while page < end {
+            let (_, area) = self.area_at(page).expect("checked above");
+            let area_end = area.end.min(end);
+            if !matches!(area.backing, Backing::Device { .. }) {
+                for page in (page..area_end).step_by(PAGE_SIZE as usize) {
+                    freed.extend(self.unmap_page(page));
+                }
+            }
+            page = area_end;
+        }
+        smp::flush_tlb(start, end);
+        freed.into_iter().for_each(frames::free);
+        Ok(())
     }
 
     /// Changes the access rights of `start..end`, which must be covered by

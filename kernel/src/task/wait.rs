@@ -60,6 +60,43 @@ impl WaitQueue {
         result
     }
 
+    /// Like [`wait_until_deadline`](Self::wait_until_deadline), waiting on
+    /// several queues at once (woken by any of them): `poll` on many files.
+    pub fn wait_any<T>(
+        queues: &[&WaitQueue],
+        deadline: Option<u64>,
+        mut ready: impl FnMut() -> Option<T>,
+    ) -> Option<T> {
+        let enabled = arch::interrupts_enabled();
+        let me = super::current();
+        let result = loop {
+            arch::disable_interrupts();
+            for queue in queues {
+                let mut waiters = queue.waiters.lock();
+                if !waiters.contains(&me) {
+                    waiters.push_back(me);
+                }
+            }
+            if let Some(value) = ready() {
+                break Some(value);
+            }
+            if deadline.is_some_and(|deadline| crate::time::ticks() >= deadline) {
+                break None;
+            }
+            super::block_current(deadline);
+            if enabled {
+                arch::enable_interrupts();
+            }
+        };
+        for queue in queues {
+            queue.waiters.lock().retain(|&waiter| waiter != me);
+        }
+        if enabled {
+            arch::enable_interrupts();
+        }
+        result
+    }
+
     /// Wakes every waiting thread. Callable from interrupt handlers.
     pub fn wake_all(&self) {
         let waiters = core::mem::take(&mut *self.waiters.lock());

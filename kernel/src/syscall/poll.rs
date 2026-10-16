@@ -30,15 +30,23 @@ struct PollFd {
 fn wait(entries: &mut [PollFd], deadline: Option<u64>) -> Result<u64> {
     let process = process::current();
     // Files that become ready at a set time (timerfds) need a wakeup then.
+    let mut watch = fs::PollWatch::default();
     let files_deadline = {
         let files = process.files.lock();
-        entries.iter().filter_map(|entry| files.get(entry.fd as usize).ok()?.inode.poll_deadline()).min()
+        let watched: Vec<Arc<OpenFile>> = entries
+            .iter()
+            .filter(|entry| entry.fd >= 0)
+            .filter_map(|entry| files.get(entry.fd as usize).ok())
+            .collect();
+        drop(files);
+        watched.iter().for_each(|file| watch.add(&*file.inode));
+        watched.iter().filter_map(|file| file.inode.poll_deadline()).min()
     };
     let effective = match (deadline, files_deadline) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
-    let ready = fs::POLL_EVENTS.wait_until_deadline(effective, || {
+    let ready = crate::task::WaitQueue::wait_any(&watch.queues(), effective, || {
         if process::signal_pending() {
             return Some(Err(Errno::EINTR));
         }
@@ -240,15 +248,25 @@ pub fn epoll_wait(epfd: u64, events: u64, max: u64, timeout: u64, timespec: bool
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        let result = fs::POLL_EVENTS.wait_until_deadline(effective, || {
+        // Wait on the watched files' sources. If the set changes meanwhile
+        // (another thread's epoll_ctl), start over with the new set.
+        let mut watch = fs::PollWatch::default();
+        watch.add(epoll);
+        let membership = epoll.membership_changes();
+        let result = crate::task::WaitQueue::wait_any(&watch.queues(), effective, || {
             if process::signal_pending() {
                 return Some(Err(Errno::EINTR));
             }
-            let ready = epoll.collect(max as usize, fs::poll_generation());
-            (!ready.is_empty()).then_some(Ok(ready))
+            let ready = epoll.collect(max as usize);
+            if !ready.is_empty() {
+                return Some(Ok(Some(ready)));
+            }
+            (epoll.membership_changes() != membership).then_some(Ok(None))
         });
         match result {
-            Some(result) => break result?,
+            Some(Ok(Some(ready))) => break ready,
+            Some(Ok(None)) => continue,
+            Some(Err(error)) => return Err(error),
             None if deadline.is_none_or(|deadline| time::ticks() < deadline) => continue,
             None => break Vec::new(),
         }

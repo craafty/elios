@@ -176,6 +176,11 @@ impl Inode for SocketFile {
         poll(self.id)
     }
 
+    fn poll_sources(&self, sources: &mut Vec<Arc<crate::fs::PollSource>>, _depth: usize) -> bool {
+        sources.push(super::sockets_changed().clone());
+        true
+    }
+
     fn on_close(&self, _flags: u32) {
         close(self.id);
     }

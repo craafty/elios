@@ -21,7 +21,8 @@ static TSC_AT_BOOT: AtomicU64 = AtomicU64::new(0);
 /// Wall-clock time at boot, in seconds since the Unix epoch.
 static BOOT_UNIX_TIME: AtomicU64 = AtomicU64::new(0);
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
-static TICKS: AtomicU64 = AtomicU64::new(0);
+/// Timer interrupts on the boot CPU (for checking the timer's rate).
+static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 /// The APIC timer count between ticks, for starting other CPUs' timers.
 static TIMER_PERIOD: AtomicU64 = AtomicU64::new(0);
 
@@ -64,16 +65,24 @@ pub fn start_timer() {
     apic::timer_start_periodic(interrupts::TIMER, TIMER_PERIOD.load(Ordering::Relaxed) as u32);
 }
 
-/// Every CPU's timer fires every millisecond; the boot CPU's also keeps the
-/// time.
-fn on_tick(_frame: &mut InterruptFrame) {
-    let now = if cpu::current().index() == 0 { Some(TICKS.fetch_add(1, Ordering::Relaxed) + 1) } else { None };
+/// Every CPU's timer fires every millisecond; the boot CPU's also wakes
+/// threads whose time has come.
+fn on_tick(frame: &mut InterruptFrame) {
+    let now = (cpu::current().index() == 0).then(|| {
+        INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+        ticks()
+    });
+    crate::process::sample_tick(frame);
     crate::task::on_tick(now);
 }
 
-/// Timer ticks (milliseconds) since the periodic timer started.
+/// Milliseconds since boot: the unit of the kernel's deadlines ("ticks",
+/// for the timer interrupt that checks them). They're read from the TSC,
+/// not counted interrupts, so deadlines keep to real time even when
+/// interrupts arrive late (in an emulator, or after a long stretch with
+/// interrupts off): a late tick finds everything that came due meanwhile.
 pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Relaxed)
+    uptime_nanos() / 1_000_000
 }
 
 /// The timestamp counter's frequency, as measured at boot.
@@ -129,9 +138,9 @@ mod tests {
 
         fn the_timer_ticks_at_its_rate() {
             // Interrupts are on while tests run, so the tick handler fires.
-            let start_ticks = ticks();
+            let start_ticks = INTERRUPTS.load(Ordering::Relaxed);
             let start = uptime_nanos();
-            while ticks() < start_ticks + 50 {
+            while INTERRUPTS.load(Ordering::Relaxed) < start_ticks + 50 {
                 core::hint::spin_loop();
             }
             let elapsed_ms = (uptime_nanos() - start) / 1_000_000;

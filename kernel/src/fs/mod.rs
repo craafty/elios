@@ -39,8 +39,81 @@ pub const POLLOUT: u16 = 0x4;
 pub const POLLERR: u16 = 0x8;
 pub const POLLHUP: u16 = 0x10;
 
-/// Woken whenever any file might have become ready, so `poll` can recheck.
+/// Woken whenever a file without a [`PollSource`] of its own might have
+/// become ready, so `poll` can recheck.
 pub static POLL_EVENTS: WaitQueue = WaitQueue::new();
+
+/// What `poll` and `epoll` wait on for one object (a pipe, a socket, an
+/// event file): a wait queue woken when its readiness may have changed,
+/// and a count of those changes (which tells edge-triggered `epoll`
+/// entries that something new happened). Objects with one wake only the
+/// threads watching them; others use [`notify_poll`], which wakes every
+/// such waiter in the system.
+pub struct PollSource {
+    queue: WaitQueue,
+    changes: core::sync::atomic::AtomicU64,
+}
+
+impl PollSource {
+    pub const fn new() -> Self {
+        Self { queue: WaitQueue::new(), changes: core::sync::atomic::AtomicU64::new(0) }
+    }
+
+    /// The object's state changed: wake whoever waits for it.
+    pub fn notify(&self) {
+        self.changes.fetch_add(1, core::sync::atomic::Ordering::Release);
+        self.queue.wake_all();
+    }
+
+    pub fn changes(&self) -> u64 {
+        self.changes.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn queue(&self) -> &WaitQueue {
+        &self.queue
+    }
+}
+
+impl Default for PollSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Where to wait for a set of files' readiness to change: their poll
+/// sources, and whether some file needs the global [`POLL_EVENTS`].
+#[derive(Default)]
+pub struct PollWatch {
+    pub sources: Vec<Arc<PollSource>>,
+    pub global: bool,
+}
+
+impl PollWatch {
+    pub fn add(&mut self, inode: &dyn Inode) {
+        if !inode.poll_sources(&mut self.sources, 0) {
+            self.global = true;
+        }
+    }
+
+    /// The wait queues to wait on.
+    pub fn queues(&self) -> Vec<&WaitQueue> {
+        let mut queues: Vec<&WaitQueue> = self.sources.iter().map(|source| source.queue()).collect();
+        if self.global {
+            queues.push(&POLL_EVENTS);
+        }
+        queues
+    }
+}
+
+/// How many times an inode's readiness may have changed (for edge-triggered
+/// `epoll`): the sum of its sources' counts, plus the global count if it
+/// has none.
+pub fn poll_changes(inode: &dyn Inode) -> u64 {
+    let mut sources = Vec::new();
+    let own = inode.poll_sources(&mut sources, 0);
+    let total = sources.iter().fold(0u64, |sum, source| sum.wrapping_add(source.changes()));
+    if own { total } else { total.wrapping_add(poll_generation()) }
+}
 
 /// Counts wakeups of [`POLL_EVENTS`] (see `epoll` for what it's for).
 static POLL_GENERATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -220,6 +293,14 @@ pub trait Inode: Send + Sync {
     /// an open file with these flags. Most things are always ready.
     fn poll(&self, _flags: u32) -> u16 {
         POLLIN | POLLOUT
+    }
+
+    /// Adds what to wait on for this file's readiness to change (see
+    /// [`PollSource`]) and returns true, or returns false if it has no
+    /// source of its own and [`notify_poll`] announces its changes. `depth`
+    /// counts nesting (an epoll set watching others).
+    fn poll_sources(&self, _sources: &mut Vec<Arc<PollSource>>, _depth: usize) -> bool {
+        false
     }
 
     /// Called when the last open file referring to this inode is closed.

@@ -7,11 +7,14 @@
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 
-use super::{FileKind, Inode, Metadata, O_ACCMODE, O_RDONLY, OpenFile, POLLERR, POLLHUP, POLLIN, POLLOUT, ramfs};
+use alloc::vec::Vec;
+
+use super::{
+    FileKind, Inode, Metadata, O_ACCMODE, O_RDONLY, OpenFile, POLLERR, POLLHUP, POLLIN, POLLOUT, PollSource, ramfs,
+};
 use crate::errno::{Errno, Result};
 use crate::process;
 use crate::sync::SpinLock;
-use crate::task::WaitQueue;
 
 const CAPACITY: usize = 64 * 1024;
 
@@ -24,8 +27,9 @@ struct State {
 pub struct Pipe {
     inode: u64,
     state: SpinLock<State>,
-    /// Woken whenever data, space, or a closed end appears.
-    changed: WaitQueue,
+    /// Notified whenever data, space, or a closed end appears: blocked
+    /// readers and writers wait on it, as do `poll` and `epoll`.
+    changed: Arc<PollSource>,
 }
 
 /// Creates a pipe, returning its read end and write end.
@@ -33,7 +37,7 @@ pub fn create() -> (Arc<OpenFile>, Arc<OpenFile>) {
     let pipe = Arc::new(Pipe {
         inode: ramfs::next_inode_number(),
         state: SpinLock::new(State { buffer: VecDeque::new(), readers: 1, writers: 1 }),
-        changed: WaitQueue::new(),
+        changed: Arc::new(PollSource::new()),
     });
     let reader = OpenFile::new(pipe.clone(), "pipe:".into(), O_RDONLY);
     let writer = OpenFile::new(pipe, "pipe:".into(), super::O_WRONLY);
@@ -62,7 +66,7 @@ impl Inode for Pipe {
         if buf.is_empty() {
             return Ok(0);
         }
-        let count = self.changed.wait_until(|| {
+        let count = self.changed.queue().wait_until(|| {
             if process::signal_pending() {
                 return Some(Err(Errno::EINTR));
             }
@@ -80,15 +84,14 @@ impl Inode for Pipe {
             }
             Some(Ok(count))
         })?;
-        self.changed.wake_all();
-        super::notify_poll();
+        self.changed.notify();
         Ok(count)
     }
 
     fn write_stream(&self, buf: &[u8], nonblocking: bool) -> Result<usize> {
         let mut written = 0;
         while written < buf.len() {
-            let count = self.changed.wait_until(|| {
+            let count = self.changed.queue().wait_until(|| {
                 if process::signal_pending() {
                     return Some(Err(Errno::EINTR));
                 }
@@ -115,8 +118,7 @@ impl Inode for Pipe {
                     return Err(error);
                 }
             }
-            self.changed.wake_all();
-            super::notify_poll();
+            self.changed.notify();
         }
         Ok(written)
     }
@@ -136,6 +138,11 @@ impl Inode for Pipe {
         }
     }
 
+    fn poll_sources(&self, sources: &mut Vec<Arc<PollSource>>, _depth: usize) -> bool {
+        sources.push(self.changed.clone());
+        true
+    }
+
     /// Each end is one open file, shared (not copied) by `dup` and `fork`,
     /// so this runs once per end.
     fn on_close(&self, flags: u32) {
@@ -146,8 +153,7 @@ impl Inode for Pipe {
             state.writers -= 1;
         }
         drop(state);
-        self.changed.wake_all();
-        super::notify_poll();
+        self.changed.notify();
     }
 }
 

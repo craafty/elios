@@ -226,8 +226,14 @@ impl Desktop {
                 } else if !has_content && mapped {
                     self.forget(surface);
                 } else {
+                    let before = self.surface_rect(surface);
                     self.place_window(surface);
-                    self.damage_surface(surface);
+                    if self.surface_rect(surface) != before {
+                        // Moved or resized.
+                        before.inspect(|&rect| self.screen.damage(rect));
+                        self.damage_surface(surface);
+                    }
+                    self.damage_applied(surface.0);
                 }
             }
             Role::Popup(_) => {
@@ -241,7 +247,34 @@ impl Desktop {
                 self.damage_surface(surface);
             }
             Role::Cursor => self.damage_cursor(),
-            _ => self.damage_surface(surface),
+            _ => self.damage_applied(surface.0),
+        }
+        // Whatever wasn't redrawn above is now in the past.
+        if let Some(client) = self.clients.get_mut(&surface.0) {
+            client.applied.clear();
+        }
+    }
+
+    /// Redraws what a client's last commit changed: the damaged parts of
+    /// each surface it applied (or all of a surface whose size changed),
+    /// or everything if a subsurface moved.
+    fn damage_applied(&mut self, client: u32) {
+        let Some(c) = self.clients.get_mut(&client) else { return };
+        let applied = core::mem::take(&mut c.applied);
+        if core::mem::take(&mut c.moved) {
+            self.screen.damage_all();
+            return;
+        }
+        for (id, changed) in applied {
+            let surface = (client, id);
+            match changed {
+                None => self.damage_surface(surface),
+                Some(rect) if !rect.is_empty() => {
+                    let Some((x, y)) = self.origin(surface) else { continue };
+                    self.screen.damage(Rect::new(x + rect.x, y + rect.y, rect.width, rect.height));
+                }
+                Some(_) => {}
+            }
         }
     }
 

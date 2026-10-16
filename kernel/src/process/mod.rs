@@ -67,6 +67,14 @@ pub struct Process {
     /// Whether to print every system call (see `strace`). Inherited by
     /// children and kept across `exec`.
     pub trace: AtomicBool,
+    /// Samples of where the process was at timer ticks, while profiling
+    /// (see /proc/PID/profile): user instruction pointer -> count, or for
+    /// ticks spent in the kernel on its behalf, [`KERNEL_SAMPLE`] plus the
+    /// system call running (+1; 0 for page faults and interrupts).
+    pub profile: SpinLock<Option<BTreeMap<u64, u32>>>,
+    /// The kernel's instruction pointers at those kernel samples.
+    pub kernel_profile: SpinLock<Option<BTreeMap<u64, u32>>>,
+    pub profiling: AtomicBool,
     /// The signal the parent gets when this process ends (normally SIGCHLD;
     /// 0 for none).
     exit_signal: AtomicU32,
@@ -185,6 +193,9 @@ fn create(parent: Pid, group: Option<Pid>, name: &str, inherited: Inherited) -> 
         thread_exits: WaitQueue::new(),
         ending: SpinLock::new(None),
         trace: AtomicBool::new(false),
+        profile: SpinLock::new(None),
+        kernel_profile: SpinLock::new(None),
+        profiling: AtomicBool::new(false),
         exit_signal: AtomicU32::new(signal::SIGCHLD),
         credentials: SpinLock::new(inherited.credentials),
         umask: AtomicU32::new(inherited.umask),
@@ -315,13 +326,13 @@ fn load_image(
     let mut space = AddressSpace::new()?;
     let mut program = elf::load(&mut space, &data)?;
     let full_path = fs::normalize(cwd, path);
-    space.name_unnamed(&full_path);
+    space.name_unnamed(&full_path, program.base);
     if let Some(interpreter) = program.interpreter.clone() {
         let inode = fs::lookup_as(&credentials, cwd, &interpreter, true)?;
         let mut interpreter_data = vec![0; inode.metadata().size as usize];
         inode.read_at(0, &mut interpreter_data)?;
         elf::load_interpreter(&mut space, &mut program, &interpreter_data)?;
-        space.name_unnamed(&fs::normalize(cwd, &interpreter));
+        space.name_unnamed(&fs::normalize(cwd, &interpreter), program.interpreter_base);
     }
     let stack_pointer = elf::build_stack(&mut space, &program, &arguments, environment, path, &credentials)?;
     space.set_name(stack_pointer, "[stack]".into());
@@ -624,7 +635,7 @@ pub fn exit_thread(status: i32) -> ! {
     let process = thread.process.clone();
     let clear_child_tid = thread.clear_child_tid.swap(0, Ordering::Relaxed);
     if clear_child_tid != 0 && user::write_value(clear_child_tid, &0u32).is_ok() {
-        let _ = futex::wake(process.pid, clear_child_tid, 1, u32::MAX);
+        let _ = futex::wake(clear_child_tid, false, 1, u32::MAX);
     }
     // Other threads may free the memory once this one is off the list.
     task::set_address_space(memory::kernel_page_table_root());
@@ -830,6 +841,40 @@ pub fn before_return_to_user(frame: &mut InterruptFrame, syscall: Option<u64>) {
     }
 }
 
+/// Marks a profile sample taken in the kernel (user addresses never have
+/// these bits).
+pub const KERNEL_SAMPLE: u64 = 0xFFFF_0000_0000_0000;
+
+/// Called on every timer tick: if the running thread's process is being
+/// profiled, counts where it was (user code's instruction pointer, or the
+/// system call it's in).
+pub fn sample_tick(frame: &InterruptFrame) {
+    let Some(thread) = task::current_user_thread() else { return };
+    if !thread.process.profiling.load(Ordering::Relaxed) {
+        return;
+    }
+    let user = frame.cs & 3 == 3;
+    let place = if user { frame.rip } else { KERNEL_SAMPLE | thread.syscall.load(Ordering::Relaxed) };
+    // Interrupts are off, so no lock this CPU holds (the heap's included)
+    // can be held by the code the tick interrupted.
+    if let Some(samples) = thread.process.profile.lock().as_mut() {
+        *samples.entry(place).or_insert(0) += 1;
+    }
+    if !user && let Some(samples) = thread.process.kernel_profile.lock().as_mut() {
+        *samples.entry(frame.rip).or_insert(0) += 1;
+    }
+}
+
+/// Starts or stops profiling a process (writing `1` or `0` to
+/// /proc/PID/profile). Starting clears earlier samples.
+pub fn set_profiling(process: &Process, on: bool) {
+    if on {
+        *process.profile.lock() = Some(BTreeMap::new());
+        *process.kernel_profile.lock() = Some(BTreeMap::new());
+    }
+    process.profiling.store(on, Ordering::Relaxed);
+}
+
 /// Handles a CPU exception raised by user code: page faults inside the
 /// program's areas are resolved; anything else raises the matching signal,
 /// as on Linux, which ends the process unless it handles it.
@@ -1017,7 +1062,9 @@ mod tests {
                 if fs::lookup("/", &path, true).is_err() {
                     continue;
                 }
-                assert_eq!(shell(&alloc::format!("{program} > /dev/null")), exit_status(0), "{program} failed");
+                let output = alloc::format!("/tmp/{program}-output");
+                let status = shell(&alloc::format!("{program} > {output} 2>&1"));
+                assert_eq!(status, exit_status(0), "{program} failed:\n{}", read_file(&output));
             }
         }
 

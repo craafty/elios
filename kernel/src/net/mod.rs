@@ -193,10 +193,18 @@ pub fn receive(frame: Vec<u8>) {
     WORK.wake_all();
 }
 
+/// What `poll` and `epoll` wait on for network sockets: one source shared
+/// by all of them, since the stack doesn't track which socket a change
+/// was for. Programs waiting on other files aren't woken by traffic.
+pub fn sockets_changed() -> &'static alloc::sync::Arc<crate::fs::PollSource> {
+    static SOURCE: crate::sync::Once<alloc::sync::Arc<crate::fs::PollSource>> = crate::sync::Once::new();
+    SOURCE.get_or_init(|| alloc::sync::Arc::new(crate::fs::PollSource::new()))
+}
+
 /// Tells blocked socket calls and `poll` that something changed.
 pub fn notify() {
     SOCKET_EVENTS.wake_all();
-    crate::fs::notify_poll();
+    sockets_changed().notify();
 }
 
 /// The stack thread: processes received frames and loopback packets, and

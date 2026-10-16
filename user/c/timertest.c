@@ -88,6 +88,7 @@ int main(void) {
     clock_gettime(CLOCK_MONOTONIC, &start);
     while (thread_calls < 3 && elapsed_ms(&start) < 3000) usleep(10000);
     check("its function runs in a thread, repeatedly", thread_calls >= 3);
+    if (thread_calls < 3) printf("    (%d calls in %ld ms)\n", (int)thread_calls, elapsed_ms(&start));
     timer_delete(timer);
 
     sigset_t set;

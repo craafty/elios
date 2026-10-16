@@ -21,11 +21,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use crate::errno::{Errno, Result};
-use crate::fs::{self, FileKind, Inode, Metadata, POLLHUP, POLLIN, POLLOUT, ramfs};
+use crate::fs::{self, FileKind, Inode, Metadata, POLLHUP, POLLIN, POLLOUT, PollSource, ramfs};
 use crate::process::credentials::{self, Gid, Uid};
 use crate::process::{self, user};
 use crate::sync::{Once, SpinLock};
-use crate::task::WaitQueue;
 use crate::{console, log};
 
 // termios flag bits (Linux values).
@@ -136,7 +135,7 @@ enum Output {
 pub struct Tty {
     inode: u64,
     state: SpinLock<State>,
-    readable: WaitQueue,
+    readable: Arc<PollSource>,
     output: Output,
     /// Who the terminal belongs to: `login` gives it to the user who logs
     /// in, so their programs can reopen it.
@@ -161,7 +160,7 @@ impl Tty {
                 foreground: 0,
                 window: (24, 80),
             }),
-            readable: WaitQueue::new(),
+            readable: Arc::new(PollSource::new()),
             output,
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(TTY_GROUP),
@@ -212,8 +211,7 @@ impl Tty {
                         buffer.push_back(byte);
                     }
                 }
-                pty.changed.wake_all();
-                fs::notify_poll();
+                pty.changed.notify();
             }
         }
     }
@@ -317,12 +315,11 @@ impl Tty {
             }
         }
         if wake {
-            self.readable.wake_all();
-            fs::notify_poll();
+            self.readable.notify();
         }
         if let Some(group) = interrupt_group {
             process::signal_group(group, process::SIGINT);
-            self.readable.wake_all();
+            self.readable.notify();
         }
     }
 
@@ -349,7 +346,7 @@ impl Tty {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.readable.wait_until(|| {
+        self.readable.queue().wait_until(|| {
             if process::signal_pending() {
                 return Some(Err(Errno::EINTR));
             }
@@ -484,6 +481,11 @@ impl Inode for Tty {
         if self.hung_up() { ready | POLLIN | POLLHUP } else { ready }
     }
 
+    fn poll_sources(&self, sources: &mut Vec<Arc<PollSource>>, _depth: usize) -> bool {
+        sources.push(self.readable.clone());
+        true
+    }
+
     fn ioctl(&self, request: u64, argument: u64) -> Result<u64> {
         match request {
             // Becoming the controlling terminal (and giving it up).
@@ -535,7 +537,7 @@ pub struct Pty {
     number: u32,
     slave: Arc<Tty>,
     to_master: SpinLock<VecDeque<u8>>,
-    changed: WaitQueue,
+    changed: Arc<PollSource>,
     master_closed: AtomicBool,
     /// Descriptors open on the slave side.
     slave_opens: AtomicUsize,
@@ -591,7 +593,7 @@ fn open_pty() -> Result<Arc<Master>> {
         number,
         slave: Arc::new(Tty::new(Output::Pseudo(me.clone()), uid, 0o620, PTS_MAJOR << 8 | u64::from(number))),
         to_master: SpinLock::new(VecDeque::new()),
-        changed: WaitQueue::new(),
+        changed: Arc::new(PollSource::new()),
         master_closed: AtomicBool::new(false),
         slave_opens: AtomicUsize::new(0),
         slave_was_opened: AtomicBool::new(false),
@@ -623,8 +625,7 @@ impl Drop for Master {
         if group != 0 {
             process::signal_group(group, SIGHUP);
         }
-        pty.slave.readable.wake_all();
-        fs::notify_poll();
+        pty.slave.readable.notify();
     }
 }
 
@@ -643,7 +644,7 @@ impl Inode for Master {
 
     fn read_stream(&self, buf: &mut [u8], nonblocking: bool) -> Result<usize> {
         let pty = &self.pty;
-        let count = pty.changed.wait_until(|| {
+        let count = pty.changed.queue().wait_until(|| {
             if process::signal_pending() {
                 return Some(Err(Errno::EINTR));
             }
@@ -663,7 +664,7 @@ impl Inode for Master {
             }
             Some(Ok(count))
         })?;
-        fs::notify_poll();
+        pty.changed.notify();
         Ok(count)
     }
 
@@ -690,6 +691,11 @@ impl Inode for Master {
             ready |= POLLHUP;
         }
         ready
+    }
+
+    fn poll_sources(&self, sources: &mut Vec<Arc<PollSource>>, _depth: usize) -> bool {
+        sources.push(self.pty.changed.clone());
+        true
     }
 
     fn ioctl(&self, request: u64, argument: u64) -> Result<u64> {
@@ -764,8 +770,7 @@ struct SlaveHandle {
 impl Drop for SlaveHandle {
     fn drop(&mut self) {
         if self.pty.slave_opens.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.pty.changed.wake_all();
-            fs::notify_poll();
+            self.pty.changed.notify();
         }
     }
 }
@@ -801,6 +806,10 @@ impl Inode for SlaveHandle {
 
     fn poll(&self, flags: u32) -> u16 {
         self.pty.slave.poll(flags)
+    }
+
+    fn poll_sources(&self, sources: &mut Vec<Arc<PollSource>>, depth: usize) -> bool {
+        self.pty.slave.poll_sources(sources, depth)
     }
 
     fn ioctl(&self, request: u64, argument: u64) -> Result<u64> {

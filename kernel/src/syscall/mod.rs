@@ -201,8 +201,7 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         23 => poll::select(a[0], a[1], a[2], a[3], a[4], false),
         24 => processes::sched_yield(),
         25 => processes::mremap(a[0], a[1], a[2], a[3]),
-        // madvise: advice can be ignored.
-        28 => Ok(0),
+        28 => processes::madvise(a[0], a[1], a[2]),
         32 => files::dup(a[0]),
         33 => files::dup2(a[0], a[1]),
         34 => signal::pause(),
