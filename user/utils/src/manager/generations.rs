@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 
 use eli::fs::{self, FileType};
 use eli::users::{self, Group, User};
-use eli::{eprintln, system, time};
+use eli::{eprintln, process, system, time};
 
 use super::config::{self, Config};
 use super::store;
@@ -140,8 +140,90 @@ pub fn activate(generation: &Generation) -> Result<(), String> {
     let _ = fs::write("/etc/hostname", format!("{name}\n").as_bytes());
     let _ = system::set_hostname(name);
     link_packages(&generation.packages)?;
+    run_triggers(&generation.packages);
     let _ = fs::write(&format!("{RUN}/generation"), format!("{}\n", generation.number).as_bytes());
     Ok(())
+}
+
+/// Runs the packages' triggers: scripts that rebuild caches from what
+/// other packages put in the directories they watch (image loaders for
+/// GTK, GLib's settings schemas, the font and MIME databases). Alpine runs
+/// them after installing; here the system is assembled anew at every
+/// activation, so they run then. They're BusyBox shell scripts; what they
+/// print goes to /run/eli/triggers.log.
+fn run_triggers(packages: &[String]) {
+    let shell: &[&str] = if fs::exists("/bin/busybox") { &["/bin/busybox", "sh"] } else { &["/bin/sh"] };
+    let log = format!("{RUN}/triggers.log");
+    let _ = fs::write(&log, b"");
+    for id in packages {
+        let scripts = format!("{}/{}", store::path(id), store::SCRIPTS);
+        let script = format!("{scripts}/.trigger");
+        let Ok(patterns) = fs::read_to_string(&format!("{scripts}/triggers")) else { continue };
+        if !fs::exists(&script) {
+            continue;
+        }
+        let directories: Vec<String> = patterns.split_whitespace().flat_map(expand_pattern).collect();
+        if directories.is_empty() {
+            continue;
+        }
+        let mut arguments: Vec<String> = shell.iter().map(|part| String::from(*part)).collect();
+        arguments.push(script.clone());
+        arguments.extend(directories);
+        match process::fork() {
+            Ok(0) => {
+                if let Ok(file) = fs::File::append(&log) {
+                    let _ = eli::io::dup2(file.fd(), 1);
+                    let _ = eli::io::dup2(file.fd(), 2);
+                }
+                let error = process::exec(shell[0], &arguments, &eli::env::vars());
+                eprintln!("eli: {script}: {error}");
+                process::exit(127);
+            }
+            Ok(pid) => {
+                if let Ok(Some((_, status))) = process::wait(pid as i32, false)
+                    && !status.success()
+                {
+                    eprintln!("eli: {id}'s trigger failed ({status}); see {log}");
+                }
+            }
+            Err(error) => eprintln!("eli: {id}'s trigger: {error}"),
+        }
+    }
+}
+
+/// The existing directories a trigger pattern (like
+/// `/usr/lib/gdk-pixbuf-2.0/*/loaders`) names: `*` matches any one path
+/// component.
+fn expand_pattern(pattern: &str) -> Vec<String> {
+    let mut paths = alloc::vec![String::new()];
+    for component in pattern.split('/').filter(|component| !component.is_empty()) {
+        let mut next = Vec::new();
+        for path in paths {
+            if component.contains('*') {
+                let directory = if path.is_empty() { String::from("/") } else { path.clone() };
+                for entry in fs::read_dir(&directory).unwrap_or_default() {
+                    if glob_matches(component, &entry.name) {
+                        next.push(format!("{path}/{}", entry.name));
+                    }
+                }
+            } else {
+                next.push(format!("{path}/{component}"));
+            }
+        }
+        paths = next;
+    }
+    paths.into_iter().filter(|path| fs::metadata(path).is_ok_and(|m| m.kind == FileType::Directory)).collect()
+}
+
+/// Whether `name` matches a pattern with `*` wildcards.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == name,
+        Some((prefix, rest)) => {
+            let Some(after) = name.strip_prefix(prefix) else { return false };
+            (0..=after.len()).any(|skip| after.is_char_boundary(skip) && glob_matches(rest, &after[skip..]))
+        }
+    }
 }
 
 /// Account ids, remembered so a user keeps theirs (and owns their files)
@@ -346,7 +428,17 @@ pub fn boot() -> Result<(), String> {
         fs::write(&format!("{DATA}/etc/shadow"), &shadow).map_err(|error| error.to_string())?;
         let _ = fs::set_permissions(&format!("{DATA}/etc/shadow"), 0o600);
     }
-    for (link, target) in [("/etc/system.conf", DATA_CONFIG), ("/etc/shadow", "/data/etc/shadow")] {
+    // A machine id (32 hex digits) that lasts: D-Bus and GLib want one.
+    if !fs::exists(&format!("{DATA}/etc/machine-id")) {
+        let uuid = fs::read_to_string("/proc/sys/kernel/random/uuid").unwrap_or_default();
+        let id: String = uuid.chars().filter(char::is_ascii_hexdigit).collect();
+        let _ = fs::write(&format!("{DATA}/etc/machine-id"), format!("{id}\n").as_bytes());
+    }
+    for (link, target) in [
+        ("/etc/system.conf", DATA_CONFIG),
+        ("/etc/shadow", "/data/etc/shadow"),
+        ("/etc/machine-id", "/data/etc/machine-id"),
+    ] {
         if fs::read_link(link).ok().as_deref() != Some(target) {
             let _ = fs::remove_file(link);
             let _ = fs::symlink(target, link);

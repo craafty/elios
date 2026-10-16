@@ -2,6 +2,7 @@
    pipes and other epoll sets, as GLib, libwayland and Firefox use them. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -79,6 +80,21 @@ int main(void) {
     start = now_ms();
     check("poll wakes when the timer expires", poll(&watch, 1, 2000) == 1 && now_ms() - start < 500);
     (void)!read(timer, &value, 8);
+
+    /* A non-blocking pipe, drained until EAGAIN (Firefox's child
+       process watcher relies on this). */
+    int drained[2];
+    check("pipe2 takes O_NONBLOCK", pipe2(drained, O_NONBLOCK | O_CLOEXEC) == 0);
+    check("... and both ends are non-blocking",
+          (fcntl(drained[0], F_GETFL) & O_NONBLOCK) && (fcntl(drained[1], F_GETFL) & O_NONBLOCK));
+    (void)!write(drained[1], "ab", 2);
+    char two[32];
+    check("reading takes what's there", read(drained[0], two, sizeof two) == 2);
+    check("then fails with EAGAIN instead of waiting",
+          read(drained[0], two, sizeof two) == -1 && errno == EAGAIN);
+    check("pipe2 rejects unknown flags", pipe2(drained, 0x1) == -1 && errno == EINVAL);
+    close(drained[0]);
+    close(drained[1]);
 
     /* epoll */
     int pipes[2];

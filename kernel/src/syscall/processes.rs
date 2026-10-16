@@ -1,5 +1,7 @@
 //! Process, memory and signal system calls.
 
+use alloc::sync::Arc;
+
 use crate::arch::interrupts::InterruptFrame;
 use crate::arch::syscall;
 use crate::errno::{Errno, Result};
@@ -245,7 +247,12 @@ pub fn sigaltstack(new: u64, old: u64) -> Result<u64> {
     Ok(0)
 }
 
+const PR_SET_PDEATHSIG: u64 = 1;
+const PR_GET_PDEATHSIG: u64 = 2;
 const PR_SET_NAME: u64 = 15;
+const PR_CAPBSET_READ: u64 = 23;
+const PR_SET_NO_NEW_PRIVS: u64 = 38;
+const PR_GET_NO_NEW_PRIVS: u64 = 39;
 const PR_GET_NAME: u64 = 16;
 
 /// `prctl`: only naming the process is supported.
@@ -256,8 +263,11 @@ pub fn prctl(option: u64, argument: u64) -> Result<u64> {
             let mut name = user::read_bytes(argument, 16)?;
             name.truncate(name.iter().position(|&b| b == 0).unwrap_or(15));
             let name = alloc::string::String::from_utf8_lossy(&name).into_owned();
+            // Names a thread; the main thread's is the process's.
             task::set_name(&name);
-            *process.name.lock() = name;
+            if process::current_thread().tid() == process.pid {
+                *process.name.lock() = name;
+            }
             Ok(0)
         }
         PR_GET_NAME => {
@@ -268,12 +278,31 @@ pub fn prctl(option: u64, argument: u64) -> Result<u64> {
             user::write_value(argument, &name)?;
             Ok(0)
         }
+        PR_SET_PDEATHSIG if argument < process::SIGNAL_COUNT as u64 => {
+            process.death_signal.store(argument as u32, core::sync::atomic::Ordering::Relaxed);
+            Ok(0)
+        }
+        PR_GET_PDEATHSIG => {
+            user::write_value(argument, &(process.death_signal.load(core::sync::atomic::Ordering::Relaxed) as i32))?;
+            Ok(0)
+        }
+        // No new privileges: exec won't honor setuid and setgid bits any
+        // more. Inherited, and can't be undone (sandboxes rely on that).
+        PR_SET_NO_NEW_PRIVS if argument == 1 => {
+            process.no_new_privileges.store(true, core::sync::atomic::Ordering::Relaxed);
+            Ok(0)
+        }
+        PR_GET_NO_NEW_PRIVS => Ok(u64::from(process.no_new_privileges.load(core::sync::atomic::Ordering::Relaxed))),
+        // Whether a capability is in the bounding set: all are.
+        PR_CAPBSET_READ if argument < 64 => Ok(1),
         _ => Err(Errno::EINVAL),
     }
 }
 
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
+const ARCH_SET_GS: u64 = 0x1001;
+const ARCH_GET_GS: u64 = 0x1004;
 
 /// `arch_prctl`: programs set FS to their thread-local storage.
 pub fn arch_prctl(code: u64, address: u64) -> Result<u64> {
@@ -286,6 +315,15 @@ pub fn arch_prctl(code: u64, address: u64) -> Result<u64> {
             Ok(0)
         }
         ARCH_GET_FS => user::write_value(address, &syscall::fs_base()).map(|_| 0),
+        // GS: free for programs too (sandboxed WebAssembly uses it).
+        ARCH_SET_GS => {
+            if address >= USER_END {
+                return Err(Errno::EPERM);
+            }
+            syscall::set_user_gs_base(address);
+            Ok(0)
+        }
+        ARCH_GET_GS => user::write_value(address, &syscall::user_gs_base()).map(|_| 0),
         _ => Err(Errno::EINVAL),
     }
 }
@@ -312,6 +350,7 @@ pub fn mmap(address: u64, len: u64, protection: u64, flags: u64, fd: u64, offset
     let len = len.checked_next_multiple_of(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
     let protection = protection as u32 & (PROT_READ | PROT_WRITE | PROT_EXEC);
     let shared = flags & MAP_SHARED != 0;
+    let mut name: Option<Arc<str>> = None;
     let backing = if flags & MAP_ANONYMOUS != 0 {
         if shared {
             // Shared with children after fork: an object of its own.
@@ -326,6 +365,7 @@ pub fn mmap(address: u64, len: u64, protection: u64, flags: u64, fd: u64, offset
         if !file.readable() {
             return Err(Errno::EACCES);
         }
+        name = Some(file.path.as_str().into());
         if let Some((phys, size, cache)) = file.inode.device_memory() {
             // Device memory, like a framebuffer.
             if offset.checked_add(len).is_none_or(|end| end > size) {
@@ -367,14 +407,29 @@ pub fn mmap(address: u64, len: u64, protection: u64, flags: u64, fd: u64, offset
         let hint_free = address != 0
             && address.is_multiple_of(PAGE_SIZE)
             && address.checked_add(len).is_some_and(|end| end <= USER_END)
-            && space.add_backed_area(address, address + len, protection, backing.clone()).is_ok();
+            && space.add_named_area(address, address + len, protection, backing.clone(), name.clone()).is_ok();
         if hint_free {
             return Ok(address);
         }
         space.find_free(len).ok_or(Errno::ENOMEM)?
     };
-    space.add_backed_area(start, start + len, protection, backing)?;
+    space.add_named_area(start, start + len, protection, backing, name)?;
     Ok(start)
+}
+
+/// `mremap`: grows or shrinks a mapping, moving it if allowed
+/// (`MREMAP_MAYMOVE`). Moving to a chosen place (`MREMAP_FIXED`) isn't
+/// supported.
+pub fn mremap(address: u64, old_len: u64, new_len: u64, flags: u64) -> Result<u64> {
+    const MREMAP_MAYMOVE: u64 = 1;
+    if !address.is_multiple_of(PAGE_SIZE) || new_len == 0 || flags & !MREMAP_MAYMOVE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let old_len = old_len.next_multiple_of(PAGE_SIZE);
+    let new_len = new_len.checked_next_multiple_of(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
+    let process = process::current();
+    let mut space = process.space.lock();
+    space.as_mut().ok_or(Errno::ENOMEM)?.remap(address, old_len, new_len, flags & MREMAP_MAYMOVE != 0)
 }
 
 pub fn munmap(address: u64, len: u64) -> Result<u64> {

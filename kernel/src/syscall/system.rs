@@ -11,13 +11,16 @@ use crate::{log, power, random, time};
 
 /// The machine's name, read from /etc/hostname at boot.
 pub static HOSTNAME: SpinLock<String> = SpinLock::new(String::new());
+/// The kernel release `uname` reports: like Linux's, for programs that
+/// check for a recent enough kernel.
+pub const KERNEL_RELEASE: &str = "6.8.0-eliOS";
 
 /// `uname`: six 65-byte strings.
 pub fn uname(address: u64) -> Result<u64> {
     // The release looks like Linux's so that programs which check for a
     // minimum kernel version accept eliOS.
     let hostname = HOSTNAME.lock().clone();
-    let fields = ["eliOS", &hostname, "6.8.0-eliOS", concat!("eliOS ", env!("CARGO_PKG_VERSION")), "x86_64", ""];
+    let fields = ["eliOS", &hostname, KERNEL_RELEASE, concat!("eliOS ", env!("CARGO_PKG_VERSION")), "x86_64", ""];
     let mut buffer = [0u8; 65 * 6];
     for (index, field) in fields.iter().enumerate() {
         let bytes = field.as_bytes();
@@ -180,4 +183,50 @@ pub fn sethostname(name: u64, len: u64) -> Result<u64> {
     let name = core::str::from_utf8(bytes).map_err(|_| Errno::EINVAL)?;
     *HOSTNAME.lock() = String::from(name);
     Ok(0)
+}
+
+const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// `capget`: Linux's capabilities, which here follow the user: root has
+/// them all, others none.
+pub fn capget(header: u64, data: u64) -> Result<u64> {
+    let [version, _pid]: [u32; 2] = user::read_value(header)?;
+    if version != CAPABILITY_VERSION_3 {
+        user::write_value(header, &CAPABILITY_VERSION_3)?;
+        return Err(Errno::EINVAL);
+    }
+    if data != 0 {
+        let all = if crate::process::credentials::current().euid == 0 { u32::MAX } else { 0 };
+        // Two sets of (effective, permitted, inheritable).
+        user::write_value(data, &[all, all, 0, all, all, 0])?;
+    }
+    Ok(0)
+}
+
+/// `capset`: accepted (capabilities aren't separate from being root).
+pub fn capset(header: u64, _data: u64) -> Result<u64> {
+    let [version, _pid]: [u32; 2] = user::read_value(header)?;
+    if version != CAPABILITY_VERSION_3 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(0)
+}
+
+/// `membarrier`: makes every other CPU pass a memory barrier, by
+/// interrupting them all (the TLB shootdown path does exactly that).
+/// Garbage collectors and some lock-free code use it.
+pub fn membarrier(command: u64) -> Result<u64> {
+    const QUERY: u64 = 0;
+    const GLOBAL: u64 = 1;
+    const PRIVATE_EXPEDITED: u64 = 8;
+    const REGISTER_PRIVATE_EXPEDITED: u64 = 16;
+    match command {
+        QUERY => Ok(GLOBAL | PRIVATE_EXPEDITED | REGISTER_PRIVATE_EXPEDITED),
+        GLOBAL | PRIVATE_EXPEDITED => {
+            crate::arch::smp::flush_tlb(0, 0);
+            Ok(0)
+        }
+        REGISTER_PRIVATE_EXPEDITED => Ok(0),
+        _ => Err(Errno::EINVAL),
+    }
 }

@@ -69,10 +69,17 @@ pub fn run(mut qemu: Command, steps: &[String], monitor: &Path) -> Result<(), St
     };
 
     let mut previous_start = 0;
+    // How long commands and waits may take (`@timeout` changes it).
+    let timeout = std::cell::Cell::new(COMMAND_TIMEOUT);
     let mut run = |step: &str, previous_start: &mut usize| -> Result<(), String> {
         let start = length();
+        if let Some(seconds) = step.strip_prefix("@timeout ") {
+            let seconds: u64 = seconds.trim().parse().map_err(|_| format!("bad step `{step}`"))?;
+            timeout.set(Duration::from_secs(seconds));
+            return Ok(());
+        }
         if let Some(text) = step.strip_prefix("@wait ") {
-            let deadline = Instant::now() + COMMAND_TIMEOUT;
+            let deadline = Instant::now() + timeout.get();
             let appeared = || {
                 let data = output.lock().unwrap();
                 let since = &data[(*previous_start).min(data.len())..];
@@ -82,7 +89,7 @@ pub fn run(mut qemu: Command, steps: &[String], monitor: &Path) -> Result<(), St
                 thread::sleep(Duration::from_millis(50));
             }
             if !appeared() {
-                eprintln!("xtask: `{text}` didn't appear within {}s", COMMAND_TIMEOUT.as_secs());
+                eprintln!("xtask: `{text}` didn't appear within {}s", timeout.get().as_secs());
             }
             // The next wait looks from here on.
             *previous_start = length();
@@ -110,7 +117,7 @@ pub fn run(mut qemu: Command, steps: &[String], monitor: &Path) -> Result<(), St
             thread::sleep(Duration::from_millis(500));
         } else {
             input.write_all(format!("{step}\r").as_bytes()).and_then(|_| input.flush()).map_err(|e| e.to_string())?;
-            wait_for_prompt(start, COMMAND_TIMEOUT);
+            wait_for_prompt(start, timeout.get());
         }
         *previous_start = start;
         Ok(())

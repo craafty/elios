@@ -16,12 +16,12 @@ mod processes;
 mod system;
 
 pub use self::net::net_ioctl;
-pub use self::system::HOSTNAME;
+pub use self::system::{HOSTNAME, KERNEL_RELEASE};
 
 use crate::arch::interrupts::InterruptFrame;
 use crate::errno::{Errno, Result};
 use crate::process::signal;
-use crate::{arch, process};
+use crate::{arch, process, task};
 
 /// eliOS-specific calls.
 pub const ELI_PROCESS_LIST: u64 = 0x1000;
@@ -29,158 +29,74 @@ pub const ELI_KERNEL_LOG: u64 = 0x1001;
 pub const ELI_TRACE: u64 = 0x1002;
 
 /// System call names, for tracing.
+/// Linux's x86_64 system call names, by number (from its `unistd_64.h`),
+/// for tracing and for reporting calls eliOS doesn't implement.
+#[rustfmt::skip]
+const NAMES: [&str; 472] = [
+    "read", "write", "open", "close", "stat", "fstat", "lstat", "poll", "lseek", "mmap", "mprotect", "munmap", "brk",
+    "rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "ioctl", "pread64", "pwrite64", "readv", "writev", "access",
+    "pipe", "select", "sched_yield", "mremap", "msync", "mincore", "madvise", "shmget", "shmat", "shmctl", "dup",
+    "dup2", "pause", "nanosleep", "getitimer", "alarm", "setitimer", "getpid", "sendfile", "socket", "connect",
+    "accept", "sendto", "recvfrom", "sendmsg", "recvmsg", "shutdown", "bind", "listen", "getsockname", "getpeername",
+    "socketpair", "setsockopt", "getsockopt", "clone", "fork", "vfork", "execve", "exit", "wait4", "kill", "uname",
+    "semget", "semop", "semctl", "shmdt", "msgget", "msgsnd", "msgrcv", "msgctl", "fcntl", "flock", "fsync",
+    "fdatasync", "truncate", "ftruncate", "getdents", "getcwd", "chdir", "fchdir", "rename", "mkdir", "rmdir",
+    "creat", "link", "unlink", "symlink", "readlink", "chmod", "fchmod", "chown", "fchown", "lchown", "umask",
+    "gettimeofday", "getrlimit", "getrusage", "sysinfo", "times", "ptrace", "getuid", "syslog", "getgid", "setuid",
+    "setgid", "geteuid", "getegid", "setpgid", "getppid", "getpgrp", "setsid", "setreuid", "setregid", "getgroups",
+    "setgroups", "setresuid", "getresuid", "setresgid", "getresgid", "getpgid", "setfsuid", "setfsgid", "getsid",
+    "capget", "capset", "rt_sigpending", "rt_sigtimedwait", "rt_sigqueueinfo", "rt_sigsuspend", "sigaltstack",
+    "utime", "mknod", "uselib", "personality", "ustat", "statfs", "fstatfs", "sysfs", "getpriority", "setpriority",
+    "sched_setparam", "sched_getparam", "sched_setscheduler", "sched_getscheduler", "sched_get_priority_max",
+    "sched_get_priority_min", "sched_rr_get_interval", "mlock", "munlock", "mlockall", "munlockall", "vhangup",
+    "modify_ldt", "pivot_root", "_sysctl", "prctl", "arch_prctl", "adjtimex", "setrlimit", "chroot", "sync", "acct",
+    "settimeofday", "mount", "umount2", "swapon", "swapoff", "reboot", "sethostname", "setdomainname", "iopl",
+    "ioperm", "create_module", "init_module", "delete_module", "get_kernel_syms", "query_module", "quotactl",
+    "nfsservctl", "getpmsg", "putpmsg", "afs_syscall", "tuxcall", "security", "gettid", "readahead", "setxattr",
+    "lsetxattr", "fsetxattr", "getxattr", "lgetxattr", "fgetxattr", "listxattr", "llistxattr", "flistxattr",
+    "removexattr", "lremovexattr", "fremovexattr", "tkill", "time", "futex", "sched_setaffinity", "sched_getaffinity",
+    "set_thread_area", "io_setup", "io_destroy", "io_getevents", "io_submit", "io_cancel", "get_thread_area",
+    "lookup_dcookie", "epoll_create", "epoll_ctl_old", "epoll_wait_old", "remap_file_pages", "getdents64",
+    "set_tid_address", "restart_syscall", "semtimedop", "fadvise64", "timer_create", "timer_settime", "timer_gettime",
+    "timer_getoverrun", "timer_delete", "clock_settime", "clock_gettime", "clock_getres", "clock_nanosleep",
+    "exit_group", "epoll_wait", "epoll_ctl", "tgkill", "utimes", "vserver", "mbind", "set_mempolicy", "get_mempolicy",
+    "mq_open", "mq_unlink", "mq_timedsend", "mq_timedreceive", "mq_notify", "mq_getsetattr", "kexec_load", "waitid",
+    "add_key", "request_key", "keyctl", "ioprio_set", "ioprio_get", "inotify_init", "inotify_add_watch",
+    "inotify_rm_watch", "migrate_pages", "openat", "mkdirat", "mknodat", "fchownat", "futimesat", "newfstatat",
+    "unlinkat", "renameat", "linkat", "symlinkat", "readlinkat", "fchmodat", "faccessat", "pselect6", "ppoll",
+    "unshare", "set_robust_list", "get_robust_list", "splice", "tee", "sync_file_range", "vmsplice", "move_pages",
+    "utimensat", "epoll_pwait", "signalfd", "timerfd_create", "eventfd", "fallocate", "timerfd_settime",
+    "timerfd_gettime", "accept4", "signalfd4", "eventfd2", "epoll_create1", "dup3", "pipe2", "inotify_init1",
+    "preadv", "pwritev", "rt_tgsigqueueinfo", "perf_event_open", "recvmmsg", "fanotify_init", "fanotify_mark",
+    "prlimit64", "name_to_handle_at", "open_by_handle_at", "clock_adjtime", "syncfs", "sendmmsg", "setns", "getcpu",
+    "process_vm_readv", "process_vm_writev", "kcmp", "finit_module", "sched_setattr", "sched_getattr", "renameat2",
+    "seccomp", "getrandom", "memfd_create", "kexec_file_load", "bpf", "execveat", "userfaultfd", "membarrier",
+    "mlock2", "copy_file_range", "preadv2", "pwritev2", "pkey_mprotect", "pkey_alloc", "pkey_free", "statx",
+    "io_pgetevents", "rseq", "uretprobe", "uprobe", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+    "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "pidfd_send_signal", "io_uring_setup",
+    "io_uring_enter", "io_uring_register", "open_tree", "move_mount", "fsopen", "fsconfig", "fsmount", "fspick",
+    "pidfd_open", "clone3", "close_range", "openat2", "pidfd_getfd", "faccessat2", "process_madvise", "epoll_pwait2",
+    "mount_setattr", "quotactl_fd", "landlock_create_ruleset", "landlock_add_rule", "landlock_restrict_self",
+    "memfd_secret", "process_mrelease", "futex_waitv", "set_mempolicy_home_node", "cachestat", "fchmodat2",
+    "map_shadow_stack", "futex_wake", "futex_wait", "futex_requeue", "statmount", "listmount", "lsm_get_self_attr",
+    "lsm_set_self_attr", "lsm_list_modules", "mseal", "setxattrat", "getxattrat", "listxattrat", "removexattrat",
+    "open_tree_attr", "file_getattr", "file_setattr", "listns", "rseq_slice_yield",
+];
+
 fn name(number: u64) -> Option<&'static str> {
-    Some(match number {
-        0 => "read",
-        1 => "write",
-        2 => "open",
-        3 => "close",
-        4 => "stat",
-        5 => "fstat",
-        6 => "lstat",
-        7 => "poll",
-        8 => "lseek",
-        9 => "mmap",
-        10 => "mprotect",
-        11 => "munmap",
-        12 => "brk",
-        13 => "rt_sigaction",
-        14 => "rt_sigprocmask",
-        15 => "rt_sigreturn",
-        16 => "ioctl",
-        17 => "pread64",
-        18 => "pwrite64",
-        19 => "readv",
-        20 => "writev",
-        21 => "access",
-        22 => "pipe",
-        23 => "select",
-        24 => "sched_yield",
-        25 => "mremap",
-        28 => "madvise",
-        32 => "dup",
-        33 => "dup2",
-        34 => "pause",
-        35 => "nanosleep",
-        36 => "getitimer",
-        37 => "alarm",
-        38 => "setitimer",
-        39 => "getpid",
-        40 => "sendfile",
-        41 => "socket",
-        42 => "connect",
-        43 => "accept",
-        44 => "sendto",
-        45 => "recvfrom",
-        46 => "sendmsg",
-        47 => "recvmsg",
-        48 => "shutdown",
-        49 => "bind",
-        50 => "listen",
-        51 => "getsockname",
-        52 => "getpeername",
-        53 => "socketpair",
-        54 => "setsockopt",
-        55 => "getsockopt",
-        56 => "clone",
-        57 => "fork",
-        58 => "vfork",
-        59 => "execve",
-        60 => "exit",
-        61 => "wait4",
-        62 => "kill",
-        63 => "uname",
-        72 => "fcntl",
-        79 => "getcwd",
-        80 => "chdir",
-        81 => "fchdir",
-        82 => "rename",
-        83 => "mkdir",
-        84 => "rmdir",
-        86 => "link",
-        87 => "unlink",
-        89 => "readlink",
-        90 => "chmod",
-        91 => "fchmod",
-        92 => "chown",
-        93 => "fchown",
-        94 => "lchown",
-        95 => "umask",
-        96 => "gettimeofday",
-        99 => "sysinfo",
-        102 => "getuid",
-        105 => "setuid",
-        106 => "setgid",
-        104 => "getgid",
-        107 => "geteuid",
-        108 => "getegid",
-        109 => "setpgid",
-        110 => "getppid",
-        113 => "setreuid",
-        114 => "setregid",
-        115 => "getgroups",
-        116 => "setgroups",
-        117 => "setresuid",
-        118 => "getresuid",
-        119 => "setresgid",
-        120 => "getresgid",
-        122 => "setfsuid",
-        123 => "setfsgid",
-        128 => "rt_sigtimedwait",
-        130 => "rt_sigsuspend",
-        131 => "sigaltstack",
-        137 => "statfs",
-        138 => "fstatfs",
-        157 => "prctl",
-        158 => "arch_prctl",
-        162 => "sync",
-        165 => "mount",
-        166 => "umount2",
-        170 => "sethostname",
-        186 => "gettid",
-        201 => "time",
-        200 => "tkill",
-        202 => "futex",
-        222 => "timer_create",
-        223 => "timer_settime",
-        224 => "timer_gettime",
-        225 => "timer_getoverrun",
-        226 => "timer_delete",
-        203 => "sched_setaffinity",
-        204 => "sched_getaffinity",
-        217 => "getdents64",
-        218 => "set_tid_address",
-        228 => "clock_gettime",
-        230 => "clock_nanosleep",
-        231 => "exit_group",
-        234 => "tgkill",
-        235 => "utimes",
-        257 => "openat",
-        260 => "fchownat",
-        262 => "newfstatat",
-        263 => "unlinkat",
-        265 => "linkat",
-        267 => "readlinkat",
-        268 => "fchmodat",
-        269 => "faccessat",
-        270 => "pselect6",
-        271 => "ppoll",
-        280 => "utimensat",
-        273 => "set_robust_list",
-        288 => "accept4",
-        293 => "pipe2",
-        302 => "prlimit64",
-        318 => "getrandom",
-        332 => "statx",
-        334 => "rseq",
-        435 => "clone3",
-        439 => "faccessat2",
-        452 => "fchmodat2",
-        ELI_PROCESS_LIST => "eli_process_list",
-        ELI_KERNEL_LOG => "eli_kernel_log",
-        ELI_TRACE => "eli_trace",
-        _ => return None,
-    })
+    match number {
+        ELI_PROCESS_LIST => Some("eli_process_list"),
+        ELI_KERNEL_LOG => Some("eli_kernel_log"),
+        ELI_TRACE => Some("eli_trace"),
+        _ => NAMES.get(number as usize).copied().filter(|name| !name.is_empty()),
+    }
+}
+
+/// A system call's name (or its number), for /proc and tracing.
+pub fn call_name(number: u64) -> alloc::string::String {
+    name(number).map_or_else(|| alloc::format!("syscall_{number}"), alloc::string::ToString::to_string)
 }
 
 /// Prints a traced call (dimmed, to tell it apart from program output).
@@ -192,11 +108,23 @@ fn trace(pid: process::Pid, number: u64, a: &[u64; 6], result: Option<&Result<u6
         Some(Ok(value)) => alloc::format!("{value}"),
         Some(Err(error)) => alloc::format!("-1 {}", crate::errno::name(*error as i64)),
     };
+    // Paths are shown as strings: what a program looks for is usually the
+    // interesting part.
+    let path_argument = match number {
+        2 | 4 | 6 | 21 | 59 | 76 | 80 | 82 | 83 | 84 | 86 | 87 | 88 | 89 | 90 | 92 | 94 | 137 | 161 | 165 => Some(0),
+        257 | 258 | 260 | 262 | 263 | 264 | 265 | 266 | 267 | 268 | 269 | 280 | 316 | 332 | 437 | 439 | 452 => Some(1),
+        _ => None,
+    };
+    let argument = |index: usize| match path_argument {
+        Some(path) if path == index => process::user::read_string(a[index])
+            .map_or_else(|_| alloc::format!("{:#x}", a[index]), |s| alloc::format!("{s:?}")),
+        _ => alloc::format!("{:#x}", a[index]),
+    };
     crate::log::write_terminal(&alloc::format!(
-        "\x1b[2m[{pid}] {name}({:#x}, {:#x}, {:#x}) = {outcome}\x1b[0m\n",
-        a[0],
-        a[1],
-        a[2]
+        "\x1b[2m[{pid}] {name}({}, {}, {}) = {outcome}\x1b[0m\n",
+        argument(0),
+        argument(1),
+        argument(2)
     ));
 }
 
@@ -215,7 +143,19 @@ extern "sysv64" fn syscall_dispatch(frame: &mut InterruptFrame) {
     {
         trace(pid, number, &a, None);
     }
+    let thread = task::current_user_thread();
+    if let Some(thread) = &thread {
+        for (slot, value) in thread.syscall_arguments.iter().zip(a) {
+            slot.store(value, core::sync::atomic::Ordering::Relaxed);
+        }
+        thread.syscall.store(number + 1, core::sync::atomic::Ordering::Relaxed);
+        thread.syscall_stack.store(frame.rsp, core::sync::atomic::Ordering::Relaxed);
+        thread.syscall_rip.store(frame.rip, core::sync::atomic::Ordering::Relaxed);
+    }
     let result = dispatch(number, a, frame);
+    if let Some(thread) = &thread {
+        thread.syscall.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(pid) = traced
         && !no_return
     {
@@ -260,6 +200,7 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         22 => files::pipe(a[0], 0),
         23 => poll::select(a[0], a[1], a[2], a[3], a[4], false),
         24 => processes::sched_yield(),
+        25 => processes::mremap(a[0], a[1], a[2], a[3]),
         // madvise: advice can be ignored.
         28 => Ok(0),
         32 => files::dup(a[0]),
@@ -335,10 +276,22 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         122 => processes::fs_id(false),
         123 => processes::fs_id(true),
         121 | 124 => processes::getpgid(a[0]),
+        125 => system::capget(a[0], a[1]),
+        126 => system::capset(a[0], a[1]),
         128 => processes::sigtimedwait(a[0], a[1], a[2], a[3]),
         130 => processes::sigsuspend(a[0], a[1]),
         131 => processes::sigaltstack(a[0], a[1]),
         137 => files::statfs(a[0], a[1]),
+        // getpriority and setpriority: everything runs at the normal
+        // priority (reported, as the system call does, as 20 - nice).
+        140 => Ok(20),
+        141 => Ok(0),
+        // The scheduler: one policy (SCHED_OTHER, 0) at priority 0.
+        142 | 144 => Ok(0),
+        143 => process::user::write_value(a[1], &0i32).map(|()| 0),
+        145..=147 => Ok(0),
+        // readahead: a hint.
+        187 => Ok(0),
         138 => files::fstatfs(a[0], a[1]),
         157 => processes::prctl(a[0], a[1]),
         158 => processes::arch_prctl(a[0], a[1]),
@@ -354,6 +307,8 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         // sched_setaffinity: there's nothing to choose between yet.
         203 => Ok(0),
         204 => processes::sched_getaffinity(a[1], a[2]),
+        // fadvise64: a hint.
+        221 => Ok(0),
         217 => files::get_directory_entries(a[0], a[1], a[2]),
         222 => processes::timer_create(a[0], a[1], a[2]),
         223 => processes::timer_settime(a[0], a[1], a[2], a[3]),
@@ -383,11 +338,15 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         269 => files::access_at(a[0], a[1], a[2], 0),
         270 => poll::select(a[0], a[1], a[2], a[3], a[4], true),
         271 => poll::ppoll(a[0], a[1], a[2]),
+        // unshare: there's nothing shared to unshare, and no namespaces.
+        272 if a[0] & process::CLONE_NEW_NAMESPACES != 0 => Err(Errno::EPERM),
+        272 => Ok(0),
         // set_robust_list: nothing to do.
         273 => Ok(0),
         280 => files::utimensat(a[0], a[1], a[2], a[3]),
         281 => poll::epoll_wait(a[0], a[1], a[2], a[3], false),
         283 => poll::timerfd_create(a[0], a[1]),
+        285 => files::fallocate(a[0], a[1], a[2], a[3]),
         284 => poll::eventfd(a[0], 0),
         286 => poll::timerfd_settime(a[0], a[1], a[2], a[3]),
         287 => poll::timerfd_gettime(a[0], a[1]),
@@ -396,10 +355,15 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         291 => poll::epoll_create(a[0]),
         292 => files::dup3(a[0], a[1], a[2]),
         293 => files::pipe(a[0], a[1]),
+        295 | 327 => files::vectored_at(a[0], a[1], a[2], a[3], false),
+        296 | 328 => files::vectored_at(a[0], a[1], a[2], a[3], true),
         302 => system::prlimit(a[1], a[3]),
         318 => system::getrandom(a[0], a[1]),
         319 => files::memfd_create(a[0], a[1]),
+        324 => system::membarrier(a[0]),
+        332 => files::statx(a[0], a[1], a[2], a[3], a[4]),
         435 => processes::clone3(frame, a[0], a[1]),
+        436 => files::close_range(a[0], a[1], a[2]),
         439 => files::access_at(a[0], a[1], a[2], a[3]),
         441 => poll::epoll_wait(a[0], a[1], a[2], a[3], true),
         452 => files::chmod_at(a[0], a[1], a[2], a[3]),

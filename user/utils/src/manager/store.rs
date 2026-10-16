@@ -17,6 +17,9 @@ use super::{CACHE, KEYS, STORE};
 const REPOSITORIES: &str = "/etc/eli/repositories";
 /// Marks a store entry as complete (written last).
 pub const COMPLETE: &str = ".eli-package";
+/// Where a store entry keeps its package's install scripts and the
+/// directories its trigger watches (`triggers`).
+pub const SCRIPTS: &str = ".eli-scripts";
 
 /// The repositories to use: system.conf's, or the defaults.
 pub fn repositories(configured: &[String]) -> Vec<String> {
@@ -162,6 +165,7 @@ pub fn fetch(package: &Package, repositories: &[String], label: &str) -> Result<
         }
     }
     let scripts = contents.scripts();
+    save_scripts(&contents, &unpacking).map_err(|error| format!("{id}: {error}"))?;
     let record = format!(
         "name = {}\nversion = {}\ndescription = {}\nurl = {}\nlicense = {}\nskipped scripts = {}\n",
         package.name,
@@ -176,6 +180,32 @@ pub fn fetch(package: &Package, repositories: &[String], label: &str) -> Result<
     Ok(())
 }
 
+/// Keeps a package's install scripts, and the directories its trigger
+/// watches (from `.PKGINFO`), in the store entry.
+fn save_scripts(contents: &apk::Contents, entry: &str) -> eli::Result<()> {
+    let control = tar::entries(&contents.control).unwrap_or_default();
+    let scripts: Vec<_> = control.iter().filter(|e| e.path.starts_with('.') && e.path != ".PKGINFO").collect();
+    let triggers = control
+        .iter()
+        .find(|e| e.path == ".PKGINFO")
+        .map(|info| String::from_utf8_lossy(info.data).into_owned())
+        .and_then(|info| info.lines().find_map(|line| line.strip_prefix("triggers = ").map(String::from)));
+    if scripts.is_empty() && triggers.is_none() {
+        return Ok(());
+    }
+    let directory = format!("{entry}/{SCRIPTS}");
+    fs::create_dir(&directory)?;
+    for script in scripts {
+        let path = format!("{directory}/{}", script.path);
+        fs::write(&path, script.data)?;
+        fs::set_permissions(&path, 0o755)?;
+    }
+    if let Some(triggers) = triggers {
+        fs::write(&format!("{directory}/triggers"), triggers.as_bytes())?;
+    }
+    Ok(())
+}
+
 /// The files of a store entry, relative to it, as (path, is a directory).
 pub fn files(id: &str) -> Vec<(String, bool)> {
     let mut found = Vec::new();
@@ -183,7 +213,7 @@ pub fn files(id: &str) -> Vec<(String, bool)> {
     while let Some(directory) = pending.pop() {
         let full = if directory.is_empty() { path(id) } else { format!("{}/{directory}", path(id)) };
         for entry in fs::read_dir(&full).unwrap_or_default() {
-            if directory.is_empty() && entry.name == COMPLETE {
+            if directory.is_empty() && (entry.name == COMPLETE || entry.name == SCRIPTS) {
                 continue;
             }
             let relative =

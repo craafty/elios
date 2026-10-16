@@ -65,6 +65,60 @@ pub fn pwrite(fd: u64, buffer: u64, count: u64, offset: u64) -> Result<u64> {
     file.inode.write_at(offset, buffer).map(|n| n as u64)
 }
 
+/// `preadv`, `pwritev` and their `2` forms: `readv`/`writev` at an offset
+/// (or, for the `2` forms with offset -1, at the file position). The `2`
+/// forms' flags (`RWF_*`) are hints, ignored.
+pub fn vectored_at(fd: u64, vectors: u64, count: u64, offset: u64, writing: bool) -> Result<u64> {
+    if offset as i64 == -1 {
+        return vectored(fd, vectors, count, writing);
+    }
+    let file = file(fd)?;
+    if !file.inode.seekable() {
+        return Err(Errno::ESPIPE);
+    }
+    let mut total = 0u64;
+    for index in 0..count.min(1024) {
+        let [base, len]: [u64; 2] = user::read_value(vectors + index * 16)?;
+        if len == 0 {
+            continue;
+        }
+        let position = offset + total;
+        let done = if writing {
+            file.inode.write_at(position, user::buffer(base, len as usize)?)?
+        } else {
+            file.inode.read_at(position, user::buffer_mut(base, len as usize)?)?
+        };
+        total += done as u64;
+        if (done as u64) < len {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// `fallocate`: makes sure a file has room for `offset..offset + len`.
+/// Files here aren't preallocated, so this only grows the file when mode
+/// 0 asks (programs size shared memory this way); punching holes and the
+/// like aren't supported.
+pub fn fallocate(fd: u64, mode: u64, offset: u64, len: u64) -> Result<u64> {
+    const FALLOC_FL_KEEP_SIZE: u64 = 1;
+    let file = file(fd)?;
+    if !file.writable() {
+        return Err(Errno::EBADF);
+    }
+    if file.inode.metadata().kind != FileKind::Regular {
+        return Err(Errno::ENODEV);
+    }
+    if mode & !FALLOC_FL_KEEP_SIZE != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let end = offset.checked_add(len).filter(|_| len > 0).ok_or(Errno::EINVAL)?;
+    if mode & FALLOC_FL_KEEP_SIZE == 0 && end > file.inode.metadata().size {
+        file.inode.truncate(end)?;
+    }
+    Ok(0)
+}
+
 /// `readv` and `writev`: one read or write per buffer in the list.
 pub fn vectored(fd: u64, vectors: u64, count: u64, writing: bool) -> Result<u64> {
     let file = file(fd)?;
@@ -261,6 +315,45 @@ pub fn stat_at(dirfd: u64, path: u64, stat: u64, flags: u64) -> Result<u64> {
     write_stat(&inode, stat)
 }
 
+/// `statx`: `stat` in the newer, extensible layout (`struct statx`).
+pub fn statx(dirfd: u64, path: u64, flags: u64, _mask: u64, buffer: u64) -> Result<u64> {
+    let path = user::read_string(path)?;
+    let inode = if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        file(dirfd)?.inode.clone()
+    } else {
+        fs::lookup(&base_directory(dirfd)?, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?
+    };
+    let metadata = inode.metadata();
+    let device = match inode.filesystem() {
+        0 => 1,
+        filesystem => (filesystem as u64 >> 4) & 0xFFFF_FFFF,
+    };
+    let mut out = [0u8; 256];
+    let mut put = |offset: usize, bytes: &[u8]| out[offset..offset + bytes.len()].copy_from_slice(bytes);
+    // The basic fields are all filled in.
+    put(0, &0x7FFu32.to_le_bytes());
+    put(4, &4096u32.to_le_bytes());
+    put(16, &metadata.links.to_le_bytes());
+    put(20, &metadata.uid.to_le_bytes());
+    put(24, &metadata.gid.to_le_bytes());
+    put(28, &((metadata.kind.mode_bits() | metadata.permissions) as u16).to_le_bytes());
+    put(32, &metadata.inode.to_le_bytes());
+    put(40, &metadata.size.to_le_bytes());
+    put(48, &metadata.size.div_ceil(512).to_le_bytes());
+    // Access, birth, change and modification times (seconds; no nanoseconds).
+    for offset in [64, 80, 96, 112] {
+        put(offset, &(metadata.modified as i64).to_le_bytes());
+    }
+    let major = |dev: u64| ((dev >> 8) & 0xFFF | (dev >> 32) & !0xFFF) as u32;
+    let minor = |dev: u64| ((dev & 0xFF) | (dev >> 12) & !0xFF) as u32;
+    put(128, &major(metadata.rdev).to_le_bytes());
+    put(132, &minor(metadata.rdev).to_le_bytes());
+    put(136, &major(device).to_le_bytes());
+    put(140, &minor(device).to_le_bytes());
+    user::write_bytes(buffer, &out)?;
+    Ok(0)
+}
+
 pub fn fstat(fd: u64, stat: u64) -> Result<u64> {
     write_stat(&file(fd)?.inode, stat)
 }
@@ -282,9 +375,21 @@ pub fn access_at(dirfd: u64, path: u64, mode: u64, flags: u64) -> Result<u64> {
     Ok(0)
 }
 
+/// `O_DIRECT` for `pipe2` asks for "packet mode", which isn't supported
+/// (the pipe works as a byte stream regardless).
+const O_DIRECT: u32 = 0o40000;
+
 pub fn pipe(fds: u64, flags: u64) -> Result<u64> {
+    let flags = flags as u32;
+    if flags & !(O_CLOEXEC | fs::O_NONBLOCK | O_DIRECT) != 0 {
+        return Err(Errno::EINVAL);
+    }
     let (reader, writer) = pipe::create();
-    let close_on_exec = flags as u32 & O_CLOEXEC != 0;
+    if flags & fs::O_NONBLOCK != 0 {
+        reader.set_status_flags(fs::O_NONBLOCK);
+        writer.set_status_flags(fs::O_NONBLOCK);
+    }
+    let close_on_exec = flags & O_CLOEXEC != 0;
     let process = process::current();
     let mut files = process.files.lock();
     let read_fd = files.insert(reader, close_on_exec, 0)?;
@@ -317,6 +422,34 @@ pub fn memfd_create(name: u64, flags: u64) -> Result<u64> {
     let file = OpenFile::new(memfd, alloc::format!("/memfd:{name} (deleted)"), fs::O_RDWR);
     let fd = process::current().files.lock().insert(file, flags & MFD_CLOEXEC != 0, 0)?;
     Ok(fd as u64)
+}
+
+/// `close_range`: closes descriptors `first..=last` (or, with
+/// `CLOSE_RANGE_CLOEXEC`, marks them close-on-exec). Programs use it
+/// before running another, so it inherits only what it should.
+pub fn close_range(first: u64, last: u64, flags: u64) -> Result<u64> {
+    const CLOSE_RANGE_UNSHARE: u64 = 2;
+    const CLOSE_RANGE_CLOEXEC: u64 = 4;
+    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last {
+        return Err(Errno::EINVAL);
+    }
+    let process = process::current();
+    let closed = {
+        let mut files = process.files.lock();
+        let mut closed = Vec::new();
+        for fd in first as u32 as usize..=(last as u32 as usize).min(fs::MAX_FILES - 1) {
+            if flags & CLOSE_RANGE_CLOEXEC != 0 {
+                let _ = files.set_close_on_exec(fd, true);
+            } else if let Ok(file) = files.get(fd) {
+                let _ = files.close(fd);
+                closed.push(file);
+            }
+        }
+        closed
+    };
+    // Closed outside the lock (closing can wake other threads).
+    drop(closed);
+    Ok(0)
 }
 
 pub fn dup(fd: u64) -> Result<u64> {

@@ -20,6 +20,7 @@ const IA32_STAR: u32 = 0xC000_0081;
 const IA32_LSTAR: u32 = 0xC000_0082;
 const IA32_FMASK: u32 = 0xC000_0084;
 const IA32_FS_BASE: u32 = 0xC000_0100;
+const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 
 const EFER_SYSCALL_ENABLE: u64 = 1 << 0;
 /// RFLAGS bits cleared on entry: interrupts, direction, trap, alignment check.
@@ -105,6 +106,18 @@ pub fn fs_base() -> u64 {
 pub fn set_fs_base(base: u64) {
     // SAFETY: FS is only used by user programs; the kernel never relies on it.
     unsafe { wrmsr(IA32_FS_BASE, base) };
+}
+
+/// The user's GS base. While the kernel runs, `swapgs` has parked it in
+/// `IA32_KERNEL_GS_BASE` (GS itself is the kernel's per-CPU data).
+pub fn user_gs_base() -> u64 {
+    // SAFETY: reading an architectural MSR.
+    unsafe { rdmsr(IA32_KERNEL_GS_BASE) }
+}
+
+pub fn set_user_gs_base(base: u64) {
+    // SAFETY: it becomes GS only when returning to user mode.
+    unsafe { wrmsr(IA32_KERNEL_GS_BASE, base) };
 }
 
 /// A frame that starts user code at `entry` with stack pointer `stack`.

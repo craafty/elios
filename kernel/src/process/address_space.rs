@@ -64,6 +64,20 @@ struct Area {
     end: u64,
     protection: u32,
     backing: Backing,
+    /// What's mapped, for /proc/PID/maps and fault reports: a file's path,
+    /// or a label like `[stack]`.
+    name: Option<Arc<str>>,
+}
+
+/// An area, as /proc/PID/maps describes it.
+pub struct AreaInfo {
+    pub start: u64,
+    pub end: u64,
+    pub protection: u32,
+    pub shared: bool,
+    /// Where in the file (or memory object) the area starts.
+    pub offset: u64,
+    pub name: Option<Arc<str>>,
 }
 
 impl Area {
@@ -131,9 +145,71 @@ impl AddressSpace {
         self.table.root()
     }
 
-    /// The areas as (start, end, protection, shared), in address order.
-    pub fn areas(&self) -> Vec<(u64, u64, u32, bool)> {
-        self.areas.iter().map(|(&start, area)| (start, area.end, area.protection, area.shared())).collect()
+    /// The areas, in address order.
+    pub fn areas(&self) -> Vec<AreaInfo> {
+        self.areas
+            .iter()
+            .map(|(&start, area)| AreaInfo {
+                start,
+                end: area.end,
+                protection: area.protection,
+                shared: area.shared(),
+                offset: match area.backing {
+                    Backing::Object { offset, .. } => offset,
+                    _ => 0,
+                },
+                name: area.name.clone(),
+            })
+            .collect()
+    }
+
+    /// Names the areas that have no name yet (after loading a program
+    /// image, its areas are the unnamed ones).
+    pub fn name_unnamed(&mut self, name: &str) {
+        let name: Arc<str> = name.into();
+        for area in self.areas.values_mut().filter(|area| area.name.is_none()) {
+            area.name = Some(name.clone());
+        }
+    }
+
+    /// Names the area containing `address`.
+    pub fn set_name(&mut self, address: u64, name: Arc<str>) {
+        if let Some((start, _)) = self.area_at(address) {
+            self.areas.get_mut(&start).unwrap().name = Some(name);
+        }
+    }
+
+    /// Reads a word of user memory if its page is mapped (without
+    /// faulting anything in), for debugging views like /proc/PID/stacks.
+    pub fn peek(&self, address: u64) -> Option<u64> {
+        if !address.is_multiple_of(8) {
+            return None;
+        }
+        let mapping = self.table.translate(address & !(PAGE_SIZE - 1)).filter(|m| m.flags & DEVICE_PAGE == 0)?;
+        // SAFETY: the frame is RAM (not device memory), in the direct map,
+        // and referenced by this address space, which the caller holds.
+        Some(unsafe { core::ptr::read_volatile(phys_to_virt(mapping.phys + address % PAGE_SIZE) as *const u64) })
+    }
+
+    /// Whether `address` is in an executable area.
+    pub fn executable(&self, address: u64) -> bool {
+        self.area_at(address).is_some_and(|(_, area)| area.protection & PROT_EXEC != 0)
+    }
+
+    /// Describes an address for a fault report: the name of what's mapped
+    /// there and the offset from where that is mapped first (for a library,
+    /// its load address, which is what `addr2line` wants).
+    pub fn describe(&self, address: u64) -> Option<(Arc<str>, u64)> {
+        let (_, area) = self.area_at(address)?;
+        let name = area.name.clone()?;
+        let base = self.areas.iter().find(|(_, other)| other.name.as_ref() == Some(&name)).map(|(&start, other)| {
+            start
+                - match other.backing {
+                    Backing::Object { offset, .. } => offset,
+                    _ => 0,
+                }
+        })?;
+        Some((name, address.wrapping_sub(base)))
     }
 
     pub fn resident_bytes(&self) -> u64 {
@@ -156,13 +232,25 @@ impl AddressSpace {
 
     /// Adds an area with the given backing.
     pub fn add_backed_area(&mut self, start: u64, end: u64, protection: u32, backing: Backing) -> Result<()> {
+        self.add_named_area(start, end, protection, backing, None)
+    }
+
+    /// Adds an area with the given backing and name.
+    pub fn add_named_area(
+        &mut self,
+        start: u64,
+        end: u64,
+        protection: u32,
+        backing: Backing,
+        name: Option<Arc<str>>,
+    ) -> Result<()> {
         if !start.is_multiple_of(PAGE_SIZE) || !end.is_multiple_of(PAGE_SIZE) || start >= end || end > USER_END {
             return Err(Errno::EINVAL);
         }
         if self.overlaps(start, end) {
             return Err(Errno::EEXIST);
         }
-        self.areas.insert(start, Area { end, protection, backing });
+        self.areas.insert(start, Area { end, protection, backing, name });
         Ok(())
     }
 
@@ -238,6 +326,51 @@ impl AddressSpace {
         }
         self.areas.get_mut(&start).unwrap().end = address;
         self.areas.insert(address, upper);
+    }
+
+    /// `mremap`: resizes the mapping at `start..start + old_len` (which
+    /// must be within one area) to `new_len`, in place if there's room, or
+    /// (if `may_move`) by moving it, pages and all. Returns where it is.
+    pub fn remap(&mut self, start: u64, old_len: u64, new_len: u64, may_move: bool) -> Result<u64> {
+        let old_end = start + old_len;
+        match self.area_at(start) {
+            Some((_, area)) if area.end >= old_end => {}
+            _ => return Err(Errno::EFAULT),
+        }
+        if new_len <= old_len {
+            if new_len < old_len {
+                self.remove(start + new_len, old_end);
+            }
+            return Ok(start);
+        }
+        self.split_at(start);
+        self.split_at(old_end);
+        let new_end = start.checked_add(new_len).filter(|&end| end <= USER_END).ok_or(Errno::ENOMEM)?;
+        if !self.overlaps(old_end, new_end) {
+            self.areas.get_mut(&start).expect("split above").end = new_end;
+            return Ok(start);
+        }
+        if !may_move {
+            return Err(Errno::ENOMEM);
+        }
+        let target = self.find_free(new_len).ok_or(Errno::ENOMEM)?;
+        let mut area = self.areas.remove(&start).expect("split above");
+        area.end = target + new_len;
+        self.areas.insert(target, area);
+        for offset in (0..old_len).step_by(PAGE_SIZE as usize) {
+            if let Some(mapping) = self.table.unmap(start + offset) {
+                let flags = mapping.flags & (USER | WRITABLE | NO_EXECUTE | COPY_ON_WRITE | DEVICE_PAGE)
+                    | mapping.flags & crate::memory::paging::WRITE_THROUGH;
+                if self.table.map(target + offset, mapping.phys, PageSize::Small, flags).is_err() {
+                    if flags & DEVICE_PAGE == 0 {
+                        frames::free(mapping.phys);
+                    }
+                    self.resident_pages -= 1;
+                }
+            }
+        }
+        smp::flush_tlb(start, old_end);
+        Ok(target)
     }
 
     /// Finds room for `len` bytes, below the `mmap` ceiling.
@@ -517,7 +650,11 @@ impl AddressSpace {
                 }
                 extendable
             });
-            if !extended && self.add_area(old_end, new_end, PROT_READ | PROT_WRITE).is_err() {
+            if !extended
+                && self
+                    .add_named_area(old_end, new_end, PROT_READ | PROT_WRITE, Backing::Anonymous, Some("[heap]".into()))
+                    .is_err()
+            {
                 return self.brk;
             }
         } else if new_end < old_end {

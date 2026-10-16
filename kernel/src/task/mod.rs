@@ -53,6 +53,7 @@ pub enum State {
 #[derive(Debug, Clone)]
 pub struct ThreadInfo {
     pub id: ThreadId,
+    pub name: String,
     pub state: State,
     /// Timer ticks (milliseconds) spent running.
     pub cpu_ticks: u64,
@@ -83,6 +84,7 @@ struct Thread {
     /// out.
     fpu: Box<FpuState>,
     fs_base: u64,
+    gs_base: u64,
 }
 
 /// How to start a thread.
@@ -94,6 +96,7 @@ pub struct Spawn {
     pub address_space: u64,
     pub fpu: FpuState,
     pub fs_base: u64,
+    pub gs_base: u64,
 }
 
 impl Spawn {
@@ -105,6 +108,7 @@ impl Spawn {
             address_space: memory::kernel_page_table_root(),
             fpu: FpuState::initial(),
             fs_base: 0,
+            gs_base: 0,
         }
     }
 }
@@ -228,6 +232,7 @@ fn new_thread(options: Spawn, state: State, rsp: u64, stack: KernelStack) -> Box
         user: options.user,
         fpu: Box::new(options.fpu),
         fs_base: options.fs_base,
+        gs_base: options.gs_base,
     })
 }
 
@@ -437,7 +442,12 @@ pub fn list() -> Vec<ThreadInfo> {
         s.threads
             .values()
             .filter(|thread| thread.state != State::Exited)
-            .map(|thread| ThreadInfo { id: thread.id, state: thread.state, cpu_ticks: thread.cpu_ticks })
+            .map(|thread| ThreadInfo {
+                id: thread.id,
+                name: thread.name.clone(),
+                state: thread.state,
+                cpu_ticks: thread.cpu_ticks,
+            })
             .collect()
     })
 }
@@ -572,12 +582,14 @@ fn switch(how: How) {
     let old = s.threads.get_mut(&current).unwrap();
     fpu::save(&mut old.fpu);
     old.fs_base = syscall::fs_base();
+    old.gs_base = syscall::user_gs_base();
     let old_address_space = old.address_space;
     let save_rsp = &raw mut old.rsp;
 
     let new = &s.threads[&next];
     fpu::restore(&new.fpu);
     syscall::set_fs_base(new.fs_base);
+    syscall::set_user_gs_base(new.gs_base);
     syscall::set_kernel_stack(new.kernel_stack_top);
     cpu.current_thread.store(next.0, Ordering::Relaxed);
     let user = new.user.as_ref().map_or(core::ptr::null_mut(), |user| Arc::as_ptr(user).cast_mut().cast());

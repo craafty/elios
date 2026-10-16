@@ -129,12 +129,85 @@ pub fn create() -> Arc<dyn Inode> {
             ("partitions".into(), generated(partitions)),
             ("cmdline".into(), generated(|| format!("{}\n", crate::cmdline::line()))),
             ("net".into(), net_directory()),
+            ("sys".into(), sys_directory()),
         ];
         for info in process::list() {
             entries.push((info.pid.to_string(), process_directory(info.pid)));
         }
         entries
     })
+}
+
+/// /proc/sys: the kernel settings programs read (read-only here).
+fn sys_directory() -> Arc<dyn Inode> {
+    fn value(text: &'static str) -> Arc<dyn Inode> {
+        generated(move || format!("{text}\n"))
+    }
+    directory(|| {
+        alloc::vec![
+            (
+                "kernel".into(),
+                directory(|| {
+                    alloc::vec![
+                        ("hostname".into(), generated(|| format!("{}\n", crate::syscall::HOSTNAME.lock()))),
+                        ("ostype".into(), value("Linux")),
+                        ("osrelease".into(), value(crate::syscall::KERNEL_RELEASE)),
+                        ("overflowuid".into(), value("65534")),
+                        ("overflowgid".into(), value("65534")),
+                        ("pid_max".into(), value("4194304")),
+                        ("ngroups_max".into(), value("65536")),
+                        (
+                            "random".into(),
+                            directory(|| {
+                                alloc::vec![
+                                    ("uuid".into(), generated(random_uuid)),
+                                    ("boot_id".into(), generated(boot_id)),
+                                ]
+                            })
+                        ),
+                        ("yama".into(), directory(|| alloc::vec![("ptrace_scope".into(), value("0"))])),
+                    ]
+                }),
+            ),
+            (
+                "vm".into(),
+                directory(|| {
+                    alloc::vec![
+                        ("overcommit_memory".into(), value("0")),
+                        ("max_map_count".into(), value("65530")),
+                        ("mmap_min_addr".into(), value("65536")),
+                    ]
+                }),
+            ),
+            ("fs".into(), directory(|| alloc::vec![("file-max".into(), value("1048576"))])),
+            // No user namespaces: sandboxes that look here know not to try.
+            ("user".into(), directory(|| alloc::vec![("max_user_namespaces".into(), value("0"))])),
+        ]
+    })
+}
+
+/// A random UUID (version 4), as /proc/sys/kernel/random/uuid gives.
+fn random_uuid() -> String {
+    let mut bytes = [0u8; 16];
+    crate::random::fill(&mut bytes);
+    bytes[6] = bytes[6] & 0x0F | 0x40;
+    bytes[8] = bytes[8] & 0x3F | 0x80;
+    uuid_text(&bytes)
+}
+
+fn uuid_text(bytes: &[u8; 16]) -> String {
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}-{}-{}-{}-{}\n", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..])
+}
+
+/// The same UUID for the whole boot.
+fn boot_id() -> String {
+    static BOOT_ID: crate::sync::Once<String> = crate::sync::Once::new();
+    if let Some(id) = BOOT_ID.get() {
+        return id.clone();
+    }
+    let _ = BOOT_ID.set(random_uuid());
+    BOOT_ID.get().cloned().unwrap_or_default()
 }
 
 /// /proc/net, in Linux's formats, which `netstat`, `route` and `arp` read.
@@ -239,6 +312,95 @@ fn net_sockets(protocol: u8) -> String {
     text
 }
 
+/// What a thread is doing, as /proc/PID/syscall shows it: the system call
+/// number and first arguments, or `running`.
+fn current_syscall(process: &process::Process, tid: Option<Pid>) -> String {
+    let threads = process.threads.lock();
+    let thread = match tid {
+        Some(tid) => threads.iter().find(|thread| thread.tid() == tid),
+        None => threads.first(),
+    };
+    let Some(thread) = thread else { return String::from("running\n") };
+    match thread.syscall.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => String::from("running\n"),
+        number => {
+            let a: Vec<u64> =
+                thread.syscall_arguments.iter().map(|a| a.load(core::sync::atomic::Ordering::Relaxed)).collect();
+            format!("{} {:#x} {:#x} {:#x}\n", number - 1, a[0], a[1], a[2])
+        }
+    }
+}
+
+/// eliOS's own /proc/PID/threads: each thread's id, name, state and the
+/// system call it's in (for finding where a program is stuck).
+fn threads(process: &process::Process) -> String {
+    let names: Vec<task::ThreadInfo> = task::list();
+    let mut text = String::new();
+    for thread in process.threads.lock().iter() {
+        let info = names.iter().find(|info| info.id == thread.id);
+        let name = info.map_or("?", |info| info.name.as_str());
+        let state = info.map_or('?', |info| match info.state {
+            task::State::Running | task::State::Ready => 'R',
+            _ => 'S',
+        });
+        let call = match thread.syscall.load(core::sync::atomic::Ordering::Relaxed) {
+            0 => String::from("-"),
+            number => {
+                let a: Vec<u64> =
+                    thread.syscall_arguments.iter().map(|a| a.load(core::sync::atomic::Ordering::Relaxed)).collect();
+                format!("{}({:#x}, {:#x}, {:#x})", crate::syscall::call_name(number - 1), a[0], a[1], a[2])
+            }
+        };
+        text.push_str(&format!("{:>6} {state} {name:<16} {call}\n", thread.tid()));
+    }
+    text
+}
+
+/// eliOS's own /proc/PID/stacks: for each thread in a system call, where
+/// it was called from and the return addresses found on its stack (words
+/// pointing into executable areas, as `file+offset`). A heuristic, since
+/// programs rarely keep frame pointers, but enough to see what a stuck
+/// program is waiting for.
+fn stacks(process: &process::Process) -> String {
+    use core::sync::atomic::Ordering::Relaxed;
+    const SCAN_BYTES: u64 = 64 * 1024;
+    const MOST_FRAMES: usize = 48;
+    let space = process.space.lock();
+    let Some(space) = space.as_ref() else { return String::new() };
+    let place = |address: u64| match space.describe(address) {
+        Some((name, offset)) => format!("{address:#x} {name}+{offset:#x}"),
+        None => format!("{address:#x}"),
+    };
+    let mut text = String::new();
+    for thread in process.threads.lock().iter() {
+        let number = thread.syscall.load(Relaxed);
+        if number == 0 {
+            text.push_str(&format!("thread {}: running\n\n", thread.tid()));
+            continue;
+        }
+        let stack = thread.syscall_stack.load(Relaxed);
+        text.push_str(&format!(
+            "thread {}: {}\n  {}\n",
+            thread.tid(),
+            crate::syscall::call_name(number - 1),
+            place(thread.syscall_rip.load(Relaxed))
+        ));
+        let mut found = 0;
+        for address in (stack & !7..stack.saturating_add(SCAN_BYTES)).step_by(8) {
+            let Some(word) = space.peek(address) else { break };
+            if space.executable(word) {
+                text.push_str(&format!("  {}\n", place(word)));
+                found += 1;
+                if found == MOST_FRAMES {
+                    break;
+                }
+            }
+        }
+        text.push('\n');
+    }
+    text
+}
+
 fn process_directory(pid: Pid) -> Arc<dyn Inode> {
     let owner = process::find(pid).map_or((0, 0), |process| {
         let credentials = process.credentials.lock();
@@ -259,7 +421,13 @@ fn process_directory(pid: Pid) -> Arc<dyn Inode> {
         entries.push(("status".into(), generated(move || status(pid))));
         entries.push(("stat".into(), generated(move || stat(pid))));
         let target = process.clone();
+        entries.push(("syscall".into(), generated(move || current_syscall(&target, None))));
+        let target = process.clone();
+        entries.push(("threads".into(), generated(move || threads(&target))));
+        let target = process.clone();
         entries.push(("maps".into(), generated(move || maps(&target))));
+        let target = process.clone();
+        entries.push(("stacks".into(), generated(move || stacks(&target))));
         let target = process;
         entries.push((
             "fd".into(),
@@ -331,15 +499,23 @@ fn maps(process: &process::Process) -> String {
     let space = process.space.lock();
     let Some(space) = space.as_ref() else { return String::new() };
     let mut text = String::new();
-    for (start, end, protection, shared) in space.areas() {
-        let flag = |bit, c| if protection & bit != 0 { c } else { '-' };
-        text.push_str(&format!(
-            "{start:012x}-{end:012x} {}{}{}{} 00000000 00:00 0\n",
+    for area in space.areas() {
+        let flag = |bit, c| if area.protection & bit != 0 { c } else { '-' };
+        let line = format!(
+            "{:012x}-{:012x} {}{}{}{} {:08x} 00:00 0",
+            area.start,
+            area.end,
             flag(process::PROT_READ, 'r'),
             flag(process::PROT_WRITE, 'w'),
             flag(process::PROT_EXEC, 'x'),
-            if shared { 's' } else { 'p' }
-        ));
+            if area.shared { 's' } else { 'p' },
+            area.offset,
+        );
+        match &area.name {
+            // Linux pads the name to a column.
+            Some(name) => text.push_str(&format!("{line:<73}{name}\n")),
+            None => text.push_str(&format!("{line}\n")),
+        }
     }
     text
 }

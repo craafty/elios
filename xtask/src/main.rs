@@ -1,6 +1,7 @@
 //! Build and run eliOS. Invoked as `cargo xtask <command>`.
 
 mod image;
+mod mirror;
 mod session;
 
 use std::env;
@@ -18,6 +19,8 @@ commands:
   run          build, then boot the disk image in QEMU
   test         boot a test build of the kernel in QEMU and run its tests
   image        build a fresh disk image (for a USB stick or another VM)
+  mirror       serve a caching mirror of Alpine's packages on port 8086
+               (QEMU reaches it at 10.0.2.2; see xtask/src/mirror.rs)
   session      boot, type the given steps at the shell, print a transcript
                (steps: `command`, `@raw TEXT`, `@sleep S`, `@key NAME`,
                `@screenshot FILE.png`, `@monitor COMMAND`, `@wait TEXT`; see
@@ -119,6 +122,7 @@ fn main() -> ExitCode {
             let options = Options { fresh: true, ..options };
             build(&options).map(|disk| eprintln!("xtask: wrote {}", disk.display()))
         }
+        Some("mirror") => mirror::run(workspace_root().join("target/alpine-cache")),
         Some("help" | "-h" | "--help") => {
             print!("{USAGE}");
             Ok(())

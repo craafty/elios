@@ -77,6 +77,12 @@ pub struct Process {
     /// The controlling terminal, which `/dev/tty` opens (inherited; a new
     /// session starts without one).
     pub terminal: SpinLock<Option<Arc<crate::tty::Tty>>>,
+    /// `PR_SET_NO_NEW_PRIVS`: setuid programs don't gain privileges.
+    /// Inherited, and permanent.
+    pub no_new_privileges: AtomicBool,
+    /// `PR_SET_PDEATHSIG`: the signal to get when the parent exits (0:
+    /// none). Not inherited.
+    pub death_signal: AtomicU32,
 }
 
 /// Why a process's threads are ending.
@@ -102,6 +108,14 @@ pub struct UserThread {
     /// exits, the kernel stores 0 here and wakes a futex waiter, which is
     /// how `pthread_join` learns a thread has finished.
     clear_child_tid: AtomicU64,
+    /// The system call running now (number + 1; 0 for none) and its first
+    /// arguments, for /proc/PID/syscall and /proc/PID/threads.
+    pub syscall: AtomicU64,
+    pub syscall_arguments: [AtomicU64; 3],
+    /// The user stack pointer and instruction pointer at the last system
+    /// call, for /proc/PID/stacks.
+    pub syscall_stack: AtomicU64,
+    pub syscall_rip: AtomicU64,
 }
 
 impl UserThread {
@@ -175,6 +189,8 @@ fn create(parent: Pid, group: Option<Pid>, name: &str, inherited: Inherited) -> 
         credentials: SpinLock::new(inherited.credentials),
         umask: AtomicU32::new(inherited.umask),
         terminal: SpinLock::new(inherited.terminal),
+        no_new_privileges: AtomicBool::new(false),
+        death_signal: AtomicU32::new(0),
     });
     PROCESSES.lock().insert(pid, process.clone());
     process
@@ -201,6 +217,7 @@ struct NewThread {
     frame: InterruptFrame,
     fpu: FpuState,
     fs_base: u64,
+    gs_base: u64,
     clear_child_tid: u64,
 }
 
@@ -213,6 +230,10 @@ fn start_thread(process: &Arc<Process>, new: NewThread) {
         process: process.clone(),
         signals: SpinLock::new(new.signals),
         clear_child_tid: AtomicU64::new(new.clear_child_tid),
+        syscall: AtomicU64::new(0),
+        syscall_arguments: Default::default(),
+        syscall_stack: AtomicU64::new(0),
+        syscall_rip: AtomicU64::new(0),
     });
     process.threads.lock().push(thread.clone());
     let options = Spawn {
@@ -222,6 +243,7 @@ fn start_thread(process: &Arc<Process>, new: NewThread) {
         address_space,
         fpu: new.fpu,
         fs_base: new.fs_base,
+        gs_base: new.gs_base,
     };
     let frame = new.frame;
     task::spawn_with(options, move || {
@@ -292,14 +314,18 @@ fn load_image(
     };
     let mut space = AddressSpace::new()?;
     let mut program = elf::load(&mut space, &data)?;
-    if let Some(interpreter) = &program.interpreter {
-        let inode = fs::lookup_as(&credentials, cwd, interpreter, true)?;
+    let full_path = fs::normalize(cwd, path);
+    space.name_unnamed(&full_path);
+    if let Some(interpreter) = program.interpreter.clone() {
+        let inode = fs::lookup_as(&credentials, cwd, &interpreter, true)?;
         let mut interpreter_data = vec![0; inode.metadata().size as usize];
         inode.read_at(0, &mut interpreter_data)?;
         elf::load_interpreter(&mut space, &mut program, &interpreter_data)?;
+        space.name_unnamed(&fs::normalize(cwd, &interpreter));
     }
     let stack_pointer = elf::build_stack(&mut space, &program, &arguments, environment, path, &credentials)?;
-    let path = fs::normalize(cwd, path);
+    space.set_name(stack_pointer, "[stack]".into());
+    let path = full_path;
     Ok(Image { space, entry: program.start(), stack_pointer, path, arguments, credentials })
 }
 
@@ -342,7 +368,15 @@ pub fn start(path: &str, arguments: Vec<String>) -> Result<Pid> {
     let signals = ThreadSignals::default();
     start_thread(
         &process,
-        NewThread { tid: process.pid, signals, frame, fpu: FpuState::initial(), fs_base: 0, clear_child_tid: 0 },
+        NewThread {
+            tid: process.pid,
+            signals,
+            frame,
+            fpu: FpuState::initial(),
+            fs_base: 0,
+            gs_base: 0,
+            clear_child_tid: 0,
+        },
     );
     Ok(process.pid)
 }
@@ -361,6 +395,12 @@ pub const CLONE_SETTLS: u64 = 0x8_0000;
 pub const CLONE_PARENT_SETTID: u64 = 0x10_0000;
 pub const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
 pub const CLONE_CHILD_SETTID: u64 = 0x100_0000;
+/// The flags that ask for new namespaces (mount, UTS, IPC, user, PID,
+/// network, cgroup, time). eliOS has none, and refuses them as Linux does
+/// for someone not allowed to make them: sandboxing tools like bubblewrap
+/// then know to do without.
+pub const CLONE_NEW_NAMESPACES: u64 =
+    0x2_0000 | 0x200_0000 | 0x400_0000 | 0x800_0000 | 0x1000_0000 | 0x2000_0000 | 0x4000_0000 | 0x80;
 
 /// The arguments of `clone` and `clone3` that eliOS uses.
 #[derive(Debug, Clone, Copy)]
@@ -389,6 +429,9 @@ pub fn fork(frame: &InterruptFrame) -> Result<Pid> {
 pub fn clone(frame: &InterruptFrame, args: &CloneArgs) -> Result<Pid> {
     let me = current_thread();
     let flags = args.flags;
+    if flags & CLONE_NEW_NAMESPACES != 0 {
+        return Err(Errno::EPERM);
+    }
     let mut child_frame = *frame;
     child_frame.rax = 0;
     if args.stack != 0 {
@@ -423,7 +466,18 @@ pub fn clone(frame: &InterruptFrame, args: &CloneArgs) -> Result<Pid> {
             user::write_value(args.child_tid, &tid)?;
         }
         let signals = me.signals.lock().for_new_thread();
-        start_thread(&process, NewThread { tid, signals, frame: child_frame, fpu, fs_base, clear_child_tid });
+        start_thread(
+            &process,
+            NewThread {
+                tid,
+                signals,
+                frame: child_frame,
+                fpu,
+                fs_base,
+                gs_base: syscall::user_gs_base(),
+                clear_child_tid,
+            },
+        );
         return Ok(tid);
     }
 
@@ -442,6 +496,7 @@ pub fn clone(frame: &InterruptFrame, args: &CloneArgs) -> Result<Pid> {
     *child.executable.lock() = parent.executable.lock().clone();
     *child.arguments.lock() = parent.arguments.lock().clone();
     child.trace.store(parent.trace.load(Ordering::Relaxed), Ordering::Relaxed);
+    child.no_new_privileges.store(parent.no_new_privileges.load(Ordering::Relaxed), Ordering::Relaxed);
     child.exit_signal.store(args.exit_signal, Ordering::Relaxed);
     if flags & CLONE_PARENT_SETTID != 0 {
         user::write_value(args.parent_tid, &child.pid)?;
@@ -451,7 +506,18 @@ pub fn clone(frame: &InterruptFrame, args: &CloneArgs) -> Result<Pid> {
     }
     *child.space.lock() = Some(space);
     let signals = me.signals.lock().for_child();
-    start_thread(&child, NewThread { tid: child.pid, signals, frame: child_frame, fpu, fs_base, clear_child_tid });
+    start_thread(
+        &child,
+        NewThread {
+            tid: child.pid,
+            signals,
+            frame: child_frame,
+            fpu,
+            fs_base,
+            gs_base: syscall::user_gs_base(),
+            clear_child_tid,
+        },
+    );
     Ok(child.pid)
 }
 
@@ -464,7 +530,7 @@ pub fn exec(frame: &mut InterruptFrame, path: &str, arguments: Vec<String>, envi
     let credentials = process.credentials.lock().clone();
     // A traced program can't gain privileges: tracing shows (and could
     // be used to steer) what it does. Linux does the same under ptrace.
-    let setuid_allowed = !process.trace.load(Ordering::Relaxed);
+    let setuid_allowed = !process.trace.load(Ordering::Relaxed) && !process.no_new_privileges.load(Ordering::Relaxed);
     let image = load_image(&credentials, setuid_allowed, &cwd, path, arguments, &environment)?;
     end_other_threads(&thread)?;
 
@@ -488,6 +554,7 @@ pub fn exec(frame: &mut InterruptFrame, path: &str, arguments: Vec<String>, envi
     *process.arguments.lock() = image.arguments;
     task::reset_fpu();
     syscall::set_fs_base(0);
+    syscall::set_user_gs_base(0);
     *frame = syscall::user_frame(image.entry, image.stack_pointer);
     Ok(())
 }
@@ -587,9 +654,18 @@ fn end_process(process: &Process, status: i32) {
     let space = process.space.lock().take();
     drop(space);
 
+    let mut orphans = Vec::new();
     for other in PROCESSES.lock().values() {
         if other.parent() == process.pid {
             other.parent.store(INIT, Ordering::Relaxed);
+            orphans.push(other.clone());
+        }
+    }
+    // Children that asked to be told their parent died.
+    for orphan in orphans {
+        let signal = orphan.death_signal.load(Ordering::Relaxed);
+        if signal != 0 && orphan.status.lock().is_none() {
+            send_signal(&orphan, signal);
         }
     }
     *process.status.lock() = Some(status);
@@ -790,7 +866,20 @@ pub fn handle_user_exception(frame: &mut InterruptFrame) {
         (signal, description.into(), frame.rip)
     };
     if !signal::raise_fault(&thread, signal, address) {
-        warn!("{} (pid {}): {description} at {:#x}", process.name.lock(), process.pid, frame.rip);
+        // Where it happened, as `library+offset` for addr2line or objdump.
+        let place = process.space.lock().as_ref().and_then(|space| space.describe(frame.rip));
+        let place = place.map(|(name, offset)| alloc::format!(" ({name}+{offset:#x})")).unwrap_or_default();
+        warn!(
+            "{} (pid {}): {description} at {:#x}{place}, stack {:#x}, error code {:#x}",
+            process.name.lock(),
+            process.pid,
+            frame.rip,
+            frame.rsp,
+            frame.error_code
+        );
+    } else {
+        // Handled by the program, but worth knowing about when debugging.
+        debug!("{} (pid {}): {description} at {:#x} (handled)", process.name.lock(), thread.tid(), frame.rip);
     }
     signal::fault(&thread, frame, signal, address);
 }
@@ -898,6 +987,23 @@ mod tests {
             // Three processes, two pipes, and a redirection.
             assert_eq!(shell("seq 50 | grep 5 | wc -l > /tmp/pipeline-test"), exit_status(0));
             assert_eq!(read_file("/tmp/pipeline-test").trim(), "6");
+        }
+
+        fn scripts_get_their_arguments() {
+            // "$@" keeps each argument a word of its own (launchers like
+            // Firefox's rely on it) and disappears when there are none.
+            let script = "printf \"<%s>\" \"$@\" > /tmp/args-test; echo \" $#\" >> /tmp/args-test";
+            assert_eq!(shell(&alloc::format!("echo '{script}' > /tmp/args.sh")), exit_status(0));
+            assert_eq!(shell("sh /tmp/args.sh one 'two three'"), exit_status(0));
+            assert_eq!(read_file("/tmp/args-test").trim(), "<one><two three> 2");
+            assert_eq!(shell("sh /tmp/args.sh"), exit_status(0));
+            assert_eq!(read_file("/tmp/args-test").trim(), "<> 0");
+        }
+
+        fn maps_name_what_is_mapped() {
+            assert_eq!(shell("grep stack /proc/self/maps > /tmp/maps-test"), exit_status(0));
+            assert!(read_file("/tmp/maps-test").trim_end().ends_with("[stack]"));
+            assert_eq!(shell("grep /bin/ /proc/self/maps > /dev/null"), exit_status(0));
         }
 
         fn linux_c_programs_pass_their_self_tests() {

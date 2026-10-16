@@ -190,6 +190,21 @@ int main(void) {
     close(shm);
     close(again);
 
+    /* mremap: growing a mapping keeps its contents, moving it if needed. */
+    char *small = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *blocker = mmap(small + 8192, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    strcpy(small, "kept");
+    strcpy(small + 4096, "second page");
+    char *grown = mremap(small, 8192, 1 << 20, MREMAP_MAYMOVE);
+    check("mremap grows a mapping (moving it)", grown != MAP_FAILED && grown != small);
+    check("... keeping its contents", grown != MAP_FAILED && strcmp(grown, "kept") == 0 && strcmp(grown + 4096, "second page") == 0);
+    if (grown != MAP_FAILED) {
+        grown[(1 << 20) - 1] = 1;
+        check("... and the new part is usable", mremap(grown, 1 << 20, 4096, 0) == grown && strcmp(grown, "kept") == 0);
+        munmap(grown, 4096);
+    }
+    munmap(blocker, 4096);
+
     /* Forking while another thread's system call writes to memory. */
     pthread_t reader;
     pthread_create(&reader, NULL, keep_reading, NULL);

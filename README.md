@@ -104,9 +104,23 @@ eli add foot font-dejavu      # a terminal, and a font for it
 desktop foot                  # the desktop, with a terminal in it
 ```
 
-The bar's buttons start a terminal or Firefox (`eli add firefox` first);
-Super+Enter opens a terminal, Super+Tab switches windows, Super+Q closes
-one, and Ctrl+Alt+Backspace goes back to the text console.
+The bar's buttons start a terminal or Firefox; Super+Enter opens a
+terminal, Super+Tab switches windows, Super+Q closes one, and
+Ctrl+Alt+Backspace goes back to the text console.
+
+Firefox is Alpine's, unmodified, with its multi-process design (a fork
+server, content processes, a socket process) working on eliOS's kernel.
+It needs about 4 GiB of memory in QEMU (`cargo xtask run --memory 4G`):
+
+```sh
+eli add firefox font-dejavu glycin-image-rs glycin-svg
+desktop firefox https://example.com
+```
+
+Firefox is a 100 MB download. `cargo xtask mirror` keeps Alpine's packages
+on this computer, so testing doesn't fetch them again on every boot; point
+eliOS at it with
+`echo "repositories = http://10.0.2.2:8086/alpine/v3.24/main http://10.0.2.2:8086/alpine/v3.24/community" >> /etc/system.conf`.
 
 ### On real hardware
 
@@ -214,7 +228,8 @@ may work too, but QEMU is the one eliOS is tested on.
   for the commands eliutils doesn't have.
 
 The shell has pipes, redirection (`<`, `>`, `>>`, `2>&1`), `;` `&&` `||`,
-background jobs, quoting, `$VARIABLES`, `~`, `*` wildcards, scripts, history
+background jobs, quoting, `$VARIABLES` (and a script's `$1`, `$#`, `"$@"`),
+`~`, `*` wildcards, scripts, `exec`, history
 (arrow keys) and Tab completion. Each pipeline runs in its own process group,
 so Ctrl+C interrupts the program and not the shell.
 
@@ -294,11 +309,15 @@ glyph and rebuild.
       and `/dev/input`, the I217 Ethernet, and the first stage of the
       Intel 7260 Wi-Fi driver (firmware loaded, MAC address read, radio
       calibrated) and a Bluetooth probe; next, Wi-Fi networking (scanning,
-      WPA2), Bluetooth, and a simple desktop that runs Firefox
+      WPA2), Bluetooth
 - [x] **Desktop groundwork:** copy-on-write `fork`, shared memory
       (`memfd`, `MAP_SHARED`, a page cache), `epoll`, `eventfd`,
       `timerfd`, Unix domain sockets with descriptor passing,
       pseudo-terminals, `/dev/fb0`
 - [x] **Desktop:** a Wayland compositor of eliOS's own (`desktop`), running
       Alpine's Wayland programs
-- [ ] **Next:** Firefox, sound, the camera, TLS for HTTPS
+- [x] **Firefox:** Alpine's Firefox browses HTTPS sites in the desktop
+      (package triggers, `mremap`, `statx`, `prctl` and `arch_prctl`
+      additions, `/proc/sys`, namespaces refused so sandboxes fall back)
+- [ ] **Next:** sound, the camera and microphone (for video calls), faster
+      clocks (a vDSO), Wi-Fi networking and Bluetooth on the T440p

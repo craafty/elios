@@ -20,7 +20,8 @@ use eli::{env, eprintln, println, system, term};
 
 use crate::editor::{Editor, Line};
 
-const BUILTINS: &[&str] = &["cd", "exit", "logout", "export", "unset", "history", "source", ".", "jobs", "wait"];
+const BUILTINS: &[&str] =
+    &["cd", "exit", "logout", "export", "unset", "history", "source", ".", "jobs", "wait", "exec"];
 
 pub fn main(arguments: &[String]) -> i32 {
     let mut shell = Shell::new();
@@ -439,6 +440,17 @@ impl Shell {
                     2
                 }
             },
+            // Replaces the shell with the program (launcher scripts end so).
+            "exec" => {
+                let Some(name) = argument else { return 0 };
+                let Some(path) = process::find_program(name) else {
+                    eprintln!("exec: {name}: command not found");
+                    return 127;
+                };
+                let error = process::exec(&path, &words[1..], &env::vars());
+                eprintln!("exec: {name}: {error}");
+                126
+            }
             "jobs" => {
                 for pid in &self.jobs {
                     println!("[{pid}] running");
@@ -470,6 +482,10 @@ impl Shell {
     /// removes quotes and backslashes, substitutes `$` variables and `~`,
     /// and expands unquoted wildcards (which can produce several words).
     fn expand(&self, raw: &str) -> Result<Vec<String>, String> {
+        // Words finished by `$@` (each argument is a word of its own).
+        let mut words = Vec::new();
+        // `$@` with no arguments: the word disappears if nothing else is in it.
+        let mut vanish = false;
         let mut word = String::new();
         let mut wildcard = false;
         let mut chars = raw.chars().peekable();
@@ -494,6 +510,10 @@ impl Shell {
                             }
                             None => return Err("missing closing \"".into()),
                         },
+                        Some('$') if chars.peek() == Some(&'@') => {
+                            chars.next();
+                            vanish |= self.expand_arguments(&mut word, &mut words);
+                        }
                         Some('$') => word.push_str(&self.expand_variable(&mut chars)),
                         Some(c) => word.push(c),
                         None => return Err("missing closing \"".into()),
@@ -503,6 +523,10 @@ impl Shell {
                     if let Some(c) = chars.next() {
                         word.push(c);
                     }
+                }
+                '$' if chars.peek() == Some(&'@') => {
+                    chars.next();
+                    vanish |= self.expand_arguments(&mut word, &mut words);
                 }
                 '$' => word.push_str(&self.expand_variable(&mut chars)),
                 '~' if first && matches!(chars.peek(), None | Some('/')) => {
@@ -516,13 +540,32 @@ impl Shell {
             }
             first = false;
         }
+        if vanish && words.is_empty() && word.is_empty() {
+            return Ok(Vec::new());
+        }
         if wildcard {
             let matches = expand_wildcard(&word);
             if !matches.is_empty() {
-                return Ok(matches);
+                words.extend(matches);
+                return Ok(words);
             }
         }
-        Ok(alloc::vec![word])
+        words.push(word);
+        Ok(words)
+    }
+
+    /// Expands `$@`: the script's arguments, each a word of its own (the
+    /// first joins what's before it in `word`, the last stays in `word` for
+    /// what follows). Returns whether there were none.
+    fn expand_arguments(&self, word: &mut String, words: &mut Vec<String>) -> bool {
+        let arguments = self.positional.get(1..).unwrap_or_default();
+        for (index, argument) in arguments.iter().enumerate() {
+            if index > 0 {
+                words.push(core::mem::take(word));
+            }
+            word.push_str(argument);
+        }
+        arguments.is_empty()
     }
 
     /// Expands every word and redirection target of a command.
@@ -549,6 +592,14 @@ impl Shell {
             Some('$') => {
                 chars.next();
                 process::id().to_string()
+            }
+            Some('#') => {
+                chars.next();
+                self.positional.len().saturating_sub(1).to_string()
+            }
+            Some('*') => {
+                chars.next();
+                self.positional.get(1..).unwrap_or_default().join(" ")
             }
             Some(digit @ '0'..='9') => {
                 chars.next();

@@ -1339,6 +1339,36 @@ These were all found by running real programs:
   must be saved and restored per thread and inherited by `fork`.
 - BusyBox needed `prctl(PR_SET_NAME)`, `statfs` and `sendfile`.
 
+### Running Firefox
+
+Alpine's Firefox runs unmodified. What it needed, in the order it asked:
+
+- `exec` in the shell, and `"$@"`: `/usr/bin/firefox` is a two-line
+  script, `exec /usr/lib/firefox/firefox "$@"`.
+- Package **triggers** (section 22): GTK's image loaders cache.
+- `fallocate` (shared memory in `/dev/shm`), `mremap`, `statx`,
+  `close_range`, `membarrier`, `preadv2`/`pwritev2`, `capget`, the
+  scheduler queries, `readahead` and `fadvise64` (accepted as hints).
+- `prctl`: `PR_SET_NO_NEW_PRIVS`, `PR_SET_PDEATHSIG` (a child gets a
+  signal when its parent dies; GLib's image loaders use it), and
+  `PR_CAPBSET_READ`. `PR_SET_NAME` names the calling thread, not the
+  process, unless it's the main thread.
+- `arch_prctl(ARCH_SET_GS)`: WebAssembly code compiled to native code
+  addresses its memory through the GS segment. The GS base is saved per
+  thread, like FS, in `IA32_KERNEL_GS_BASE` while in user mode.
+- **Namespaces are refused** with `EPERM` (`unshare`, and `clone` with
+  `CLONE_NEW*` flags). `bwrap` and Firefox's sandbox then fall back to
+  running unsandboxed, as they do on Linux systems that disable
+  unprivileged namespaces.
+- `/proc/sys/kernel/overflowuid` and the other `/proc/sys` files.
+- A non-blocking `pipe2` (see Pipes).
+
+Firefox starts about a dozen processes through its fork server: the
+parent, a socket process, extensions, a graphics decoder (RDD), and
+content processes. It draws with software WebRender into `wl_shm` buffers.
+TLS is Firefox's own (NSS), so HTTPS needs nothing from the kernel beyond
+TCP.
+
 ### Tracing
 
 `strace <program>` (in eliutils) turns on a per-process tracing flag (an
@@ -1347,6 +1377,12 @@ with its first three arguments and result (with error names). The flag is
 inherited by children and kept across `exec`. Unimplemented calls are also
 logged by name at debug level. These two tools are how every compatibility
 gap above was found.
+
+A program that dies of a fault the kernel reports where:
+`glxtest (pid 35): general protection fault at 0x6ffffbf5711c
+(/usr/lib/libX11-xcb.so.1+0x111c), stack ..., error code 0x0`, an offset
+`objdump` or `addr2line` can look up. For programs that hang, see
+`/proc/PID/threads` and `/proc/PID/stacks` (section 16).
 
 ## 16. Files
 
@@ -1426,12 +1462,26 @@ layout) sets the variable; deleting it deletes the variable.
 `/proc` follows Linux's layout because programs read it: `meminfo`,
 `uptime`, `cpuinfo`, `stat`, `mounts`, `partitions`, `filesystems`,
 `version`, `loadavg`, and per
-process `exe`, `cwd`, `cmdline`, `status`, `stat`, `maps` and `fd/`. Files are
+process `exe`, `cwd`, `cmdline`, `status`, `stat`, `syscall`, `maps` and
+`fd/`. `maps` names what's mapped (the file, `[stack]`, `[heap]`) with its
+offset, as Linux does. `/proc/sys` has the settings programs read:
+`kernel/hostname`, `osrelease`, `overflowuid`, `pid_max`,
+`random/boot_id` and `uuid`, `vm/overcommit_memory`, and
+`user/max_user_namespaces` = 0, which tells sandboxes not to try. Files are
 generated when first read and the result is kept for that open file. A bug
 showed why: `cat /proc/self/maps` reads in chunks, and `cat`'s own
 allocations changed its memory map between reads, so regenerated content
 shifted under the read position and lines appeared repeated. Like Linux,
 `/proc` files report size 0.
+
+Two files are eliOS's own, for finding where a program is stuck:
+`threads` lists each thread with its name and the system call it's in, and
+`stacks` adds where each call came from and the return addresses found on
+the thread's user stack, as `library+offset`. Programs rarely keep frame
+pointers, so `stacks` scans the stack for words that point into executable
+areas; that has false entries, but the real callers are there. With a
+distribution's debug symbols (`firefox-dbg` from Alpine), `addr2line -f -C
+-e libxul.so.debug OFFSET` on the host names them.
 
 ### Pipes
 
@@ -1439,7 +1489,10 @@ A 64 KiB buffer with reader and writer counts. Readers block while empty
 (end of file once all writers are gone); writers block while full and get
 `EPIPE` plus SIGPIPE when no readers remain, which is how `yes | head` ends.
 Each end is one open file, so `dup` and `fork` share it rather than
-counting twice.
+counting twice. `pipe2` takes `O_NONBLOCK` and `O_CLOEXEC`: ignoring
+`O_NONBLOCK` once froze Firefox, whose child-process watcher drains its
+signal pipe until `EAGAIN`; the read blocked instead, on the thread that
+carries all of Firefox's inter-process messages.
 
 ### poll and select
 
@@ -2427,6 +2480,22 @@ answers an unknown command with the package that has it ("vim isn't
 installed; it's in the vim package: sudo eli add vim"), from the cached
 indexes' `cmd:` entries.
 
+### Package scripts and triggers
+
+Alpine's packages can carry scripts (`.pre-install`, `.post-install`,
+...) and a **trigger**: a script plus directories it watches, run after
+any package changes them. eli keeps them in the store, in each package's
+`.eli-scripts`. Install scripts mostly create users and directories that
+eli manages itself, so they aren't run. Triggers rebuild caches from what
+other packages put in shared directories (GTK's image loaders, GLib's
+settings schemas, fonts, MIME types), so activation runs every trigger
+whose directories exist, with BusyBox's `sh` (they're written for it).
+What they print goes to `/run/eli/triggers.log`. Since the system is
+assembled anew at every activation, they run every time.
+
+`/etc/machine-id` (D-Bus and GLib want one) is made once, in
+`/data/etc`, and linked in.
+
 ### What it took from the kernel
 
 Alpine's vim needed POSIX timers: `timer_create`, `timer_settime` and
@@ -2495,7 +2564,19 @@ the shell (waiting for each prompt, `#` or `$`), can wait for text to
 appear (`@wait Password:`), press keys through the QEMU monitor and take
 screenshots, then prints a clean transcript. Boot counts as done at a
 shell prompt or a login prompt. It's how end-to-end behavior is checked
-without a person typing.
+without a person typing. `@timeout SECONDS` changes how long the following
+steps may take (installing Firefox takes minutes).
+
+### The package mirror (`xtask/src/mirror.rs`)
+
+`cargo xtask mirror` serves Alpine's repositories on port 8086 from
+`target/alpine-cache/`, fetching each file from Alpine's CDN the first time
+(package lists are refreshed daily). QEMU's guest reaches the host as
+10.0.2.2, so a test session adds
+`http://10.0.2.2:8086/alpine/v3.24/main` (and `community`) to
+`system.conf` and installs Firefox in seconds instead of downloading
+100 MB again. eli checks Alpine's signatures, so the mirror isn't
+trusted.
 
 ## 24. Testing
 
