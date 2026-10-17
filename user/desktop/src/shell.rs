@@ -23,6 +23,8 @@ use crate::sys;
 use crate::wire::Event;
 
 pub const BAR_HEIGHT: i32 = 28;
+/// The size of the bar's text, in pixels per em.
+pub const FONT_SIZE: f32 = 15.0;
 const BACKGROUND_TOP: u32 = 0xFF16_1E3A;
 const BACKGROUND_BOTTOM: u32 = 0xFF0B_1026;
 const BAR_COLOR: u32 = 0xFF0B_1026;
@@ -80,11 +82,11 @@ pub struct Desktop {
 }
 
 impl Desktop {
-    pub fn new(screen: Screen) -> Self {
+    pub fn new(screen: Screen, font: Font) -> Self {
         let pointer = (f64::from(screen.width) / 2.0, f64::from(screen.height) / 2.0);
         Self {
             screen,
-            font: Font::load(),
+            font,
             clients: BTreeMap::new(),
             windows: Vec::new(),
             popups: Vec::new(),
@@ -579,20 +581,20 @@ impl Desktop {
         self.screen.fill(bar, BAR_COLOR);
         self.screen.fill(Rect::new(0, BAR_HEIGHT - 1, width, 1), BAR_LINE);
         self.bar.clear();
-        let text_y = (BAR_HEIGHT - 16) / 2;
-        self.screen.text(&self.font, 10, text_y, "eliOS", TEXT, clip);
-        let mut x = 64;
+        let text_y = (BAR_HEIGHT - self.font.line_height) / 2;
+        self.screen.text(&mut self.font, 10, text_y, "eliOS", TEXT, clip);
+        let mut x = 10 + self.font.width("eliOS") + 12;
         for (label, launcher) in [("Terminal", Launcher::Terminal), ("Firefox", Launcher::Browser)] {
-            let rect = Rect::new(x, 4, label.len() as i32 * 8 + 16, BAR_HEIGHT - 8);
+            let rect = Rect::new(x, 4, self.font.width(label) + 16, BAR_HEIGHT - 8);
             self.screen.fill(rect, BUTTON);
-            self.screen.text(&self.font, x + 8, text_y, label, TEXT, clip);
+            self.screen.text(&mut self.font, x + 8, text_y, label, TEXT, clip);
             self.bar.push((rect, BarItem::Launch(launcher)));
             x += rect.width + 8;
         }
         x += 16;
         // A tab per window (dialogs belong to their parents).
         let windows: Vec<SurfaceRef> = self.windows.iter().copied().filter(|&w| !self.is_dialog(w)).collect();
-        let clock_width = 6 * 8 + 16;
+        let clock_width = self.font.width("00:00") + 24;
         let space = (width - x - clock_width).max(0);
         let tab_width = if windows.is_empty() { 0 } else { (space / windows.len() as i32).min(240) };
         for window in windows {
@@ -604,17 +606,20 @@ impl Desktop {
                 && self.windows.last().is_some_and(|&top| top == window || self.is_dialog(top));
             let rect = Rect::new(x, 4, tab_width - 6, BAR_HEIGHT - 8);
             self.screen.fill(rect, if focused { HIGHLIGHT } else { BUTTON });
-            let room = ((rect.width - 32) / 8).max(0) as usize;
-            let shown: String = title.chars().take(room).collect();
-            self.screen.text(&self.font, x + 8, text_y, &shown, if focused { TEXT } else { DIM_TEXT }, clip);
+            let room = rect.width - 32;
+            let mut shown = title;
+            while self.font.width(&shown) > room {
+                shown.pop();
+            }
+            self.screen.text(&mut self.font, x + 8, text_y, &shown, if focused { TEXT } else { DIM_TEXT }, clip);
             let close = Rect::new(rect.x + rect.width - 20, 4, 18, BAR_HEIGHT - 8);
-            self.screen.text(&self.font, close.x + 5, text_y, "x", DIM_TEXT, clip);
+            self.screen.text(&mut self.font, close.x + 5, text_y, "x", DIM_TEXT, clip);
             self.bar.push((close, BarItem::Close(window)));
             self.bar.push((rect, BarItem::Window(window)));
             x += tab_width;
         }
         let clock = self.clock.clone();
-        self.screen.text(&self.font, width - clock_width + 8, text_y, &clock, TEXT, clip);
+        self.screen.text(&mut self.font, width - clock_width + 8, text_y, &clock, TEXT, clip);
     }
 
     fn cursor_rect(&self) -> Rect {

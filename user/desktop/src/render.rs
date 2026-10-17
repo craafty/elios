@@ -5,6 +5,9 @@
 //! ARGB8888 and XRGB8888 buffers hold and what the framebuffer takes
 //! (blue in the lowest byte).
 
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -192,24 +195,36 @@ impl Screen {
         }
     }
 
-    /// Draws text in the console font, `color` on whatever is there.
-    pub fn text(&mut self, font: &Font, x: i32, y: i32, text: &str, color: u32, clip: Rect) {
-        let mut pen = x;
+    /// Draws `text` with its top-left corner at (`x`, `y`), in `color`
+    /// over whatever is there.
+    pub fn text(&mut self, font: &mut Font, x: i32, y: i32, text: &str, color: u32, clip: Rect) {
+        let clip = clip.intersect(&self.bounds());
+        let baseline = y + font.ascent;
+        let mut pen = x as f32;
         for c in text.chars() {
-            let glyph = font.glyph(c);
-            for (row, bits) in glyph.iter().enumerate() {
-                for column in 0..8 {
-                    if bits & (0x80 >> column) != 0 {
-                        let (px, py) = (pen + column, y + row as i32);
-                        if clip.contains(px, py) && self.bounds().contains(px, py) {
-                            self.back[(py * self.width + px) as usize] = color;
-                        }
+            let (glyph, advance) = font.glyph(c);
+            let left = pen as i32 + glyph.left;
+            let top = baseline - glyph.top;
+            for row in 0..glyph.height {
+                let py = top + row as i32;
+                for column in 0..glyph.width {
+                    let px = left + column as i32;
+                    let coverage = u32::from(glyph.coverage[row * glyph.width + column]);
+                    if coverage != 0 && clip.contains(px, py) {
+                        let out = &mut self.back[(py * self.width + px) as usize];
+                        *out = blend(*out, premultiply(color, coverage), coverage);
                     }
                 }
             }
-            pen += 8;
+            pen += *advance;
         }
     }
+}
+
+/// `color` at `alpha` (0 to 255), premultiplied as `blend` wants it.
+fn premultiply(color: u32, alpha: u32) -> u32 {
+    let channel = |shift: u32| (((color >> shift & 0xFF) * alpha + 127) / 255) << shift;
+    alpha << 24 | channel(16) | channel(8) | channel(0)
 }
 
 /// `over` drawn on `under`, with `over`'s (premultiplied) alpha `a`.
@@ -222,38 +237,45 @@ fn blend(under: u32, over: u32, a: u32) -> u32 {
     0xFF00_0000 | channel(16) | channel(8) | channel(0)
 }
 
-/// eliOS's 8x16 console font, parsed from the kernel's source.
+/// The font the desktop writes with (the system's TrueType font at one
+/// size), with each glyph rasterized the first time it's drawn.
 pub struct Font {
-    glyphs: Vec<(char, [u8; 16])>,
-    fallback: [u8; 16],
+    face: truetype::Font,
+    size: f32,
+    /// From the top of a line to its baseline, in pixels.
+    pub ascent: i32,
+    pub line_height: i32,
+    glyphs: BTreeMap<char, (truetype::Bitmap, f32)>,
 }
 
+pub const FONT_PATH: &str = "/usr/share/fonts/dejavu/DejaVuSansMono.ttf";
+
 impl Font {
-    pub fn load() -> Self {
-        let source = include_str!("../../../kernel/font/eli-8x16.txt");
-        let mut glyphs = Vec::new();
-        let mut fallback = [0u8; 16];
-        let mut lines = source.lines().peekable();
-        while let Some(line) = lines.next() {
-            let Some(name) = line.strip_prefix("glyph ") else { continue };
-            let mut rows = [0u8; 16];
-            for row in &mut rows {
-                let Some(line) = lines.next() else { break };
-                *row = line.bytes().take(8).fold(0, |bits, b| bits << 1 | u8::from(b == b'#'));
-            }
-            if name == "fallback" {
-                fallback = rows;
-            } else if let Some(code) = name.strip_prefix("U+").and_then(|rest| rest.split_whitespace().next())
-                && let Some(c) = u32::from_str_radix(code, 16).ok().and_then(char::from_u32)
-            {
-                glyphs.push((c, rows));
-            }
-        }
-        Self { glyphs, fallback }
+    pub fn load(size: f32) -> Result<Self, String> {
+        let data = eli::fs::read(FONT_PATH).map_err(|error| format!("can't read {FONT_PATH}: {error}"))?;
+        let face = truetype::Font::parse(data).map_err(|error| format!("{FONT_PATH}: {error:?}"))?;
+        let metrics = face.line_metrics(size);
+        Ok(Self {
+            ascent: metrics.ascent as i32 + 1,
+            line_height: metrics.height() as i32 + 1,
+            face,
+            size,
+            glyphs: BTreeMap::new(),
+        })
     }
 
-    fn glyph(&self, c: char) -> &[u8; 16] {
-        self.glyphs.iter().find(|(glyph, _)| *glyph == c).map_or(&self.fallback, |(_, rows)| rows)
+    /// `c`'s bitmap and advance.
+    fn glyph(&mut self, c: char) -> &(truetype::Bitmap, f32) {
+        let (face, size) = (&self.face, self.size);
+        self.glyphs.entry(c).or_insert_with(|| {
+            let glyph = face.glyph_index(c);
+            (face.rasterize(glyph, size), face.advance(glyph, size))
+        })
+    }
+
+    /// How wide `text` is, in pixels.
+    pub fn width(&mut self, text: &str) -> i32 {
+        text.chars().map(|c| self.glyph(c).1).sum::<f32>() as i32
     }
 }
 

@@ -1,0 +1,8 @@
+[package]
+name = "truetype"
+version.workspace = true
+edition.workspace = true
+
+# TrueType fonts: reading the tables and turning outlines into
+# anti-aliased bitmaps. Used by the desktop and its programs.
+[dependencies]

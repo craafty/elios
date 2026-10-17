@@ -2607,12 +2607,52 @@ It's one event loop around `epoll`, with a 60 Hz timer for redrawing.
   client under it sets one.
 - **Drawing** (`render.rs`): into a back buffer, blending surfaces with
   alpha, and only the damaged part is copied to the screen (video memory is
-  slow to read, so it's only written). The bar's text uses the console's
-  font, read from the kernel's source.
+  slow to read, so it's only written). Text is the system's TrueType
+  font (below), each character rasterized once and kept, and blended onto
+  the background by its coverage.
 
 Shortcuts: Super+Enter a terminal, Super+F Firefox, Super+Tab the next
 window, Super+Q closes the front one, Ctrl+Alt+Backspace quits back to the
 text console. `desktop PROGRAM` starts a program once it's up.
+
+### Fonts (`truetype/`)
+
+The desktop and its programs write with a TrueType font, read and
+rasterized by eliOS's own code: one font file ships,
+`/usr/share/fonts/dejavu/DejaVuSansMono.ttf` (DejaVu Sans Mono, with its
+licence beside it). It's monospaced so the terminal can use it as well as
+the bar and menus; the `truetype` crate reads any TrueType font, so adding
+a proportional one later is just another file.
+
+- **Reading** (`lib.rs`): the tables needed to draw are `head` (units per
+  em, `loca`'s format), `maxp` (glyph count), `cmap` (character to glyph:
+  format 12 for all of Unicode, else format 4's segments, both binary
+  searched), `hhea`/`hmtx` (line height and advances), and `loca`/`glyf`
+  (the outlines). A simple glyph's points are stored as flags plus
+  delta-encoded coordinates; two control points in a row imply an
+  on-curve point between them. Composite glyphs (most accented letters)
+  are other glyphs with an offset and maybe a scale or 2x2 matrix, nested
+  at most 8 deep. Every read is bounds-checked: a broken font draws
+  nothing rather than crashing the desktop.
+- **Rasterizing** (`raster.rs`): curves are flattened into lines (more
+  pieces the more they bend), and each line adds the exact signed area it
+  cuts off in every pixel it crosses to an accumulation buffer; a running
+  sum then turns that into each pixel's coverage. That's exact
+  anti-aliasing with one pass over the lines and one over the pixels, no
+  sampling or edge sorting. The sum runs on across row ends because every
+  row's areas cancel out.
+- **No hinting**: fonts' bytecode programs that snap outlines to the pixel
+  grid are skipped. Grayscale anti-aliasing reads well at the sizes and
+  densities used (15 px on a 1080p laptop), and an interpreter would be
+  larger than the rest put together.
+- `core` has no `floor`, `ceil` or `sqrt` for floats (`std` gets them from
+  the C library), so `raster.rs` has small versions of its own.
+
+Tests (`cargo test -p truetype`) check the bundled font's metrics,
+character map, closed outlines and composites, and the rasterizer against
+shapes whose coverage is known exactly (a half-pixel-shifted square, a
+diagonal); `TRUETYPE_SAMPLE=out.pgm` also writes a sample of text to look
+at.
 
 ### Linux programs
 

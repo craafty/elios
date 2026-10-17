@@ -6,3 +6,4 @@ edition.workspace = true
 # eliOS's desktop: a Wayland compositor that draws on the framebuffer.
 [dependencies]
 eli = { path = "../eli" }
+truetype = { path = "../../truetype" }

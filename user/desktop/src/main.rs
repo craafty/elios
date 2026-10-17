@@ -29,9 +29,9 @@ use alloc::vec::Vec;
 
 use eli::{eprintln, println};
 
-use crate::render::Screen;
+use crate::render::{Font, Screen};
 use crate::server::Client;
-use crate::shell::Desktop;
+use crate::shell::{Desktop, FONT_SIZE};
 
 eli::main!(main);
 
@@ -63,6 +63,14 @@ struct InputDevice {
 
 fn main() -> i32 {
     let arguments = eli::env::args();
+    // Before taking over the screen, so the message can be read.
+    let font = match Font::load(FONT_SIZE) {
+        Ok(font) => font,
+        Err(error) => {
+            eprintln!("desktop: {error}");
+            return 1;
+        }
+    };
     let screen = match Screen::open() {
         Ok(screen) => screen,
         Err(error) => {
@@ -98,7 +106,7 @@ fn main() -> i32 {
     };
     let _ = epoll.add(timer, TOKEN_TIMER);
 
-    let mut desktop = Desktop::new(screen);
+    let mut desktop = Desktop::new(screen, font);
     let mut devices: Vec<InputDevice> = Vec::new();
     let mut ticks = 0u64;
     scan_devices(&mut devices, &epoll);

@@ -264,11 +264,15 @@ and ext2 crates also have host unit tests (`cargo test -p fat -p ext2`); the
 ext2 tests check every volume they make with Linux's `e2fsck`. The `tls`
 crate's tests (`cargo test -p tls`) talk to `openssl s_server`, and, with
 `RADIUS_SERVER=host:port` set, sign in to a FreeRADIUS server over PEAP.
+The `truetype` crate's (`cargo test -p truetype`) check the bundled font
+and the rasterizer against shapes whose coverage is known exactly.
 
 ### The font
 
 The console font is drawn as ASCII art in `kernel/font/eli-8x16.txt`; edit a
-glyph and rebuild.
+glyph and rebuild. The desktop uses a TrueType font instead, DejaVu Sans
+Mono (`rootfs/usr/share/fonts/dejavu/`, with its licence), drawn by
+eliOS's own rasterizer in `truetype/`.
 
 ## Layout
 
@@ -282,6 +286,7 @@ glyph and rebuild.
 | `ext2/`         | ext2, shared by the kernel, `mkfs` and the installer         |
 | `apk/`          | Alpine's package format: gzip, tar, hashes, RSA, indexes      |
 | `tls/`          | TLS 1.2 client and PEAP/MS-CHAPv2, for enterprise Wi-Fi       |
+| `truetype/`     | TrueType fonts: reading and anti-aliased rasterizing          |
 | `user/eli/`     | libeli, the runtime for eliOS's Rust programs                |
 | `user/utils/`   | eliutils: shell, init, editor and commands                   |
 | `user/c/`       | C test programs built with the host's toolchain              |
@@ -330,6 +335,10 @@ glyph and rebuild.
       pseudo-terminals, `/dev/fb0`
 - [x] **Desktop:** a Wayland compositor of eliOS's own (`desktop`), running
       Alpine's Wayland programs
+- [ ] **Our own desktop programs:** a login screen with a Text/Desktop
+      choice (done), a TrueType rasterizer and bundled font (done), then
+      a widget library, a graphical terminal, a file explorer, a
+      clipboard and an app menu (Firefox appears once it's added)
 - [x] **Firefox:** Alpine's Firefox browses HTTPS sites in the desktop
       (package triggers, `mremap`, `statx`, `prctl` and `arch_prctl`
       additions, `/proc/sys`, namespaces refused so sandboxes fall back),
