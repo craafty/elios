@@ -24,6 +24,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::ptr;
 
+use super::commands::TxFrame;
 use super::firmware::{SEPARATOR_CPU1_CPU2, SEPARATOR_PAGING, Section};
 use crate::drivers::dma::DmaBuffer;
 use crate::memory::{self, CacheType, PAGE_SIZE};
@@ -67,7 +68,9 @@ const FH_RSCSR_CHNL0_RDPTR: u32 = 0x1BCC;
 const FH_MEM_RCSR_CHNL0_CONFIG: u32 = 0x1C00;
 const FH_MEM_RCSR_CHNL0_RBDCB_WPTR: u32 = 0x1C08;
 const FH_MEM_RCSR_CHNL0_FLUSH_RB_REQ: u32 = 0x1C10;
+const FH_MEM_RSSR_RX_STATUS: u32 = 0x1C44;
 const FH_TX_CHICKEN_BITS: u32 = 0x1E98;
+const FH_TSSR_TX_STATUS: u32 = 0x1EB0;
 
 const fn fh_tcsr_config(channel: u32) -> u32 {
     0x1D00 + 0x20 * channel
@@ -88,6 +91,7 @@ const fn fh_queue_base(queue: u32) -> u32 {
 
 // Periphery registers.
 const APMG_CLK_EN: u32 = 0x3004;
+const APMG_CLK_DIS: u32 = 0x3008;
 const APMG_PS_CTRL: u32 = 0x300C;
 const APMG_PCIDEV_STT: u32 = 0x3010;
 const APMG_RTC_INT_STT: u32 = 0x301C;
@@ -125,6 +129,8 @@ const GP_CNTRL_GOING_TO_SLEEP: u32 = 0x10;
 /// Set while the radio is allowed on (no hardware kill switch engaged).
 pub const GP_CNTRL_RF_KILL_OFF: u32 = 0x0800_0000;
 const RESET_SW_RESET: u32 = 0x80;
+const RESET_STOP_MASTER: u32 = 0x100;
+const RESET_MASTER_DISABLED: u32 = 0x200;
 const INT_FH_RX: u32 = 1 << 31;
 const INT_HW_ERROR: u32 = 1 << 29;
 const INT_FH_TX: u32 = 1 << 27;
@@ -147,6 +153,8 @@ const TFD_SIZE: usize = 128;
 /// The first buffer of a command TFD is at most this long (the card may
 /// write to it).
 const FIRST_BUFFER_LEN: usize = 20;
+const COMMAND_HEADER_LEN: usize = 4;
+const TX_PARAMETERS_LEN: usize = 56;
 /// Byte count tables: 256 entries plus 64 duplicated, 2 bytes each.
 const BYTE_COUNT_ENTRIES: usize = 320;
 
@@ -179,6 +187,9 @@ pub enum Error {
     /// The firmware reported an error or crashed.
     Firmware(&'static str),
     NoMemory,
+    /// A transmit queue is full (the frame is dropped, as a busy network
+    /// would).
+    QueueFull,
 }
 
 /// A transmit queue: its TFD ring and a buffer per slot for what the TFDs
@@ -187,6 +198,9 @@ struct TxQueue {
     tfds: DmaBuffer,
     buffers: Vec<Option<DmaBuffer>>,
     write: usize,
+    /// The oldest slot the card hasn't finished with (data queues only:
+    /// commands are answered in order, one at a time).
+    read: usize,
 }
 
 pub struct Transport {
@@ -214,7 +228,7 @@ impl Transport {
         let mut queues = Vec::new();
         for _ in 0..QUEUE_COUNT {
             let tfds = dma(TFD_COUNT * TFD_SIZE / PAGE_SIZE as usize, 1)?;
-            queues.push(TxQueue { tfds, buffers: (0..TFD_COUNT).map(|_| None).collect(), write: 0 });
+            queues.push(TxQueue { tfds, buffers: (0..TFD_COUNT).map(|_| None).collect(), write: 0, read: 0 });
         }
         let mut rx_buffers = Vec::new();
         for _ in 0..RX_COUNT {
@@ -442,6 +456,7 @@ impl Transport {
         self.write(FH_KW_MEM_ADDR, (self.keep_warm.phys >> 4) as u32);
         for index in 0..self.queues.len() {
             self.queues[index].write = 0;
+            self.queues[index].read = 0;
             self.write(fh_queue_base(index as u32), (self.queues[index].tfds.phys >> 8) as u32);
         }
         // Automatic queue activation, and all 31 queues.
@@ -571,25 +586,145 @@ impl Transport {
         }
         let buffer = queue.buffers[slot].as_ref().expect("allocated above");
         buffer.write_bytes(0, &bytes);
-        let tfd = slot * TFD_SIZE;
-        for offset in (0..TFD_SIZE).step_by(4) {
-            queue.tfds.write32(tfd + offset, 0);
-        }
         let first = bytes.len().min(FIRST_BUFFER_LEN);
         let mut pieces = alloc::vec![(buffer.phys, first)];
         if bytes.len() > first {
             pieces.push((buffer.phys + first as u64, bytes.len() - first));
         }
-        for (index, &(phys, len)) in pieces.iter().enumerate() {
-            let entry = tfd + 4 + index * 6;
-            queue.tfds.write32(entry, phys as u32);
-            queue.tfds.write16(entry + 4, ((phys >> 32) as u16 & 0xF) | (len as u16) << 4);
-        }
-        queue.tfds.write8(tfd + 3, pieces.len() as u8);
+        write_tfd(&queue.tfds, slot, &pieces);
         queue.write = (slot + 1) % TFD_COUNT;
         let write = queue.write as u32;
         self.write(HBUS_TARG_WRPTR, write | COMMAND_QUEUE << 8);
         Ok(sequence)
+    }
+
+    /// Readies data queue `queue` for frames starting at sequence number
+    /// `ssn`, and returns the sequence number to tell the firmware (with
+    /// the SCD_QUEUE_CFG command, which connects it to a station).
+    pub fn enable_queue(&mut self, queue: u32, ssn: u16) -> u16 {
+        let state = &mut self.queues[queue as usize];
+        let mut ssn = ssn;
+        // The 7000 family's scheduler gets stuck if its write pointer
+        // jumps by a multiple of 64; Linux steps over this the same way.
+        let write = state.write as u16;
+        if ssn.wrapping_sub(write) & 0x3F == 0 && ssn != write {
+            ssn += 1;
+        }
+        state.write = usize::from(ssn & 0xFF);
+        state.read = state.write;
+        self.write(HBUS_TARG_WRPTR, u32::from(ssn & 0xFF) | queue << 8);
+        ssn
+    }
+
+    /// Queues an 802.11 frame (`header` then `body`) on a data queue,
+    /// behind a TX command built from `frame` (its length and scratch
+    /// address are filled in here). Returns the slot it took.
+    pub fn transmit(&mut self, queue: u32, mut frame: TxFrame, header: &[u8], body: &[u8]) -> Result<usize, Error> {
+        let queue_index = queue as usize;
+        let slot = self.queues[queue_index].write;
+        if (slot + 1) % TFD_COUNT == self.queues[queue_index].read {
+            return Err(Error::QueueFull);
+        }
+        // The command header and TX parameters, then the 802.11 header
+        // padded to 4 bytes, then the body, all in one page.
+        let header_end = (COMMAND_HEADER_LEN + TX_PARAMETERS_LEN + header.len()).next_multiple_of(4);
+        if header_end + body.len() > PAGE_SIZE as usize {
+            return Err(Error::Firmware("frame too long"));
+        }
+        let state = &mut self.queues[queue_index];
+        if state.buffers[slot].is_none() {
+            state.buffers[slot] = Some(DmaBuffer::new(1, 1).ok_or(Error::NoMemory)?);
+        }
+        let buffer = state.buffers[slot].as_ref().expect("allocated above");
+        frame.len = (header.len() + body.len()) as u16;
+        frame.scratch = buffer.phys + COMMAND_HEADER_LEN as u64 + 8;
+        if header_end != COMMAND_HEADER_LEN + TX_PARAMETERS_LEN + header.len() {
+            frame.flags |= super::commands::TX_PADDED_HEADER;
+        }
+        let station = frame.station;
+        let sequence = (queue as u16) << 8 | slot as u16;
+        let mut bytes = Vec::with_capacity(header_end);
+        bytes.extend_from_slice(&[super::commands::TX, 0]);
+        bytes.extend_from_slice(&sequence.to_le_bytes());
+        bytes.extend_from_slice(&super::commands::tx_parameters(&frame));
+        bytes.extend_from_slice(header);
+        bytes.resize(header_end, 0);
+        buffer.write_bytes(0, &bytes);
+        buffer.write_bytes(header_end, body);
+        let mut pieces = alloc::vec![
+            (buffer.phys, FIRST_BUFFER_LEN),
+            (buffer.phys + FIRST_BUFFER_LEN as u64, header_end - FIRST_BUFFER_LEN),
+        ];
+        if !body.is_empty() {
+            pieces.push((buffer.phys + header_end as u64, body.len()));
+        }
+        write_tfd(&state.tfds, slot, &pieces);
+
+        // The scheduler's byte count for the slot: the frame, its checksum
+        // and delimiter, in 4-byte units, and the station. The first 64
+        // entries are repeated after the 256 (the scheduler reads past the
+        // end of the ring).
+        let count = (usize::from(frame.len) + 8).div_ceil(4) as u16 | u16::from(station) << 12;
+        let entry = (queue_index * BYTE_COUNT_ENTRIES + slot) * 2;
+        self.byte_counts.write16(entry, count);
+        if slot < BYTE_COUNT_ENTRIES - TFD_COUNT {
+            self.byte_counts.write16(entry + TFD_COUNT * 2, count);
+        }
+        let write = (slot + 1) % TFD_COUNT;
+        self.queues[queue_index].write = write;
+        self.write(HBUS_TARG_WRPTR, write as u32 | queue << 8);
+        Ok(slot)
+    }
+
+    /// Frees slots of a data queue up to and including `slot` (the card
+    /// reported it sent them).
+    pub fn reclaim(&mut self, queue: u32, slot: usize) {
+        if let Some(state) = self.queues.get_mut(queue as usize) {
+            state.read = (slot + 1) % TFD_COUNT;
+        }
+    }
+
+    /// Stops the card (its DMA, then its processor) so another firmware
+    /// image can be loaded, and forgets everything queued.
+    pub fn stop(&mut self) {
+        self.write(CSR_INT_MASK, 0);
+        self.write(CSR_INT, 0xFFFF_FFFF);
+        if self.grab_nic_access().is_ok() {
+            self.write_prph(SCD_TXFACT, 0);
+            for channel in 0..8 {
+                self.write(fh_tcsr_config(channel), 0);
+            }
+            let idle = 0xFF << 16;
+            if !self.poll(FH_TSSR_TX_STATUS, idle, idle, 5000) {
+                debug!("wifi: transmit DMA didn't stop: {:#x}", self.read(FH_TSSR_TX_STATUS));
+            }
+            self.write(FH_MEM_RCSR_CHNL0_CONFIG, 0);
+            if !self.poll(FH_MEM_RSSR_RX_STATUS, 1 << 24, 1 << 24, 1000) {
+                debug!("wifi: receive DMA didn't stop: {:#x}", self.read(FH_MEM_RSSR_RX_STATUS));
+            }
+            self.write_prph(APMG_CLK_DIS, 0x200);
+            time::delay_us(5);
+        }
+        self.write(CSR_GP_CNTRL, self.read(CSR_GP_CNTRL) & !GP_CNTRL_MAC_ACCESS_REQ);
+        self.set_bits(CSR_RESET, RESET_STOP_MASTER);
+        if !self.poll(CSR_RESET, RESET_MASTER_DISABLED, RESET_MASTER_DISABLED, 100) {
+            debug!("wifi: the card's bus master didn't stop");
+        }
+        self.set_bits(CSR_RESET, RESET_SW_RESET);
+        time::delay_us(10);
+        self.write(CSR_GP_CNTRL, self.read(CSR_GP_CNTRL) & !GP_CNTRL_INIT_DONE);
+        self.pending.clear();
+        self.rx_status.zero();
+        self.byte_counts.zero();
+        for buffer in &self.rx_buffers {
+            buffer.zero();
+        }
+    }
+
+    /// The next packet from the card, if any (call [`Self::poll_events`]
+    /// first).
+    pub fn next_packet(&mut self) -> Option<Packet> {
+        self.pending.pop_front()
     }
 
     /// Checks the interrupt status and the receive ring, keeping any
@@ -675,4 +810,18 @@ impl Transport {
             task::sleep_ms(1);
         }
     }
+}
+
+/// Fills in a TFD: the buffers it points at (address and length).
+fn write_tfd(tfds: &DmaBuffer, slot: usize, pieces: &[(u64, usize)]) {
+    let tfd = slot * TFD_SIZE;
+    for offset in (0..TFD_SIZE).step_by(4) {
+        tfds.write32(tfd + offset, 0);
+    }
+    for (index, &(phys, len)) in pieces.iter().enumerate() {
+        let entry = tfd + 4 + index * 6;
+        tfds.write32(entry, phys as u32);
+        tfds.write16(entry + 4, ((phys >> 32) as u16 & 0xF) | (len as u16) << 4);
+    }
+    tfds.write8(tfd + 3, pieces.len() as u8);
 }

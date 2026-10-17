@@ -109,6 +109,7 @@ pub struct Counters {
 }
 
 struct Interface {
+    name: &'static str,
     device: Arc<dyn NetDevice>,
     mac: [u8; 6],
     config: Option<Config>,
@@ -116,7 +117,11 @@ struct Interface {
 }
 
 pub struct Stack {
+    /// The interface in use. One card is used at a time: a machine with
+    /// both Ethernet and Wi-Fi uses Wi-Fi while it's connected.
     interface: Option<Interface>,
+    /// Cards not in use.
+    standby: Vec<Interface>,
     loopback_counters: Counters,
     arp: arp::Cache,
     dhcp: dhcp::Client,
@@ -128,6 +133,7 @@ pub struct Stack {
 
 pub static STACK: SpinLock<Stack> = SpinLock::new(Stack {
     interface: None,
+    standby: Vec::new(),
     loopback_counters: Counters { received_packets: 0, received_bytes: 0, sent_packets: 0, sent_bytes: 0 },
     arp: arp::Cache::new(),
     dhcp: dhcp::Client::new(),
@@ -137,7 +143,7 @@ pub static STACK: SpinLock<Stack> = SpinLock::new(Stack {
 });
 
 /// Frames received by cards, waiting for the stack thread.
-static RECEIVED: SpinLock<VecDeque<Vec<u8>>> = SpinLock::new(VecDeque::new());
+static RECEIVED: SpinLock<VecDeque<([u8; 6], Vec<u8>)>> = SpinLock::new(VecDeque::new());
 /// Wakes the stack thread.
 static WORK: WaitQueue = WaitQueue::new();
 /// Woken whenever a socket's state changes; blocked socket calls wait here.
@@ -155,16 +161,60 @@ pub fn init() {
     task::spawn("net", run);
 }
 
-/// Adds a network card as `eth0` and starts configuring it with DHCP.
-pub fn add_interface(device: Arc<dyn NetDevice>) {
+/// Adds a network card called `name` (`eth0`, `wlan0`). The first card
+/// added is used, and configured with DHCP; others wait for [`activate`].
+pub fn add_interface(name: &'static str, device: Arc<dyn NetDevice>) {
     let mut stack = STACK.lock();
+    let mac = device.mac();
+    let interface = Interface { name, device, mac, config: None, counters: Counters::default() };
     if stack.interface.is_some() {
-        warn!("net: only one network card is supported; ignoring another");
+        stack.standby.push(interface);
         return;
     }
-    let mac = device.mac();
-    stack.interface = Some(Interface { device, mac, config: None, counters: Counters::default() });
+    stack.interface = Some(interface);
     stack.dhcp.start(&mac);
+    drop(stack);
+    WORK.wake_all();
+}
+
+/// Switches to the card called `name` and configures it with DHCP (as
+/// Wi-Fi does once it's connected). Connections using the previous card's
+/// address stop working, as on other systems.
+pub fn activate(name: &str) {
+    let mut stack = STACK.lock();
+    if stack.interface.as_ref().is_some_and(|interface| interface.name == name) {
+        // Already in use: a new network (reconnecting) needs a new address.
+        stack.restart_dhcp();
+        return;
+    }
+    let Some(index) = stack.standby.iter().position(|interface| interface.name == name) else { return };
+    let interface = stack.standby.remove(index);
+    if let Some(mut previous) = stack.interface.replace(interface) {
+        previous.config = None;
+        stack.standby.push(previous);
+    }
+    info!("net: using {name}");
+    stack.restart_dhcp();
+    drop(stack);
+    WORK.wake_all();
+}
+
+/// Stops using the card called `name` (Wi-Fi disconnected), going back to
+/// another card if there is one.
+pub fn deactivate(name: &str) {
+    let mut stack = STACK.lock();
+    if !stack.interface.as_ref().is_some_and(|interface| interface.name == name) {
+        return;
+    }
+    let mut previous = stack.interface.take().expect("checked above");
+    previous.config = None;
+    if !stack.standby.is_empty() {
+        let next = stack.standby.remove(0);
+        info!("net: using {}", next.name);
+        stack.interface = Some(next);
+    }
+    stack.standby.push(previous);
+    stack.restart_dhcp();
     drop(stack);
     WORK.wake_all();
 }
@@ -182,12 +232,13 @@ pub fn wait_until_configured(timeout_ms: u64) {
     }
 }
 
-/// Called by card drivers with each frame they receive.
-pub fn receive(frame: Vec<u8>) {
+/// Called by card drivers with each frame they receive; `mac` is the
+/// card's (frames for a card not in use are dropped).
+pub fn receive(mac: [u8; 6], frame: Vec<u8>) {
     let mut queue = RECEIVED.lock();
     // A bound, so a flood can't eat all memory.
     if queue.len() < 512 {
-        queue.push_back(frame);
+        queue.push_back((mac, frame));
     }
     drop(queue);
     WORK.wake_all();
@@ -214,8 +265,8 @@ fn run() {
         let mut changed = false;
         loop {
             let frame = RECEIVED.lock().pop_front();
-            let Some(frame) = frame else { break };
-            STACK.lock().receive_frame(&frame);
+            let Some((mac, frame)) = frame else { break };
+            STACK.lock().receive_frame(mac, &frame);
             changed = true;
         }
         loop {
@@ -317,9 +368,11 @@ pub fn interfaces() -> Vec<InterfaceInfo> {
         counters: stack.loopback_counters,
         mtu: 65536,
     }];
-    if let Some(interface) = &stack.interface {
+    let mut cards: Vec<&Interface> = stack.interface.iter().chain(stack.standby.iter()).collect();
+    cards.sort_by_key(|interface| interface.name);
+    for interface in cards {
         list.push(InterfaceInfo {
-            name: "eth0",
+            name: interface.name,
             mac: interface.mac,
             config: interface.config.clone(),
             up: interface.device.link_up(),
@@ -378,6 +431,22 @@ impl Stack {
         self.config().map(|config| config.address)
     }
 
+    /// Forgets the old network's neighbors and asks DHCP for an address on
+    /// the interface in use.
+    fn restart_dhcp(&mut self) {
+        self.arp = arp::Cache::new();
+        if let Some(interface) = &mut self.interface {
+            interface.config = None;
+            let mac = interface.mac;
+            self.dhcp.start(&mac);
+        }
+    }
+
+    /// The name of the interface in use, for messages.
+    pub fn interface_name(&self) -> &'static str {
+        self.interface.as_ref().map_or("none", |interface| interface.name)
+    }
+
     fn config(&self) -> Option<&Config> {
         self.interface.as_ref()?.config.as_ref()
     }
@@ -387,13 +456,16 @@ impl Stack {
         address.is_loopback() || self.config().is_some_and(|config| config.address == address)
     }
 
-    fn receive_frame(&mut self, frame: &[u8]) {
+    fn receive_frame(&mut self, mac: [u8; 6], frame: &[u8]) {
         if frame.len() < 14 {
             return;
         }
-        if let Some(interface) = &mut self.interface {
-            interface.counters.received_packets += 1;
-            interface.counters.received_bytes += frame.len() as u64;
+        match &mut self.interface {
+            Some(interface) if interface.mac == mac => {
+                interface.counters.received_packets += 1;
+                interface.counters.received_bytes += frame.len() as u64;
+            }
+            _ => return,
         }
         let payload = &frame[14..];
         match read_u16(frame, 12) {

@@ -32,6 +32,7 @@ dependencies = [
 name = "elikernel"
 version = "0.1.0"
 dependencies = [
+ "apk",
  "bootinfo",
  "ext2",
  "fat",

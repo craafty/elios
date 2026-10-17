@@ -44,6 +44,7 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("uname", "show system name and version"),
     ("nproc", "show how many CPUs there are"),
     ("ifconfig", "show network interfaces"),
+    ("wifi", "scan for and join Wi-Fi networks"),
     ("ping", "check that a host answers"),
     ("host", "look up a host name"),
     ("wget", "download a file over HTTP"),

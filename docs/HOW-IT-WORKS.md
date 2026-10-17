@@ -2097,15 +2097,72 @@ serves. Firmware is copied in by the DMA engine's service channel, in
 chunks of up to 128 KiB, then the card's processor is released and the
 firmware says it's alive.
 
-**Stage one** (where this is now) runs the *init* image: it starts the
-scheduler for the command queue, configures Bluetooth coexistence, reads
-the card's NVM (its MAC address and settings) with `NVM_ACCESS` commands,
-and calibrates the radio, keeping the results for the *runtime* image.
-Everything is polled and every step is logged, because the only way to
-test it is on the real card: the log saved to the USB stick shows how far
-it got, the card's registers and the firmware's error log if it failed.
-Next come the runtime image, scanning, joining a network (802.11
-authentication and association), WPA2's handshake, and data.
+**The init image** (`mod.rs`) starts the scheduler for the command queue,
+configures Bluetooth coexistence, reads the card's NVM with `NVM_ACCESS`
+commands (its MAC address, and a word of flags per channel saying which
+channels it may use where it was sold), and calibrates the radio, keeping
+the `CALIBRATION_RESULT`s. If the hardware kill switch is off, the driver
+waits for it. Everything is polled and every step is logged, because the
+only way to test it is on the real card: the log saved to the USB stick
+shows how far it got, the card's registers and the firmware's error log
+if it failed. A firmware error restarts the card from scratch, up to
+three times.
+
+**The runtime image** (`runtime.rs`) is then loaded the same way. Its
+start-up follows Linux's iwlwifi (`mvm`) closely, since the firmware
+expects exactly that sequence: the calibration results go back as the
+"PHY database" (in Linux's order), then the radio configuration,
+Bluetooth coexistence, "dynamic queue allocation", an auxiliary station
+with a queue that scan probes go out on, and power saving off. One kernel
+thread owns the card from then on; it polls the receive ring, takes
+requests written to `/proc/wifi`, and sends the frames the network stack
+queues for `wlan0`.
+
+**Commands** (`commands.rs`) build the firmware's structures byte by byte
+(sizes checked by a test against Linux's): scan requests, PHY and MAC
+contexts, bindings, time quotas, stations, queues, link quality (the rate
+list), time events, smart FIFO. **802.11** (`ieee80211.rs`) parses beacons
+(SSID, rates, RSN, HT, WMM, ERP) and builds management and data frames.
+
+**Joining a network**: scan for it (the firmware hops channels and sends
+probes; beacons and probe responses come back as received frames, each
+preceded by a packet with its channel, signal and timestamps); describe
+the channel, our station role and the access point to the firmware; take
+the channel with a time event; send authentication and association
+requests as ordinary frames on a management queue; then tell the firmware
+the association id, the rates (802.11n MCS 15 down to 0 when both sides
+have two streams, else the network's legacy rates) and, from the first
+beacon, when DTIM beacons come.
+
+**WPA2-Personal** (`wpa.rs`, `crypto.rs`) is done in software, with no
+code from elsewhere: PBKDF2-HMAC-SHA1 turns the password into the PMK
+(SHA-1 comes from the `apk` crate), the 4-way handshake derives the
+pairwise keys, checks the access point's MIC and unwraps the group key
+(AES key wrap), and every data frame is then AES-CCMP encrypted or
+decrypted here, with replay checks per traffic class. Doing it in
+software rather than handing keys to the firmware costs some processor
+time, but keeps the firmware interface small. The tests check each piece
+against the standards' test vectors (FIPS 197, RFC 3394, IEEE 802.11
+annex M) and run a whole handshake against a simulated access point.
+
+**Data**: outgoing Ethernet frames become 802.11 data frames (an LLC/SNAP
+header carries the Ethernet type), with QoS headers when the network has
+WMM; incoming ones are decrypted, A-MSDUs split, and handed to the stack
+as Ethernet frames, so DHCP, TCP and the rest don't know it's Wi-Fi. A
+simple rate control moves the firmware's starting rate down after
+retries and back up after a run of clean first tries; the firmware falls
+back down the list by itself for each frame.
+
+**Leaving** (asked to, deauthenticated, or 20 beacons missed) sends a
+deauthentication and restarts the runtime firmware, which clears all of
+its state in about a second.
+
+**Using it**: `wifi` shows the state and the last scan, `wifi scan`,
+`wifi connect NETWORK [PASSWORD]` (it asks for the password if it isn't
+given), `wifi disconnect`. They write to `/proc/wifi` (root only) and
+wait for the state to settle; `ifconfig` then shows `wlan0`'s address.
+Not yet: scanning while connected, roaming, WPA3, enterprise networks,
+802.11n aggregation (so throughput is well below the card's best).
 
 ### The stack (`net/mod.rs`)
 
@@ -2734,8 +2791,9 @@ Current limits, roughly in order of how much they'd matter to a user:
   which eliOS uses), and Bluetooth controllers are only identified. USB 3
   hubs and transaction translators are untested outside the
   specifications.
-- **Wi-Fi** is at its first stage (firmware loaded, settings read, radio
-  calibrated on the Intel 7260); it can't connect yet.
+- **Wi-Fi** (Intel 7260/3160 only) joins open and WPA2-Personal
+  networks, but hasn't been tried on the laptop yet; no WPA3, enterprise
+  networks, roaming or 802.11n aggregation.
 - **Networking is IPv4 only**, with one network card (Intel e1000
   family), no TLS (so `https` doesn't work), and TCP without congestion
   control or out-of-order buffering. Unix sockets live only in in-memory

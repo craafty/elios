@@ -202,7 +202,7 @@ pub fn probe(devices: &[pci::Device]) {
                     if USES_INTERRUPTS.load(Ordering::Relaxed) { "" } else { ", polled" }
                 );
                 let receiver = nic.clone();
-                net::add_interface(nic);
+                net::add_interface("eth0", nic);
                 task::spawn("e1000", move || receiver.receive_loop());
             }
             Err(error) => warn!("net: e1000 {:04x}: {error}", device.device),
@@ -346,7 +346,7 @@ impl E1000 {
             let interrupts_before = INTERRUPTS_SEEN.load(Ordering::Relaxed);
             while let Some(frame) = self.next_frame() {
                 received += 1;
-                net::receive(frame);
+                net::receive(self.mac, frame);
             }
             // Reading ICR acknowledges the interrupt.
             self.read(ICR);

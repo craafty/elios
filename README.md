@@ -203,8 +203,10 @@ may work too, but QEMU is the one eliOS is tested on.
   devices (`/dev/input/event*`), serial port, Local and
   I/O APICs, PIT/TSC/APIC timers, CMOS clock, PCI with MSI/MSI-X, AHCI and
   NVMe, Intel e1000 network cards (including the I217/I218 built into
-  Haswell and Broadwell laptops), ACPI power management. Being brought up
-  on real hardware: Intel's 7260 Wi-Fi card and its Bluetooth.
+  Haswell and Broadwell laptops), Intel 7260/3160 Wi-Fi (scanning, open
+  and WPA2-Personal networks, with the `wifi` command; written for the
+  T440p and still being tried there), ACPI power management. Being
+  brought up on real hardware: the 7260's Bluetooth.
 - **Networking:** eliOS's own TCP/IP stack (Ethernet, ARP, IPv4, ICMP, UDP,
   TCP), DHCP, loopback, and the Linux socket API, so programs like
   BusyBox's `wget` and `netstat` work unmodified.
@@ -306,11 +308,11 @@ glyph and rebuild.
       rollback, a boot menu of generations
 - [ ] **Laptop (ThinkPad T440p):** the log saved to the USB stick, USB
       ports routed to xHCI on Intel 8-series chipsets, PS/2 and USB mice
-      and `/dev/input`, the I217 Ethernet (works: gigabit, DHCP), the
-      sound chip (found; not yet heard), and the first stage of the
-      Intel 7260 Wi-Fi driver (firmware loaded, MAC address read, radio
-      calibrated) and a Bluetooth probe; next, Wi-Fi networking (scanning,
-      WPA2), Bluetooth
+      and `/dev/input`, the I217 Ethernet (works: gigabit, DHCP), sound
+      (works: `speaker-test` plays), the Intel 7260 Wi-Fi driver (radio
+      calibrates; the runtime firmware, scanning, joining open and WPA2
+      networks with `wifi connect` and the data path are written and
+      awaiting the laptop's log) and a Bluetooth probe; next, Bluetooth
 - [x] **Desktop groundwork:** copy-on-write `fork`, shared memory
       (`memfd`, `MAP_SHARED`, a page cache), `epoll`, `eventfd`,
       `timerfd`, Unix domain sockets with descriptor passing,
@@ -326,4 +328,4 @@ glyph and rebuild.
       Linux's generic driver, so no per-laptop tables) behind Linux's
       ALSA interface, so `libasound` programs play and record
 - [ ] **Next:** the camera (for video calls), faster
-      clocks (a vDSO), Wi-Fi networking and Bluetooth on the T440p
+      clocks (a vDSO), Wi-Fi working on the T440p, Bluetooth

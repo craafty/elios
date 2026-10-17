@@ -1,4 +1,4 @@
-//! Network commands: ifconfig, ping, host, wget and nc.
+//! Network commands: ifconfig, wifi, ping, host, wget and nc.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -98,6 +98,83 @@ pub fn ifconfig(_: &[String]) -> i32 {
         println!("        RX packets {rx_packets}  bytes {rx_bytes}");
         println!("        TX packets {tx_packets}  bytes {tx_bytes}");
         println!();
+    }
+    0
+}
+
+/// The Wi-Fi driver's status and control file.
+const WIFI: &str = "/proc/wifi";
+
+/// The `state:` line of /proc/wifi, and the `error:` line if there is one.
+fn wifi_state() -> (String, Option<String>) {
+    let text = fs::read_to_string(WIFI).unwrap_or_default();
+    let field =
+        |name: &str| text.lines().find_map(|line| line.strip_prefix(name)).map(|value| value.trim().to_string());
+    (field("state:").unwrap_or_default(), field("error:"))
+}
+
+/// `wifi [scan | connect SSID [PASSWORD] | disconnect]`: talks to the
+/// Wi-Fi driver through /proc/wifi, then waits for it to finish.
+pub fn wifi(arguments: &[String]) -> i32 {
+    if !fs::exists(WIFI) {
+        eprintln!("wifi: no Wi-Fi card");
+        return 1;
+    }
+    let request = match arguments.get(1).map(String::as_str) {
+        None | Some("status") => {
+            print!("{}", fs::read_to_string(WIFI).unwrap_or_default());
+            return 0;
+        }
+        Some("scan") => String::from("scan"),
+        Some("disconnect") => String::from("disconnect"),
+        Some("connect") if arguments.len() == 3 || arguments.len() == 4 => {
+            let password = match arguments.get(3) {
+                Some(password) => password.clone(),
+                None => eli::term::read_password("Password (empty for an open network): ").unwrap_or_default(),
+            };
+            if !password.is_empty() && !(8..=63).contains(&password.len()) {
+                eprintln!("wifi: WPA2 passwords are 8 to 63 characters");
+                return 1;
+            }
+            alloc::format!("connect\n{}\n{password}", arguments[2])
+        }
+        _ => {
+            eprintln!("usage: wifi [scan | connect NETWORK [PASSWORD] | disconnect]");
+            return 2;
+        }
+    };
+    let written = fs::File::open_read_write(WIFI).and_then(|file| file.write_all(request.as_bytes()));
+    if let Err(error) = written {
+        eprintln!("wifi: {error}");
+        return 1;
+    }
+    // Joining takes a scan, the handshake and DHCP: allow a minute.
+    let deadline = time::monotonic_nanos() + 60_000_000_000;
+    let mut last = String::new();
+    loop {
+        time::sleep_ms(200);
+        let (state, error) = wifi_state();
+        if state != last && state != "working" {
+            println!("{state}");
+            last = state.clone();
+        }
+        if let Some(error) = error {
+            eprintln!("wifi: {error}");
+            return 1;
+        }
+        if state == "idle" || state == "connected" {
+            break;
+        }
+        if time::monotonic_nanos() > deadline {
+            eprintln!("wifi: still {state}; giving up waiting");
+            return 1;
+        }
+    }
+    if arguments[1] == "scan" {
+        let text = fs::read_to_string(WIFI).unwrap_or_default();
+        if let Some((_, networks)) = text.split_once("networks:\n") {
+            print!("{networks}");
+        }
     }
     0
 }

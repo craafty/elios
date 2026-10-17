@@ -182,7 +182,8 @@ impl Stack {
                 let prefix = mask.map_or(24, |mask| mask.to_u32().leading_ones() as u8);
                 let config = Config { address, prefix, gateway: router };
                 info!(
-                    "net: eth0: {address}/{prefix}{} (DHCP)",
+                    "net: {}: {address}/{prefix}{} (DHCP)",
+                    self.interface_name(),
                     router.map_or_else(alloc::string::String::new, |router| alloc::format!(" via {router}"))
                 );
                 if let Some(interface) = &mut self.interface {

@@ -173,6 +173,14 @@ pub fn create() -> Arc<dyn Inode> {
             ("sys".into(), sys_directory()),
             ("asound".into(), directory(|| alloc::vec![("cards".into(), generated(crate::sound::cards_text))])),
         ];
+        if crate::drivers::intel_wifi::present() {
+            // Status, and requests ("scan", "connect\nSSID\nPASSWORD",
+            // "disconnect") for the `wifi` command.
+            entries.push((
+                "wifi".into(),
+                control(crate::drivers::intel_wifi::status_text, crate::drivers::intel_wifi::control),
+            ));
+        }
         for info in process::list() {
             entries.push((info.pid.to_string(), process_directory(info.pid)));
         }
@@ -322,9 +330,10 @@ fn net_routes() -> String {
 
 fn net_neighbors() -> String {
     let mut text = String::from("IP address       HW type     Flags       HW address            Mask     Device\n");
+    let device = net::STACK.lock().interface_name();
     for (address, mac) in net::neighbors() {
         text.push_str(&format!(
-            "{:<16} 0x1         0x2         {}     *        eth0\n",
+            "{:<16} 0x1         0x2         {}     *        {device}\n",
             address.to_string(),
             net::format_mac(&mac)
         ));

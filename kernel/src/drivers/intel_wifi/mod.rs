@@ -9,17 +9,26 @@
 //! Bringing a card up takes two firmware images: "init", which calibrates
 //! the radio and lets the driver read the card's settings (its NVM, which
 //! holds the MAC address), then "runtime", which does the networking.
-//! This first stage runs the init image: loading it, reading the NVM and
-//! calibrating. Every step is logged, since this hardware can only be
-//! tested on a real machine.
+//! The init image's results (calibration, MAC address, channels) go to
+//! the runtime image, which `runtime` runs. Every step is logged, since
+//! this hardware can only be tested on a real machine.
 
+mod commands;
+mod crypto;
 mod firmware;
+mod ieee80211;
+mod runtime;
 mod transport;
+mod wpa;
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
+pub use self::runtime::{control, present, status_text};
+
+use self::commands::Channel;
 use self::firmware::{Firmware, Image};
+use self::runtime::InitResults;
 use self::transport::{Error, Packet, Transport};
 use super::pci;
 use crate::{fs, task, time};
@@ -66,6 +75,7 @@ pub fn probe(devices: &[pci::Device]) {
         // otherwise interfere with the processor's sleep states.
         device.write(0x40, device.read(0x40) & !0xFF00);
         info!("wifi: {} ({:04x}:{:04x})", model.name, device.vendor, device.device);
+        runtime::announce(model.name);
         task::spawn("wifi", move || {
             if let Err(error) = start(bar, model) {
                 warn!("wifi: {}: {error}", model.name);
@@ -96,12 +106,28 @@ fn start(bar: u64, model: &Model) -> Result<(), String> {
         card.hw_revision,
         if card.radio_allowed() { "allowed" } else { "off (kill switch)" }
     );
-    let result = run_init_image(&mut card, &firmware);
-    if let Err(error) = &result {
-        dump_state(&card);
-        return Err(describe_ref(error));
+    let mut warned = false;
+    while !card.radio_allowed() {
+        if !warned {
+            warn!("wifi: the radio is switched off (hardware kill switch); waiting for it");
+            warned = true;
+        }
+        task::sleep_ms(1000);
     }
-    Ok(())
+    // The card is restarted from scratch after a firmware error, a few
+    // times.
+    for attempt in 1..=3 {
+        let result = run_init_image(&mut card, &firmware).and_then(|init| runtime::run(&mut card, &firmware, init));
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                warn!("wifi: {} (attempt {attempt})", describe_ref(&error));
+                dump_state(&card);
+                card.stop();
+            }
+        }
+    }
+    Err(String::from("giving up after three tries"))
 }
 
 /// Reads /lib/firmware/<name>, waiting for the root file system if it
@@ -132,7 +158,7 @@ fn read_firmware(name: &str) -> Result<Vec<u8>, String> {
 
 /// Runs the init image: reads the card's settings and calibrates the
 /// radio.
-fn run_init_image(card: &mut Transport, firmware: &Firmware) -> Result<(), Error> {
+fn run_init_image(card: &mut Transport, firmware: &Firmware) -> Result<InitResults, Error> {
     card.prepare()?;
     card.power_up()?;
     card.initialize(firmware.phy_config)?;
@@ -178,10 +204,8 @@ fn run_init_image(card: &mut Transport, firmware: &Firmware) -> Result<(), Error
         nvm_word(&software, 2)
     );
 
-    if !card.radio_allowed() {
-        warn!("wifi: the radio is switched off (hardware kill switch); not calibrating");
-        return Ok(());
-    }
+    let channels = nvm_channels(&software);
+    debug!("wifi: channels {:?}", channels.iter().map(|channel| channel.number).collect::<Vec<_>>());
 
     // Calibrate: the antennas that transmit, then the PHY configuration
     // with the init image's calibration triggers. The firmware reports
@@ -205,9 +229,41 @@ fn run_init_image(card: &mut Transport, firmware: &Firmware) -> Result<(), Error
             }
         },
     )?;
-    // The results are what the runtime image will need (the next stage).
     info!("wifi: radio calibrated ({} results)", calibration.len());
-    Ok(())
+    Ok(InitResults { mac, calibration, channels })
+}
+
+/// The channels in the order of the NVM's channel flags.
+const NVM_CHANNELS: [u8; 39] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124,
+    128, 132, 136, 140, 144, 149, 153, 157, 161, 165,
+];
+/// Where the flags start in the software section.
+const NVM_CHANNEL_FLAGS: usize = 0x40;
+const CHANNEL_VALID: u16 = 1 << 0;
+const CHANNEL_ACTIVE: u16 = 1 << 3;
+const CHANNEL_RADAR: u16 = 1 << 4;
+
+/// The channels the card may scan, from its NVM: valid ones, without radar
+/// channels (they need checks before transmitting there).
+fn nvm_channels(software: &[u8]) -> Vec<Channel> {
+    let mut channels = Vec::new();
+    let mut flags_log = String::new();
+    for (index, &number) in NVM_CHANNELS.iter().enumerate() {
+        let offset = NVM_CHANNEL_FLAGS + index * 2;
+        let Some(bytes) = software.get(offset..offset + 2) else { break };
+        let flags = u16::from_le_bytes([bytes[0], bytes[1]]);
+        flags_log.push_str(&alloc::format!(" {number}:{flags:#x}"));
+        if flags & CHANNEL_VALID != 0 && flags & CHANNEL_RADAR == 0 {
+            channels.push(Channel { number });
+        }
+    }
+    debug!("wifi: NVM channel flags{flags_log} (active scanning bit {CHANNEL_ACTIVE:#x})");
+    if channels.is_empty() {
+        warn!("wifi: no channels in the NVM; using 1-11");
+        channels = (1..=11).map(|number| Channel { number }).collect();
+    }
+    channels
 }
 
 /// The address of the firmware's error log in the card's memory, from the
@@ -288,5 +344,6 @@ fn describe_ref(error: &Error) -> String {
         Error::Timeout(what) => alloc::format!("timed out waiting for {what}"),
         Error::Firmware(what) => String::from(*what),
         Error::NoMemory => String::from("out of memory"),
+        Error::QueueFull => String::from("transmit queue full"),
     }
 }
