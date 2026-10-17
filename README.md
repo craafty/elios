@@ -313,10 +313,9 @@ glyph and rebuild.
 - [ ] **Laptop (ThinkPad T440p):** the log saved to the USB stick, USB
       ports routed to xHCI on Intel 8-series chipsets, PS/2 and USB mice
       and `/dev/input`, the I217 Ethernet (works: gigabit, DHCP), sound
-      (works: `speaker-test` plays), the Intel 7260 Wi-Fi driver (radio
-      calibrates; the runtime firmware, scanning, joining open, WPA2 and
-      WPA2-Enterprise networks with `wifi connect` and the data path are
-      written; scanning works on the laptop, joining awaits its log) and a
+      (works: `speaker-test` plays), the Intel 7260 Wi-Fi driver (works:
+      scanning, and joining Purdue's WPA2-Enterprise PAL3.0 with DHCP;
+      open and WPA2 networks use the same path) and a
       Bluetooth probe; next, Bluetooth
 - [x] **Desktop groundwork:** copy-on-write `fork`, shared memory
       (`memfd`, `MAP_SHARED`, a page cache), `epoll`, `eventfd`,

@@ -326,6 +326,42 @@ pub fn deauthentication(bssid: &[u8; 6], mac: &[u8; 6], reason: u16) -> Vec<u8> 
     frame
 }
 
+/// The answer to an action frame the access point sent us, if it needs
+/// one. Block Ack setups (category 3, action 0) are declined: without
+/// aggregation every frame is acknowledged on its own, and an access point
+/// that hears nothing keeps asking. Other categories are returned with the
+/// top bit set, the standard's "not understood" (802.11-2020 11.24).
+pub fn action_reply(request: &[u8], bssid: &[u8; 6], mac: &[u8; 6]) -> Option<Vec<u8>> {
+    let body = request.get(24..)?;
+    let category = *body.first()?;
+    if category & 0x80 != 0 {
+        return None;
+    }
+    let mut frame = management_header(ACTION, bssid, mac);
+    match (category, body.get(1)) {
+        (BLOCK_ACK, Some(&ADDBA_REQUEST)) => {
+            // Dialog token, then the request's parameters and timeout.
+            let (token, parameters, timeout) = (body.get(2)?, body.get(3..5)?, body.get(5..7)?);
+            frame.extend_from_slice(&[BLOCK_ACK, ADDBA_RESPONSE, *token]);
+            frame.extend_from_slice(&REQUEST_DECLINED.to_le_bytes());
+            frame.extend_from_slice(parameters);
+            frame.extend_from_slice(timeout);
+        }
+        (BLOCK_ACK, _) => return None,
+        _ => {
+            frame.push(category | 0x80);
+            frame.extend_from_slice(&body[1..]);
+        }
+    }
+    Some(frame)
+}
+
+const BLOCK_ACK: u8 = 3;
+const ADDBA_REQUEST: u8 = 0;
+const ADDBA_RESPONSE: u8 = 1;
+/// Status 37, "the request has been declined".
+const REQUEST_DECLINED: u16 = 37;
+
 /// An association request for `bss`, offering what both sides support.
 pub fn association_request(bss: &Bss, mac: &[u8; 6], listen_interval: u16) -> Vec<u8> {
     let mut frame = management_header(ASSOCIATION_REQUEST, &bss.bssid, mac);
@@ -451,6 +487,24 @@ pub fn strip_llc(data: &[u8]) -> Option<(u16, &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    crate::ktest! {
+        fn block_ack_requests_are_declined() {
+            let (ap, us) = ([2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 2]);
+            let mut request = management_header(ACTION, &us, &ap);
+            request.extend_from_slice(&[3, 0, 7, 0x02, 0x10, 0, 0, 0x10, 0]);
+            let reply = action_reply(&request, &ap, &us).unwrap();
+            assert_eq!(reply[4..10], ap);
+            assert_eq!(reply[24..], [3, 1, 7, 37, 0, 0x02, 0x10, 0, 0]);
+            // Deleting a Block Ack needs no answer; unknown ones come back.
+            request.truncate(24);
+            request.extend_from_slice(&[3, 2, 0, 0, 0, 0]);
+            assert!(action_reply(&request, &ap, &us).is_none());
+            request.truncate(24);
+            request.extend_from_slice(&[10, 7, 1]);
+            assert_eq!(action_reply(&request, &ap, &us).unwrap()[24..], [0x8A, 7, 1]);
+        }
+    }
 
     crate::ktest! {
         fn beacons_are_parsed() {

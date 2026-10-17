@@ -2209,7 +2209,9 @@ the password. They write to `/proc/wifi` (root only; `connect` sends the
 name, password and user name on separate lines) and wait for the state
 to settle; `ifconfig` then shows `wlan0`'s address. Not yet: scanning
 while connected, roaming, WPA3, EAP methods other than PEAP/MS-CHAPv2,
-802.11n aggregation (so throughput is well below the card's best).
+802.11n aggregation (so throughput is well below the card's best; the
+access point's Block Ack requests are declined with status 37, as the
+standard asks, so it stops asking and sends frames one at a time).
 
 ### The stack (`net/mod.rs`)
 

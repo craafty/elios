@@ -22,6 +22,7 @@ pub const PHY_DB: u8 = 0x6C;
 pub const SCAN_COMPLETE: u8 = 0x6D;
 pub const DEVICE_POWER: u8 = 0x77;
 pub const THERMAL_BACKOFF: u8 = 0x7E;
+pub const STATISTICS: u8 = 0x9D;
 pub const MISSED_BEACONS: u8 = 0xA2;
 pub const RX_PHY: u8 = 0xC0;
 pub const RX_MPDU: u8 = 0xC1;

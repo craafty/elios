@@ -545,7 +545,8 @@ impl Radio<'_> {
                     self.disconnect("the access point stopped answering")?;
                 }
             }
-            cmd::TIME_EVENT_NOTIFICATION | SCAN_ITERATION_COMPLETE | cmd::SCAN_COMPLETE => {}
+            // Statistics come with every beacon; nothing here uses them.
+            cmd::TIME_EVENT_NOTIFICATION | SCAN_ITERATION_COMPLETE | cmd::SCAN_COMPLETE | cmd::STATISTICS => {}
             _ => super::log_unexpected(packet),
         }
         Ok(())
@@ -1102,12 +1103,14 @@ impl Radio<'_> {
                 warn!("wifi: the access point disconnected us (reason {reason})");
                 return self.disconnect("the access point disconnected us");
             }
-            wlan::ACTION => {
-                // Block Ack requests (category 3, action 0) are declined:
-                // without aggregation everything is acknowledged one by one.
-                debug!("wifi: action frame, category {}", frame.get(24).copied().unwrap_or(0));
-                return Ok(());
+            wlan::ACTION if frame.get(4..10) == Some(&self.init.mac[..]) => {
+                let (category, action) = (frame.get(24).copied(), frame.get(25).copied());
+                let bss = link.bss.clone();
+                let Some(reply) = wlan::action_reply(&frame, &bss.bssid, &self.init.mac) else { return Ok(()) };
+                debug!("wifi: action frame (category {category:?}, action {action:?}); answering");
+                return self.send_management(&reply, &bss);
             }
+            wlan::ACTION => return Ok(()),
             _ => {}
         }
         let Some(data) = wlan::parse_data(&frame) else { return Ok(()) };
