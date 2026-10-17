@@ -331,6 +331,8 @@ fn build_userland() -> Result<PathBuf, String> {
             "desktop",
             "--package",
             "ui",
+            "--package",
+            "term",
             "--target",
             USER_TARGET,
             // Tier 3 target: the standard library is built from source.
@@ -365,10 +367,10 @@ fn build_initrd() -> Result<PathBuf, String> {
     }
     let eliauth = eliutils.with_file_name("eliauth");
     fs::copy(&eliauth, bin.join("eliauth")).map_err(|e| format!("copying eliauth: {e}"))?;
-    let desktop = eliutils.with_file_name("desktop");
-    fs::copy(&desktop, bin.join("desktop")).map_err(|e| format!("copying desktop: {e}"))?;
-    let uidemo = eliutils.with_file_name("uidemo");
-    fs::copy(&uidemo, bin.join("uidemo")).map_err(|e| format!("copying uidemo: {e}"))?;
+    for program in ["desktop", "uidemo", "term"] {
+        let path = eliutils.with_file_name(program);
+        fs::copy(&path, bin.join(program)).map_err(|e| format!("copying {program}: {e}"))?;
+    }
     for (name, _) in AUTH_APPLETS {
         symlink("eliauth", &bin.join(name))?;
     }

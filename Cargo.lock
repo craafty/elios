@@ -59,6 +59,14 @@ name = "fat"
 version = "0.1.0"
 
 [[package]]
+name = "term"
+version = "0.1.0"
+dependencies = [
+ "eli",
+ "ui",
+]
+
+[[package]]
 name = "tls"
 version = "0.1.0"
 dependencies = [

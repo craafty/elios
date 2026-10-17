@@ -265,6 +265,14 @@ impl Window {
         self.send(Outgoing::new(self.toplevel, 2).string(title));
     }
 
+    /// Whether something drawn now would be shown straight away: no frame
+    /// is waiting for the compositor. Programs that change often (a
+    /// terminal under heavy output) draw only then; the frame callback
+    /// wakes [`Window::wait`] when it's time.
+    pub fn ready(&self) -> bool {
+        self.configured && !self.frame_pending && !self.closed
+    }
+
     pub fn modifiers(&self) -> Modifiers {
         self.modifiers
     }

@@ -105,11 +105,13 @@ live in memory on the live system), then choose *Desktop* on the login
 screen, or in a text session:
 
 ```sh
-sudo eli add foot font-dejavu # a terminal, and a font for it
-desktop foot                  # the desktop, with a terminal in it
+desktop term                  # the desktop, with a terminal in it
 ```
 
-The bar's buttons start a terminal or Firefox; Super+Enter opens a
+`term` is eliOS's own terminal (xterm-compatible: 256 colours and true
+colour, mouse reporting, an alternate screen for `vi` and `top`, a 5000-line
+scrollback on Shift+PgUp, Ctrl+Shift+C/V to copy and paste, Ctrl+= and
+Ctrl+- for the font size). The bar's buttons start a terminal or Firefox; Super+Enter opens a
 terminal, Super+Tab switches windows, Super+Q closes one, and
 Ctrl+Alt+Backspace goes back to the text console.
 
@@ -288,6 +290,7 @@ eliOS's own rasterizer in `truetype/`.
 | `tls/`          | TLS 1.2 client and PEAP/MS-CHAPv2, for enterprise Wi-Fi       |
 | `truetype/`     | TrueType fonts: reading and anti-aliased rasterizing          |
 | `user/ui/`      | The toolkit: Wayland windows, drawing, widgets (and `uidemo`) |
+| `user/term/`    | `term`, the terminal                                         |
 | `user/desktop/` | The desktop: a Wayland compositor                            |
 | `user/eli/`     | libeli, the runtime for eliOS's Rust programs                |
 | `user/utils/`   | eliutils: shell, init, editor and commands                   |
@@ -339,7 +342,7 @@ eliOS's own rasterizer in `truetype/`.
       Alpine's Wayland programs
 - [ ] **Our own desktop programs:** a login screen with a Text/Desktop
       choice (done), a TrueType rasterizer and bundled font (done), a
-      widget library (`user/ui`, done), then a graphical terminal, a file explorer, a
+      widget library (`user/ui`, done), a terminal (`term`, done), then a file explorer, a
       clipboard and an app menu (Firefox appears once it's added)
 - [x] **Firefox:** Alpine's Firefox browses HTTPS sites in the desktop
       (package triggers, `mremap`, `statx`, `prctl` and `arch_prctl`

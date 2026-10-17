@@ -2572,7 +2572,7 @@ accepts `root=PARTUUID=...` for that layout.)
 
 `desktop` is eliOS's graphical desktop: a Wayland compositor, written from
 the protocol specification. Programs that speak Wayland (GTK and Qt
-applications, Firefox, terminal emulators like `foot`) connect to its
+applications, Firefox, our own `term`) connect to its
 socket, `$XDG_RUNTIME_DIR/wayland-0`, and draw their windows into shared
 memory they hand it; it composes them on the screen and sends them input.
 It's one event loop around `epoll`, with a 60 Hz timer for redrawing.
@@ -2656,6 +2656,53 @@ memory fills and cached glyphs.
   desktop's bar.
 
 `uidemo` shows every widget in one window (`desktop uidemo`).
+
+### The terminal (`user/term`)
+
+`term` is the desktop's terminal, replacing Alpine's `foot`, which needed a
+package and a font from the network before the desktop had a terminal.
+
+- **The pty** (`pty.rs`): it opens `/dev/ptmx`, unlocks it and forks; the
+  child starts a session (`setsid`), opens `/dev/pts/N`, makes it its
+  controlling terminal (`TIOCSCTTY`) and runs `$SHELL`, else the user's
+  login shell. `TERM=xterm-256color`, so programs use what they know from
+  xterm. Window resizes reach the shell as `TIOCSWINSZ`, which sends it
+  SIGWINCH. When the shell exits, reading the master fails with EIO and
+  the window closes.
+- **The emulation** (`screen.rs`) knows nothing about drawing: bytes go
+  in, cells come out. The parser is the state machine from vt100.net's
+  description of DEC's terminals (ground, escape, CSI parameters, OSC
+  strings), run over UTF-8 characters. It covers what xterm-256color's
+  terminfo promises: cursor movement, erasing, inserting and deleting
+  characters and lines, scroll regions, tab stops, 16, 256 and 24-bit
+  colours (with `;` and `:` separators), the alternate screen (1049) that
+  `vi`, `less` and `top` switch to, the DEC line-drawing set, bracketed
+  paste, the mouse modes (1000/1002/1003 with SGR 1006 encoding), focus
+  reports, cursor shapes, and answers to device attribute, cursor
+  position and colour queries (`replies`, written back to the pty).
+  Lines remember whether they wrapped, so a selection across a wrapped
+  line copies as one line. Lines scrolled off the top of the main screen
+  go to a 5000-line scrollback.
+- **Drawing** (`main.rs`): the grid is one fixed-width cell per
+  character, sized from the font's `M` advance and line height. A frame
+  is drawn only when the compositor is ready for one (`Window::ready`),
+  so a program printing quickly costs one redraw per frame, not one per
+  write; each redraw compares every row with what was last drawn and
+  repaints only the rows that changed. When the whole screen scrolled,
+  the pixels are moved (`Canvas::scroll`) and only the new lines drawn.
+  Box-drawing and block characters (U+2500 to U+259F, `boxes.rs`) are
+  drawn as rectangles and paths filling the cell exactly rather than taken
+  from the font, whose glyphs leave gaps between rows; a table of each
+  line character's four arms (none, light, heavy, double) covers all 128
+  line characters with one routine.
+- **Input**: keys are encoded as xterm does (modifiers as `;1+n`,
+  application cursor keys, Alt as an ESC prefix). Ctrl+Shift+C/V copy and
+  paste, Shift+PgUp/PgDn scroll back, Ctrl+=/-/0 set the font size. The
+  mouse selects (double click for words, triple for lines) unless the
+  program asked for mouse reports; Shift overrides that. The wheel scrolls
+  the scrollback, or sends arrow keys to full-screen programs.
+- **Not yet:** the copy and paste buffer is inside each `term`; a
+  clipboard shared between programs comes with the desktop's.
 
 ### Fonts (`truetype/`)
 

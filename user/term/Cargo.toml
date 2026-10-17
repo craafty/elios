@@ -1,0 +1,9 @@
+[package]
+name = "term"
+version.workspace = true
+edition.workspace = true
+
+# eliOS's terminal: an xterm-compatible terminal emulator for the desktop.
+[dependencies]
+eli = { path = "../eli" }
+ui = { path = "../ui" }

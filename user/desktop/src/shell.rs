@@ -974,7 +974,7 @@ impl Desktop {
 
     fn launch(&mut self, launcher: Launcher) {
         let candidates: &[&str] = match launcher {
-            Launcher::Terminal => &["foot", "weston-terminal", "alacritty"],
+            Launcher::Terminal => &["term", "foot"],
             Launcher::Browser => &["firefox", "firefox-esr"],
         };
         let Some(path) = candidates.iter().find_map(|name| eli::process::find_program(name)) else {
