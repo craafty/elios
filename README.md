@@ -203,8 +203,9 @@ may work too, but QEMU is the one eliOS is tested on.
   devices (`/dev/input/event*`), serial port, Local and
   I/O APICs, PIT/TSC/APIC timers, CMOS clock, PCI with MSI/MSI-X, AHCI and
   NVMe, Intel e1000 network cards (including the I217/I218 built into
-  Haswell and Broadwell laptops), Intel 7260/3160 Wi-Fi (scanning, open
-  and WPA2-Personal networks, with the `wifi` command; written for the
+  Haswell and Broadwell laptops), Intel 7260/3160 Wi-Fi (scanning, open,
+  WPA2-Personal and WPA2-Enterprise (PEAP with MS-CHAPv2, as eduroam and
+  campus networks use) networks, with the `wifi` command; written for the
   T440p and still being tried there), ACPI power management. Being
   brought up on real hardware: the 7260's Bluetooth.
 - **Networking:** eliOS's own TCP/IP stack (Ethernet, ARP, IPv4, ICMP, UDP,
@@ -253,7 +254,9 @@ crate::ktest! {
 They range from data structures to running real programs: a three-process
 pipeline, the C library self-test, and reading and writing the disk. The FAT
 and ext2 crates also have host unit tests (`cargo test -p fat -p ext2`); the
-ext2 tests check every volume they make with Linux's `e2fsck`.
+ext2 tests check every volume they make with Linux's `e2fsck`. The `tls`
+crate's tests (`cargo test -p tls`) talk to `openssl s_server`, and, with
+`RADIUS_SERVER=host:port` set, sign in to a FreeRADIUS server over PEAP.
 
 ### The font
 
@@ -271,6 +274,7 @@ glyph and rebuild.
 | `fat/`          | FAT32, shared by the kernel and the disk image builder       |
 | `ext2/`         | ext2, shared by the kernel, `mkfs` and the installer         |
 | `apk/`          | Alpine's package format: gzip, tar, hashes, RSA, indexes      |
+| `tls/`          | TLS 1.2 client and PEAP/MS-CHAPv2, for enterprise Wi-Fi       |
 | `user/eli/`     | libeli, the runtime for eliOS's Rust programs                |
 | `user/utils/`   | eliutils: shell, init, editor and commands                   |
 | `user/c/`       | C test programs built with the host's toolchain              |
@@ -310,9 +314,10 @@ glyph and rebuild.
       ports routed to xHCI on Intel 8-series chipsets, PS/2 and USB mice
       and `/dev/input`, the I217 Ethernet (works: gigabit, DHCP), sound
       (works: `speaker-test` plays), the Intel 7260 Wi-Fi driver (radio
-      calibrates; the runtime firmware, scanning, joining open and WPA2
-      networks with `wifi connect` and the data path are written and
-      awaiting the laptop's log) and a Bluetooth probe; next, Bluetooth
+      calibrates; the runtime firmware, scanning, joining open, WPA2 and
+      WPA2-Enterprise networks with `wifi connect` and the data path are
+      written; scanning works on the laptop, joining awaits its log) and a
+      Bluetooth probe; next, Bluetooth
 - [x] **Desktop groundwork:** copy-on-write `fork`, shared memory
       (`memfd`, `MAP_SHARED`, a page cache), `epoll`, `eventfd`,
       `timerfd`, Unix domain sockets with descriptor passing,

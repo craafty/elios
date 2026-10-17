@@ -14,7 +14,7 @@
 use alloc::vec::Vec;
 
 use super::crypto::{self, Aes128};
-use super::ieee80211::{OUR_RSN, PROTECTED};
+use super::ieee80211::PROTECTED;
 
 // EAPOL-Key "key information" bits.
 const VERSION_AES: u16 = 2;
@@ -74,13 +74,15 @@ pub struct Handshake {
     replay: Option<u64>,
     /// The access point's RSN element, which message 3 must repeat.
     ap_rsn: Vec<u8>,
+    /// Ours, from the association request, which message 2 repeats.
+    our_rsn: [u8; 22],
 }
 
 impl Handshake {
-    pub fn new(pmk: [u8; 32], station: [u8; 6], access_point: [u8; 6], ap_rsn: Vec<u8>) -> Self {
+    pub fn new(pmk: [u8; 32], station: [u8; 6], access_point: [u8; 6], ap_rsn: Vec<u8>, our_rsn: [u8; 22]) -> Self {
         let mut snonce = [0; 32];
         crate::random::fill(&mut snonce);
-        Self { pmk, station, access_point, snonce, anonce: None, ptk: None, replay: None, ap_rsn }
+        Self { pmk, station, access_point, snonce, anonce: None, ptk: None, replay: None, ap_rsn, our_rsn }
     }
 
     /// Handles an EAPOL frame from the access point (from the 802.1X
@@ -114,7 +116,7 @@ impl Handshake {
             self.anonce = Some(anonce);
             self.ptk = Some(derive_ptk(&self.pmk, &self.station, &self.access_point, &self.snonce, &anonce));
             self.replay = Some(replay);
-            let reply = self.message(PAIRWISE | MIC, replay, &self.snonce, &OUR_RSN);
+            let reply = self.message(PAIRWISE | MIC, replay, &self.snonce, &self.our_rsn);
             return Step::Reply(reply);
         }
 
@@ -293,6 +295,7 @@ pub fn ccmp_decrypt<'a>(aes: &Aes128, frame: &'a mut [u8], header_len: usize, pn
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drivers::intel_wifi::ieee80211::OUR_RSN;
 
     fn hex(text: &str) -> Vec<u8> {
         let digits: Vec<u8> = text.bytes().filter(u8::is_ascii_hexdigit).collect();
@@ -346,7 +349,7 @@ mod tests {
         fn the_four_way_handshake_completes() {
             let pmk = crypto::passphrase_key(b"correct horse", b"home");
             let (station, ap) = ([2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 2]);
-            let mut handshake = Handshake::new(pmk, station, ap, OUR_RSN.to_vec());
+            let mut handshake = Handshake::new(pmk, station, ap, OUR_RSN.to_vec(), OUR_RSN);
             let anonce = [7u8; 32];
             let Step::Reply(m2) = handshake.handle(&ap_message(PAIRWISE, 1, &anonce, &[], None)) else {
                 panic!("no message 2")

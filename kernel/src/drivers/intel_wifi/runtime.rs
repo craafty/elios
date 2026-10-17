@@ -35,7 +35,8 @@ use super::wpa::{self, GroupKey, Handshake, Step};
 use crate::errno::{Errno, Result as SysResult};
 use crate::net::{self, NetDevice};
 use crate::sync::SpinLock;
-use crate::{task, time};
+use crate::{random, task, time};
+use tls::peap::{Peer, Reply};
 
 /// What the init image found out, which the runtime image needs.
 pub struct InitResults {
@@ -46,10 +47,32 @@ pub struct InitResults {
     pub channels: Vec<Channel>,
 }
 
+/// EAPOL packet types (802.1X): EAP, and asking the access point to start.
+const EAPOL_EAP: u8 = 0;
+const EAPOL_START: u8 = 1;
+
+/// A certificate for the log and /proc/wifi: subject, issuer and SHA-256
+/// fingerprint, so the owner can compare it with what the network's IT
+/// department publishes.
+fn describe_certificate(der: &[u8]) -> String {
+    let fingerprint = apk::hash::hex(&apk::hash::sha256(der));
+    match tls::x509::Certificate::parse(der) {
+        Some(certificate) => {
+            alloc::format!("{} (issued by {}, SHA-256 {fingerprint})", certificate.subject, certificate.issuer)
+        }
+        None => alloc::format!("unreadable (SHA-256 {fingerprint})"),
+    }
+}
+
 /// A request from /proc/wifi.
 enum Request {
     Scan,
-    Connect { ssid: Vec<u8>, password: Vec<u8> },
+    /// With an identity (user name) for enterprise networks.
+    Connect {
+        ssid: Vec<u8>,
+        password: Vec<u8>,
+        identity: Vec<u8>,
+    },
     Disconnect,
 }
 
@@ -63,6 +86,8 @@ struct Shared {
     error: Option<String>,
     networks: Vec<Bss>,
     connected: Option<Bss>,
+    /// The RADIUS server's certificate on an enterprise network.
+    certificate: Option<String>,
     requests: VecDeque<Request>,
     /// Ethernet frames from the network stack.
     outgoing: VecDeque<Vec<u8>>,
@@ -79,6 +104,7 @@ static SHARED: SpinLock<Shared> = SpinLock::new(Shared {
     error: None,
     networks: Vec::new(),
     connected: None,
+    certificate: None,
     requests: VecDeque::new(),
     outgoing: VecDeque::new(),
     sent: 0,
@@ -135,6 +161,9 @@ pub fn status_text() -> String {
         );
         let _ = writeln!(out, "frames: {} sent, {} received, {} failed", shared.sent, shared.received, shared.failed);
     }
+    if let Some(certificate) = &shared.certificate {
+        let _ = writeln!(out, "server certificate: {certificate}");
+    }
     let _ = writeln!(out, "networks:");
     for bss in &shared.networks {
         let _ = writeln!(
@@ -149,8 +178,8 @@ pub fn status_text() -> String {
     out
 }
 
-/// A write to /proc/wifi: "scan", "connect\nSSID\nPASSWORD" or
-/// "disconnect".
+/// A write to /proc/wifi: "scan", "connect\nSSID\nPASSWORD",
+/// "connect\nSSID\nPASSWORD\nUSER" (enterprise networks) or "disconnect".
 pub fn control(bytes: &[u8]) -> SysResult<()> {
     let mut lines = bytes.split(|&byte| byte == b'\n');
     let request = match lines.next().unwrap_or_default().trim_ascii() {
@@ -159,10 +188,16 @@ pub fn control(bytes: &[u8]) -> SysResult<()> {
         b"connect" => {
             let ssid = lines.next().unwrap_or_default().to_vec();
             let password = lines.next().unwrap_or_default().to_vec();
-            if ssid.is_empty() || ssid.len() > 32 || !(password.is_empty() || (8..=63).contains(&password.len())) {
+            let identity = lines.next().unwrap_or_default().to_vec();
+            let password_ok = if identity.is_empty() {
+                password.is_empty() || (8..=63).contains(&password.len())
+            } else {
+                !password.is_empty() && password.len() <= 256 && identity.len() <= 256
+            };
+            if ssid.is_empty() || ssid.len() > 32 || !password_ok {
                 return Err(Errno::EINVAL);
             }
-            Request::Connect { ssid, password }
+            Request::Connect { ssid, password, identity }
         }
         _ => return Err(Errno::EINVAL),
     };
@@ -237,12 +272,26 @@ struct Keys {
     received_pn: [u64; 17],
 }
 
+/// Signing in to an enterprise network, before the 4-way handshake.
+struct Enterprise {
+    peer: Peer,
+    /// Whether the access point has started EAP (else we ask it to).
+    started: bool,
+    /// Whether the server's certificate has been logged.
+    certificate_logged: bool,
+    /// Why signing in failed.
+    failure: Option<String>,
+}
+
 /// The network we're joined to.
 struct Link {
     bss: Bss,
     qos: bool,
     association_id: u16,
+    /// Created once the pairwise master key is known: at once from a
+    /// passphrase, after EAP on enterprise networks.
     handshake: Option<Handshake>,
+    enterprise: Option<Enterprise>,
     keys: Option<Keys>,
     sequence: u16,
     /// Whether the firmware knows the DTIM timing yet (from a beacon).
@@ -444,11 +493,11 @@ impl Radio<'_> {
                         set_state("idle");
                     }
                 }
-                Some(Request::Connect { ssid, password }) => {
+                Some(Request::Connect { ssid, password, identity }) => {
                     if self.link.is_some() {
                         self.disconnect("connecting elsewhere")?;
                     }
-                    if let Err(error) = self.connect(&ssid, &password) {
+                    if let Err(error) = self.connect(&ssid, &password, &identity) {
                         let message = match error {
                             JoinError::Card(error) => return Err(error),
                             JoinError::Failed(message) => message,
@@ -620,7 +669,7 @@ impl Radio<'_> {
     }
 
     /// Joins a network. On failure the caller restarts the firmware.
-    fn connect(&mut self, ssid: &[u8], password: &[u8]) -> Result<(), JoinError> {
+    fn connect(&mut self, ssid: &[u8], password: &[u8], identity: &[u8]) -> Result<(), JoinError> {
         let name = String::from_utf8_lossy(ssid).into_owned();
         // A fresh scan for this network finds hidden ones too, and the
         // current signal strengths.
@@ -638,6 +687,16 @@ impl Radio<'_> {
             }
             Security::Wpa2Personal if password.is_empty() => {
                 return Err(JoinError::Failed(alloc::format!("{name:?} needs a password")));
+            }
+            Security::Wpa2Personal if !identity.is_empty() => {
+                return Err(JoinError::Failed(alloc::format!(
+                    "{name:?} uses a shared password (WPA2-Personal); no user name needed"
+                )));
+            }
+            Security::Wpa2Enterprise if identity.is_empty() || password.is_empty() => {
+                return Err(JoinError::Failed(alloc::format!(
+                    "{name:?} is an enterprise network: it needs a user name and password (wifi connect NAME --user USER)"
+                )));
             }
             Security::Unsupported(what) => {
                 return Err(JoinError::Failed(alloc::format!("{name:?} uses {what}, which eliOS can't join yet")));
@@ -657,7 +716,14 @@ impl Radio<'_> {
             bss.ht,
             bss.wmm.is_some()
         );
-        let pmk = (!password.is_empty()).then(|| crypto::passphrase_key(password, ssid));
+        let pmk = (bss.security == Security::Wpa2Personal).then(|| crypto::passphrase_key(password, ssid));
+        let enterprise = (bss.security == Security::Wpa2Enterprise).then(|| Enterprise {
+            peer: Peer::new(&String::from_utf8_lossy(identity), &String::from_utf8_lossy(password), random::fill),
+            started: false,
+            certificate_logged: false,
+            failure: None,
+        });
+        SHARED.lock().certificate = None;
         let mac = self.init.mac;
         let channel = Channel { number: bss.channel };
 
@@ -707,7 +773,8 @@ impl Radio<'_> {
             bss: bss.clone(),
             qos: bss.wmm.is_some(),
             association_id: 0,
-            handshake: pmk.map(|pmk| Handshake::new(pmk, mac, bss.bssid, bss.rsn.clone())),
+            handshake: pmk.map(|pmk| Handshake::new(pmk, mac, bss.bssid, bss.rsn.clone(), wlan::our_rsn(bss.security))),
+            enterprise,
             keys: None,
             sequence: 0,
             dtim_known: false,
@@ -732,8 +799,8 @@ impl Radio<'_> {
         info!("wifi: associated (association id {association_id})");
         self.associated(&bss, association_id)?;
 
-        // 4. The WPA2 handshake.
-        if pmk.is_some() {
+        // 4. Enterprise sign-in (EAP), then the WPA2 handshake.
+        if bss.security != Security::Open {
             self.handshake()?;
         }
         let _ = self.command(cmd::TIME_EVENT, &cmd::time_event(cmd::REMOVE, 0, event));
@@ -848,10 +915,28 @@ impl Radio<'_> {
     }
 
     /// Runs the 4-way handshake: messages 1 and 3 from the access point,
-    /// our 2 and 4.
+    /// our 2 and 4. On enterprise networks, EAP comes first: the access
+    /// point relays it to a RADIUS server, which can take seconds.
     fn handshake(&mut self) -> Result<(), JoinError> {
-        let deadline = time::uptime_nanos() + 5_000_000_000;
+        let start = time::uptime_nanos();
+        let enterprise = self.link.as_ref().is_some_and(|link| link.enterprise.is_some());
+        let deadline = start + if enterprise { 30_000_000_000 } else { 5_000_000_000 };
+        let mut asked = false;
         while time::uptime_nanos() < deadline {
+            if let Some(failure) =
+                self.link.as_mut().and_then(|link| link.enterprise.as_mut()).and_then(|eap| eap.failure.take())
+            {
+                return Err(JoinError::Failed(failure));
+            }
+            let waiting = self.link.as_ref().and_then(|link| link.enterprise.as_ref()).is_some_and(|eap| !eap.started);
+            if waiting && !asked && time::uptime_nanos() > start + 1_000_000_000 {
+                // Access points normally start EAP on their own; some
+                // wait for an EAPOL-Start.
+                info!("wifi: no EAP request yet; sending EAPOL-Start");
+                let bssid = self.link.as_ref().map_or([0; 6], |link| link.bss.bssid);
+                self.send_data(&bssid, wlan::ETHERTYPE_EAPOL, &[2, EAPOL_START, 0, 0])?;
+                asked = true;
+            }
             match self.receive()? {
                 Some(Received::Frame(frame, info)) => {
                     self.handle_frame(frame, info)?;
@@ -867,7 +952,12 @@ impl Radio<'_> {
                 None => task::sleep_ms(1),
             }
         }
-        Err(JoinError::Failed(String::from("the WPA2 handshake didn't finish (wrong password?)")))
+        let signed_in = self.link.as_ref().is_some_and(|link| link.handshake.is_some());
+        Err(JoinError::Failed(String::from(match (enterprise, signed_in) {
+            (true, false) => "signing in didn't finish (the RADIUS server didn't answer)",
+            (true, true) => "the WPA2 handshake after signing in didn't finish",
+            _ => "the WPA2 handshake didn't finish (wrong password?)",
+        })))
     }
 
     fn mac_context(&self, action: u32, bss: &Bss, association_id: u16, dtim: Option<cmd::Dtim>) -> Vec<u8> {
@@ -978,7 +1068,7 @@ impl Radio<'_> {
         }
         let destination: [u8; 6] = frame[..6].try_into().unwrap();
         let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-        if self.link.as_ref().is_some_and(|link| link.handshake.is_some() && link.keys.is_none()) {
+        if self.link.as_ref().is_some_and(|link| link.bss.security != Security::Open && link.keys.is_none()) {
             // Nothing but the handshake until the keys are known.
             return Ok(());
         }
@@ -1033,7 +1123,7 @@ impl Radio<'_> {
         } else {
             frame[data.header_len..].to_vec()
         };
-        let encrypted_link = link.handshake.is_some();
+        let encrypted_link = link.bss.security != Security::Open;
         let parts: Vec<([u8; 6], [u8; 6], &[u8])> =
             if data.amsdu { wlan::amsdu_parts(&body) } else { alloc::vec![(data.destination, data.source, &body[..])] };
         for (destination, source, payload) in parts {
@@ -1057,8 +1147,11 @@ impl Radio<'_> {
         Ok(())
     }
 
-    /// An EAPOL frame: a handshake message.
+    /// An EAPOL frame: a handshake message, or EAP on enterprise networks.
     fn eapol(&mut self, packet: &[u8]) -> Result<(), Error> {
+        if packet.get(1) == Some(&EAPOL_EAP) {
+            return self.eap(packet);
+        }
         let Some(link) = &mut self.link else { return Ok(()) };
         let Some(handshake) = &mut link.handshake else { return Ok(()) };
         let step = handshake.handle(packet);
@@ -1089,6 +1182,53 @@ impl Radio<'_> {
                 }
             }
             Step::Ignore(why) => debug!("wifi: EAPOL frame ignored: {why}"),
+        }
+        Ok(())
+    }
+
+    /// An EAP packet from the access point (relaying the RADIUS server).
+    fn eap(&mut self, packet: &[u8]) -> Result<(), Error> {
+        let mac = self.init.mac;
+        let Some(link) = &mut self.link else { return Ok(()) };
+        let Some(eap) = &mut link.enterprise else {
+            debug!("wifi: EAP packet on a network that doesn't use it; ignored");
+            return Ok(());
+        };
+        let length = packet.get(2..4).map_or(0, |b| usize::from(u16::from_be_bytes([b[0], b[1]])));
+        let Some(body) = packet.get(4..4 + length) else { return Ok(()) };
+        debug!("wifi: EAP code {} id {} length {}", body.first().unwrap_or(&0), body.get(1).unwrap_or(&0), length);
+        eap.started = true;
+        let reply = eap.peer.receive(body);
+        for note in eap.peer.take_notes() {
+            info!("wifi: {note}");
+        }
+        if !eap.certificate_logged
+            && let Some(tls) = eap.peer.tls()
+            && let Some(der) = tls.certificates().first()
+        {
+            eap.certificate_logged = true;
+            let description = describe_certificate(der);
+            info!("wifi: server certificate: {description} ({} in the chain; not verified)", tls.certificates().len());
+            SHARED.lock().certificate = Some(description);
+        }
+        let bssid = link.bss.bssid;
+        match reply {
+            Reply::Send(answer) => {
+                let mut frame = alloc::vec![2, EAPOL_EAP];
+                frame.extend_from_slice(&(answer.len() as u16).to_be_bytes());
+                frame.extend_from_slice(&answer);
+                self.send_data(&bssid, wlan::ETHERTYPE_EAPOL, &frame)?;
+            }
+            Reply::Nothing => {}
+            Reply::Success(pmk) => {
+                info!("wifi: signed in; starting the WPA2 handshake");
+                link.handshake =
+                    Some(Handshake::new(pmk, mac, bssid, link.bss.rsn.clone(), wlan::our_rsn(link.bss.security)));
+            }
+            Reply::Failure(why) => {
+                warn!("wifi: signing in failed: {why}");
+                eap.failure = Some(why);
+            }
         }
         Ok(())
     }

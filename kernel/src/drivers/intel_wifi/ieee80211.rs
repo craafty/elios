@@ -43,10 +43,12 @@ const VENDOR: u8 = 221;
 pub const ETHERTYPE_EAPOL: u16 = 0x888E;
 const LLC_SNAP: [u8; 6] = [0xAA, 0xAA, 0x03, 0, 0, 0];
 
-/// The cipher suite and key management suite eliOS supports: CCMP (AES)
-/// with a pre-shared key, as `00-0F-AC:4` and `00-0F-AC:2`.
+/// The cipher suite and key management suites eliOS supports: CCMP (AES)
+/// with a pre-shared key or 802.1X (enterprise sign-in), as `00-0F-AC:4`,
+/// `00-0F-AC:2` and `00-0F-AC:1`.
 const SUITE_CCMP: [u8; 4] = [0x00, 0x0F, 0xAC, 4];
 const SUITE_TKIP: [u8; 4] = [0x00, 0x0F, 0xAC, 2];
+const SUITE_8021X: [u8; 4] = [0x00, 0x0F, 0xAC, 1];
 const SUITE_PSK: [u8; 4] = [0x00, 0x0F, 0xAC, 2];
 const SUITE_SAE: [u8; 4] = [0x00, 0x0F, 0xAC, 8];
 
@@ -56,11 +58,24 @@ const SUITE_SAE: [u8; 4] = [0x00, 0x0F, 0xAC, 8];
 pub const OUR_RSN: [u8; 22] =
     [RSN, 20, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 2, 0, 0];
 
+/// Our RSN element for a network: [`OUR_RSN`], with 802.1X instead of PSK
+/// on enterprise networks.
+pub fn our_rsn(security: Security) -> [u8; 22] {
+    let mut rsn = OUR_RSN;
+    if security == Security::Wpa2Enterprise {
+        rsn[19] = SUITE_8021X[3];
+    }
+    rsn
+}
+
 /// A network's security, as far as eliOS can join it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Security {
     Open,
     Wpa2Personal,
+    /// WPA2 with 802.1X: a user name and password checked by a RADIUS
+    /// server (PEAP with MS-CHAPv2).
+    Wpa2Enterprise,
     /// Something eliOS can't join yet, and why.
     Unsupported(&'static str),
 }
@@ -70,6 +85,7 @@ impl Security {
         match self {
             Security::Open => "open",
             Security::Wpa2Personal => "WPA2",
+            Security::Wpa2Enterprise => "WPA2-EAP",
             Security::Unsupported(what) => what,
         }
     }
@@ -195,8 +211,8 @@ pub fn parse_bss(frame: &[u8], channel: u8, signal: i8) -> Option<Bss> {
 }
 
 /// Decides from an RSN element whether eliOS can join: it needs CCMP for
-/// both pairwise and group traffic, a pre-shared key, and management frame
-/// protection not required.
+/// both pairwise and group traffic, a pre-shared key or 802.1X, and
+/// management frame protection not required.
 fn parse_rsn(rsn: &[u8]) -> Security {
     let suite = |offset: usize| -> Option<[u8; 4]> { rsn.get(offset..offset + 4)?.try_into().ok() };
     let count = |offset: usize| rsn.get(offset..offset + 2).map(|b| usize::from(u16::from_le_bytes([b[0], b[1]])));
@@ -207,9 +223,14 @@ fn parse_rsn(rsn: &[u8]) -> Security {
     let Some(akm_count) = count(akm_offset) else { return Security::Unsupported("bad RSN") };
     let akms: Vec<_> = (0..akm_count).filter_map(|index| suite(akm_offset + 2 + index * 4)).collect();
     let capabilities = count(akm_offset + 2 + akm_count * 4).unwrap_or(0);
-    if !akms.contains(&SUITE_PSK) {
-        return Security::Unsupported(if akms.contains(&SUITE_SAE) { "WPA3" } else { "WPA2-Enterprise" });
-    }
+    // A network offering both prefers its pre-shared key.
+    let security = if akms.contains(&SUITE_PSK) {
+        Security::Wpa2Personal
+    } else if akms.contains(&SUITE_8021X) {
+        Security::Wpa2Enterprise
+    } else {
+        return Security::Unsupported(if akms.contains(&SUITE_SAE) { "WPA3" } else { "unknown key management" });
+    };
     if !pairwise.contains(&SUITE_CCMP) {
         return Security::Unsupported("TKIP");
     }
@@ -222,7 +243,7 @@ fn parse_rsn(rsn: &[u8]) -> Security {
     if capabilities & 1 << 6 != 0 {
         return Security::Unsupported("protected management frames required");
     }
-    Security::Wpa2Personal
+    security
 }
 
 /// The four access categories' records from a WMM parameter element, in
@@ -316,8 +337,8 @@ pub fn association_request(bss: &Bss, mac: &[u8; 6], listen_interval: u16) -> Ve
     frame.extend_from_slice(&[SSID, bss.ssid.len() as u8]);
     frame.extend_from_slice(&bss.ssid);
     frame.extend_from_slice(&supported_rates(two_ghz));
-    if bss.security == Security::Wpa2Personal {
-        frame.extend_from_slice(&OUR_RSN);
+    if matches!(bss.security, Security::Wpa2Personal | Security::Wpa2Enterprise) {
+        frame.extend_from_slice(&our_rsn(bss.security));
     }
     if bss.ht.is_some() && bss.wmm.is_some() {
         frame.extend_from_slice(&ht_capabilities());
@@ -457,6 +478,8 @@ mod tests {
             let mut sae = OUR_RSN;
             sae[19] = 8;
             assert_eq!(parse_rsn(&sae[2..]), Security::Unsupported("WPA3"));
+            let enterprise = our_rsn(Security::Wpa2Enterprise);
+            assert_eq!(parse_rsn(&enterprise[2..]), Security::Wpa2Enterprise);
             assert_eq!(ht_capabilities().len(), 28);
         }
 

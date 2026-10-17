@@ -160,10 +160,14 @@ impl PublicKey {
     /// holds an X.509 SubjectPublicKeyInfo).
     pub fn from_pem(text: &str) -> Option<Self> {
         let body = text.split("-----BEGIN PUBLIC KEY-----").nth(1)?.split("-----END PUBLIC KEY-----").next()?;
-        let der = hash::base64_decode(body)?;
+        Self::from_der(&hash::base64_decode(body)?)
+    }
+
+    /// Reads a key from a DER SubjectPublicKeyInfo (as in certificates).
+    pub fn from_der(der: &[u8]) -> Option<Self> {
         // SEQUENCE { SEQUENCE { algorithm }, BIT STRING { 0 unused bits,
         // SEQUENCE { INTEGER n, INTEGER e } } }
-        let (_, info, _) = der_read(&der, 0x30)?;
+        let (_, info, _) = der_read(der, 0x30)?;
         let (_, _algorithm, rest) = der_read(info, 0x30)?;
         let (_, bits, _) = der_read(rest, 0x03)?;
         let (_, key, _) = der_read(bits.get(1..)?, 0x30)?;
@@ -176,6 +180,34 @@ impl PublicKey {
         let mut words = from_bytes(modulus);
         words.resize(modulus.len().div_ceil(4), 0);
         Some(Self { modulus: words, exponent: from_bytes(exponent), size: modulus.len() })
+    }
+
+    /// The modulus's size in bytes.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Encrypts `message` with PKCS #1 v1.5 padding (00 02, nonzero random
+    /// bytes, 00, message), as TLS's RSA key exchange does. `random` fills
+    /// a buffer with random bytes.
+    pub fn encrypt(&self, message: &[u8], random: &mut dyn FnMut(&mut [u8])) -> Option<Vec<u8>> {
+        if message.len() + 11 > self.size {
+            return None;
+        }
+        let mut block = vec![0u8; self.size];
+        block[1] = 2;
+        let padding_end = self.size - message.len() - 1;
+        for byte in &mut block[2..padding_end] {
+            while *byte == 0 {
+                let mut one = [0u8];
+                random(&mut one);
+                *byte = one[0];
+            }
+        }
+        block[self.size - message.len()..].copy_from_slice(message);
+        let mut value = from_bytes(&block);
+        value.resize(self.modulus.len(), 0);
+        Some(to_bytes(&Montgomery::new(&self.modulus).power(&value, &self.exponent), self.size))
     }
 
     /// Whether `signature` is this key's PKCS #1 v1.5 signature of a hash

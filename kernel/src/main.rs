@@ -188,6 +188,7 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
         warn!("serial: no input: {error}");
     }
     keyboard::start_terminal_input();
+    console::start_blinking();
     arch::enable_interrupts();
 
     #[cfg(test)]

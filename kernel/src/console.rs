@@ -52,6 +52,16 @@ pub fn with<R>(f: impl FnOnce(&mut Console) -> R) -> Option<R> {
     CONSOLE.lock().as_mut().map(f)
 }
 
+/// Flashes the cursor twice a second, forever.
+pub fn start_blinking() {
+    crate::task::spawn("cursor", || {
+        loop {
+            crate::task::sleep_ms(530);
+            with(|console| console.blink());
+        }
+    });
+}
+
 /// Like [`with`], but gives up instead of waiting if the console is busy.
 /// For the panic handler, which may have interrupted a console write.
 pub fn try_with<R>(f: impl FnOnce(&mut Console) -> R) -> Option<R> {
@@ -107,10 +117,14 @@ pub struct Console<'a> {
     /// Whether the current sequence is a private one (`ESC [ ?`).
     private: bool,
 
+    /// Shown unless a program hides it (`ESC [?25l`), as on any terminal.
     cursor_visible: bool,
     /// Where the cursor was last drawn in video memory. It's never drawn in
     /// the shadow, so the shadow copy of that cell is what erases it.
     cursor_drawn: Option<usize>,
+    /// The blink phase: the cursor is a solid block while this is set.
+    /// Output turns it on, so the cursor stays put while someone types.
+    blink_on: bool,
 
     /// Pixel rows that differ from video memory, as `start..end`.
     dirty: Option<(usize, usize)>,
@@ -140,8 +154,9 @@ impl<'a> Console<'a> {
             params: [0; MAX_PARAMS],
             param_count: 0,
             private: false,
-            cursor_visible: false,
+            cursor_visible: true,
             cursor_drawn: None,
+            blink_on: true,
             dirty: None,
             hidden: false,
             fb,
@@ -210,20 +225,50 @@ impl<'a> Console<'a> {
         if let Some(row) = self.cursor_drawn.take() {
             self.mark_dirty(row * font::HEIGHT, (row + 1) * font::HEIGHT);
         }
+        self.flush_dirty();
+        self.blink_on = true;
+        self.draw_cursor();
+    }
+
+    /// Flips the cursor between shown and hidden. A timer calls this so
+    /// the cursor flashes and is easy to find.
+    pub fn blink(&mut self) {
+        if self.hidden || !self.cursor_visible {
+            return;
+        }
+        self.blink_on = !self.blink_on;
+        if let Some(row) = self.cursor_drawn.take() {
+            self.mark_dirty(row * font::HEIGHT, (row + 1) * font::HEIGHT);
+            self.flush_dirty();
+        }
+        self.draw_cursor();
+    }
+
+    fn flush_dirty(&mut self) {
         if let Some((start, end)) = self.dirty.take() {
             for y in start..end {
                 self.fb.write_span(0, y, &self.shadow[y * self.width..(y + 1) * self.width]);
             }
         }
-        if self.cursor_visible {
-            // An underline in the bottom two pixel rows of the cursor's cell.
-            let column = self.column.min(self.columns - 1);
-            let underline = [self.foreground; font::WIDTH];
-            for y in (self.row + 1) * font::HEIGHT - 2..(self.row + 1) * font::HEIGHT {
-                self.fb.write_span(column * font::WIDTH, y, &underline);
-            }
-            self.cursor_drawn = Some(self.row);
+    }
+
+    /// Draws the cursor as a block in video memory: the cell with its
+    /// background and text colors swapped.
+    fn draw_cursor(&mut self) {
+        if !self.cursor_visible || !self.blink_on {
+            return;
         }
+        let column = self.column.min(self.columns - 1);
+        let x = column * font::WIDTH;
+        let mut cell = [0; font::WIDTH];
+        for y in self.row * font::HEIGHT..(self.row + 1) * font::HEIGHT {
+            let source = &self.shadow[y * self.width + x..y * self.width + x + font::WIDTH];
+            for (out, &pixel) in cell.iter_mut().zip(source) {
+                *out = if pixel == self.background { self.foreground } else { self.background };
+            }
+            self.fb.write_span(x, y, &cell);
+        }
+        self.cursor_drawn = Some(self.row);
     }
 
     pub fn write_char(&mut self, c: char) {
@@ -564,6 +609,12 @@ mod tests {
                 console.flush();
                 assert_eq!(console.fb.read_pixel(0, underline_row), BACKGROUND.0);
                 assert_eq!(console.fb.read_pixel(font::WIDTH, underline_row), FOREGROUND.0);
+
+                // Blinking hides it, then shows it again.
+                console.blink();
+                assert_eq!(console.fb.read_pixel(font::WIDTH, underline_row), BACKGROUND.0);
+                console.blink();
+                assert_eq!(console.fb.read_pixel(font::WIDTH, 0), FOREGROUND.0);
 
                 console.write_str("\x1B[?25l").unwrap();
                 console.flush();

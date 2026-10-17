@@ -371,9 +371,12 @@ column leaves the cursor past the end, and the wrap happens on the *next*
 character. Otherwise a full-width line followed by a newline would produce a
 blank line.
 
-**The cursor** is drawn only into video memory, never the shadow buffer, so
-it can't get scrolled or overwritten; the shadow copy of a cell is what
-erases it.
+**The cursor** is a block (the cell with its colors swapped) drawn only
+into video memory, never the shadow buffer, so it can't get scrolled or
+overwritten; the shadow copy of a cell is what erases it. It's shown
+unless a program hides it (`ESC [?25l`), and a kernel thread flashes it
+every 530 ms (the usual terminal rate) so it's easy to find; output turns
+it back on, so it stays solid while someone types.
 
 ### The font (`kernel/font/eli-8x16.txt`, `kernel/build.rs`)
 
@@ -2145,6 +2148,39 @@ time, but keeps the firmware interface small. The tests check each piece
 against the standards' test vectors (FIPS 197, RFC 3394, IEEE 802.11
 annex M) and run a whole handshake against a simulated access point.
 
+**WPA2-Enterprise** (the `tls` crate, `runtime.rs`) is what universities
+and companies use: instead of a shared password, each person signs in
+with their own user name and password, checked by a RADIUS server behind
+the access point (802.1X). The access point relays EAP messages between
+us (in EAPOL frames) and that server. eliOS speaks PEAPv0 with MS-CHAPv2,
+the method nearly every such network offers (Windows' default): a TLS
+session with the server, carried inside EAP messages in fragments of
+about 1000 bytes, and inside it MS-CHAPv2, where each side proves it
+knows the password. Both then derive the same 64-byte key from the TLS
+session (the TLS exporter, label "client EAP encryption"); its first 32
+bytes are the PMK, and the 4-way handshake proceeds as for WPA2-Personal.
+Our RSN element names the 802.1X key management suite (`00-0F-AC:1`)
+instead of PSK in both the association request and handshake message 2.
+If no EAP request comes within a second of associating, we send an
+EAPOL-Start; the whole sign-in may take 30 seconds.
+
+The `tls` crate is eliOS's own TLS 1.2 client, written for this but
+usable elsewhere (`eli`, `git`): ECDHE (X25519) or RSA key exchange,
+AES-128-GCM, SHA-256, with RSA signatures checked using the `apk`
+crate's RSA code; plus MD4 and DES, which MS-CHAPv2 needs. It does no
+I/O, so the same code runs in the kernel and in host tests: against
+`openssl s_server` (both key exchanges, and a server asking for a client
+certificate, which we answer with none), and a whole PEAP sign-in through
+a RADIUS client against FreeRADIUS, checking that our PMK equals the key
+the server hands the access point (MS-MPPE-Recv-Key). **The server's
+certificate chain isn't verified yet**: the log and `/proc/wifi` show its
+subject, issuer and SHA-256 fingerprint to compare with what the
+network's IT department publishes. Many campuses treat checking as
+optional (Purdue's instructions for some systems do), but it means a
+fake access point with the same name could learn the MS-CHAPv2 exchange,
+which can be cracked offline for a weak password. Crypto binding (a PEAPv2
+idea some servers send as a TLV) is ignored.
+
 **Data**: outgoing Ethernet frames become 802.11 data frames (an LLC/SNAP
 header carries the Ethernet type), with QoS headers when the network has
 WMM; incoming ones are decrypted, A-MSDUs split, and handed to the stack
@@ -2159,9 +2195,14 @@ its state in about a second.
 
 **Using it**: `wifi` shows the state and the last scan, `wifi scan`,
 `wifi connect NETWORK [PASSWORD]` (it asks for the password if it isn't
-given), `wifi disconnect`. They write to `/proc/wifi` (root only) and
-wait for the state to settle; `ifconfig` then shows `wlan0`'s address.
-Not yet: scanning while connected, roaming, WPA3, enterprise networks,
+given), `wifi connect NETWORK --user NAME` for enterprise networks (it
+asks for the password), `wifi disconnect`. Network names may contain
+spaces, quoted or not: `wifi connect Purdue Guest` takes the longest run
+of words that names a network in the last scan, and anything after it is
+the password. They write to `/proc/wifi` (root only; `connect` sends the
+name, password and user name on separate lines) and wait for the state
+to settle; `ifconfig` then shows `wlan0`'s address. Not yet: scanning
+while connected, roaming, WPA3, EAP methods other than PEAP/MS-CHAPv2,
 802.11n aggregation (so throughput is well below the card's best).
 
 ### The stack (`net/mod.rs`)
@@ -2768,6 +2809,9 @@ trusted.
   keyboard interrupts (the PS/2 controller is told to fake a key press),
   a three-process pipeline, the C library self-test, disk I/O through AHCI.
 - **The FAT crate** has host unit tests (`cargo test -p fat`).
+- **The tls crate** is tested against OpenSSL and, with
+  `RADIUS_SERVER=host:port`, a FreeRADIUS server (secret `testing123`,
+  user `testuser`, password `testpass`): `cargo test -p tls`.
 - **End-to-end:** `cargo xtask session` and screenshots.
 
 Every phase was also tested in release builds, since optimizations can
@@ -2791,9 +2835,10 @@ Current limits, roughly in order of how much they'd matter to a user:
   which eliOS uses), and Bluetooth controllers are only identified. USB 3
   hubs and transaction translators are untested outside the
   specifications.
-- **Wi-Fi** (Intel 7260/3160 only) joins open and WPA2-Personal
-  networks, but hasn't been tried on the laptop yet; no WPA3, enterprise
-  networks, roaming or 802.11n aggregation.
+- **Wi-Fi** (Intel 7260/3160 only) joins open, WPA2-Personal and
+  WPA2-Enterprise (PEAP/MS-CHAPv2) networks; scanning works on the laptop,
+  joining is still being tried. No WPA3, other EAP methods, certificate
+  verification, roaming or 802.11n aggregation.
 - **Networking is IPv4 only**, with one network card (Intel e1000
   family), no TLS (so `https` doesn't work), and TCP without congestion
   control or out-of-order buffering. Unix sockets live only in in-memory

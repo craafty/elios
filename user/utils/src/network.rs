@@ -113,8 +113,53 @@ fn wifi_state() -> (String, Option<String>) {
     (field("state:").unwrap_or_default(), field("error:"))
 }
 
-/// `wifi [scan | connect SSID [PASSWORD] | disconnect]`: talks to the
-/// Wi-Fi driver through /proc/wifi, then waits for it to finish.
+/// Whether the last scan (in /proc/wifi) saw a network called `name`.
+fn scanned(name: &str) -> bool {
+    let text = fs::read_to_string(WIFI).unwrap_or_default();
+    let Some((_, networks)) = text.split_once("networks:\n") else { return false };
+    // Each line ends with two spaces and the name.
+    let ending = alloc::format!("  {name}");
+    networks.lines().any(|line| line.ends_with(&ending))
+}
+
+/// `wifi connect` arguments: the network (whose name may have spaces,
+/// quoted or not), maybe a password, maybe `--user NAME`.
+fn connect_request(words: &[String]) -> Result<String, String> {
+    let mut user = None;
+    let mut rest = Vec::new();
+    let mut words = words.iter();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--user" | "-u" => user = Some(words.next().ok_or("--user needs a name")?.clone()),
+            _ => rest.push(word.clone()),
+        }
+    }
+    if rest.is_empty() {
+        return Err(String::from("which network?"));
+    }
+    // "wifi connect Purdue Guest": the longest run of words naming a
+    // network seen in the last scan is the name; the rest is the password.
+    let split = (1..=rest.len()).rev().find(|&count| scanned(&rest[..count].join(" "))).unwrap_or(1);
+    let network = rest[..split].join(" ");
+    let mut password = rest[split..].join(" ");
+    if password.is_empty() {
+        let prompt = if user.is_some() { "Password: " } else { "Password (empty for an open network): " };
+        password = eli::term::read_password(prompt).unwrap_or_default();
+    }
+    match &user {
+        Some(_) if password.is_empty() => return Err(String::from("enterprise networks need a password")),
+        Some(_) => {}
+        None if !password.is_empty() && !(8..=63).contains(&password.len()) => {
+            return Err(String::from("WPA2 passwords are 8 to 63 characters (enterprise networks: --user NAME)"));
+        }
+        None => {}
+    }
+    Ok(alloc::format!("connect\n{network}\n{password}\n{}", user.unwrap_or_default()))
+}
+
+/// `wifi [scan | connect NETWORK [PASSWORD] [--user NAME] | disconnect]`:
+/// talks to the Wi-Fi driver through /proc/wifi, then waits for it to
+/// finish.
 pub fn wifi(arguments: &[String]) -> i32 {
     if !fs::exists(WIFI) {
         eprintln!("wifi: no Wi-Fi card");
@@ -127,19 +172,16 @@ pub fn wifi(arguments: &[String]) -> i32 {
         }
         Some("scan") => String::from("scan"),
         Some("disconnect") => String::from("disconnect"),
-        Some("connect") if arguments.len() == 3 || arguments.len() == 4 => {
-            let password = match arguments.get(3) {
-                Some(password) => password.clone(),
-                None => eli::term::read_password("Password (empty for an open network): ").unwrap_or_default(),
-            };
-            if !password.is_empty() && !(8..=63).contains(&password.len()) {
-                eprintln!("wifi: WPA2 passwords are 8 to 63 characters");
+        Some("connect") if arguments.len() >= 3 => match connect_request(&arguments[2..]) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("wifi: {error}");
                 return 1;
             }
-            alloc::format!("connect\n{}\n{password}", arguments[2])
-        }
+        },
         _ => {
-            eprintln!("usage: wifi [scan | connect NETWORK [PASSWORD] | disconnect]");
+            eprintln!("usage: wifi [scan | connect NETWORK [PASSWORD] [--user NAME] | disconnect]");
+            eprintln!("  enterprise networks (eduroam, campus Wi-Fi): wifi connect NETWORK --user NAME");
             return 2;
         }
     };
@@ -148,7 +190,8 @@ pub fn wifi(arguments: &[String]) -> i32 {
         eprintln!("wifi: {error}");
         return 1;
     }
-    // Joining takes a scan, the handshake and DHCP: allow a minute.
+    // Joining takes a scan, signing in, the handshake and DHCP: allow a
+    // minute.
     let deadline = time::monotonic_nanos() + 60_000_000_000;
     let mut last = String::new();
     loop {
