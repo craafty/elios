@@ -14,6 +14,7 @@ mod commands;
 mod edit;
 mod editor;
 mod gpt;
+mod greeter;
 mod init;
 mod installer;
 mod manager;

@@ -44,6 +44,7 @@ pub fn find(name: &str) -> Option<Command> {
         "wifi" => crate::network::wifi,
         "kill" => kill,
         "ln" => ln,
+        "greeter" => crate::greeter::greeter,
         "login" => crate::accounts::login,
         "ls" => ls,
         "lsblk" => crate::storage::lsblk,

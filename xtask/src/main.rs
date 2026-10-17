@@ -44,6 +44,7 @@ options:
   --usb-stick  attach the disk image as a USB stick instead of a SATA disk
                (as when eliOS is started from a stick on a real PC)
   --usb-hub    put the USB keyboard (and stick) behind a USB hub
+  --login-screen  session: boot to the login screen instead of a root shell
   --audio-wav FILE  record what eliOS plays to FILE.wav (otherwise the
                sound card's output goes nowhere)
 ";
@@ -98,6 +99,8 @@ struct Options {
     usb_stick: bool,
     /// USB devices go through a hub.
     usb_hub: bool,
+    /// Sessions start at the login screen, not logged in as root.
+    login_screen: bool,
     /// Use a throwaway copy of the firmware's variables (for tests).
     fresh_firmware: bool,
     /// Where to record the sound card's output.
@@ -114,17 +117,19 @@ fn main() -> ExitCode {
     };
 
     let result = match command.as_deref() {
-        Some("build") => build(&options).map(|_| ()),
-        Some("run") => build(&options).and_then(|disk| run(&disk, &options)),
+        Some("build") => build(&options, "").map(|_| ()),
+        Some("run") => build(&options, "").and_then(|disk| run(&disk, &options)),
         Some("test") => test(&options),
-        Some("session") => build(&options).and_then(|disk| {
+        // Scripted sessions start at a root shell rather than the login
+        // screen.
+        Some("session") => build(&options, if options.login_screen { "" } else { "autologin=root" }).and_then(|disk| {
             let mut qemu = qemu_command(&disk, &Options { qemu_args: Vec::new(), ..options.clone() })?;
             qemu.arg("-no-shutdown");
             session::run(qemu, &options.qemu_args, &workspace_root().join("target/session-monitor.sock"))
         }),
         Some("image") => {
             let options = Options { fresh: true, ..options };
-            build(&options).map(|disk| eprintln!("xtask: wrote {}", disk.display()))
+            build(&options, "").map(|disk| eprintln!("xtask: wrote {}", disk.display()))
         }
         Some("mirror") => mirror::run(workspace_root().join("target/alpine-cache")),
         Some("help" | "-h" | "--help") => {
@@ -165,6 +170,7 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options, Stri
             "--installed" => options.installed = true,
             "--usb-stick" => options.usb_stick = true,
             "--usb-hub" => options.usb_hub = true,
+            "--login-screen" => options.login_screen = true,
             "--audio-wav" => options.audio_wav = Some(args.next().ok_or("--audio-wav needs a file name")?.into()),
             "--cpus" => {
                 let count = args.next().and_then(|count| count.parse().ok()).filter(|&count| (1..=64).contains(&count));
@@ -198,20 +204,21 @@ fn profile(release: bool) -> &'static str {
     if release { "release" } else { "debug" }
 }
 
-/// Builds everything and puts it on the disk image. Returns the image.
-fn build(options: &Options) -> Result<PathBuf, String> {
+/// Builds everything and puts it on the disk image, with `command_line` as
+/// the kernel's command line. Returns the image.
+fn build(options: &Options, command_line: &str) -> Result<PathBuf, String> {
     let bootloader = build_bootloader(options.release)?;
     cargo(&["build", "--package", "elikernel", "--target", KERNEL_TARGET], options.release, &[])?;
     let kernel = workspace_root().join("target").join(KERNEL_TARGET).join(profile(options.release)).join("elikernel");
     let initrd = build_initrd()?;
-    make_disk_image("eliOS.img", &bootloader, &kernel, &initrd, options.fresh)
+    make_disk_image("eliOS.img", &bootloader, &kernel, &initrd, command_line, options.fresh)
 }
 
 fn test(options: &Options) -> Result<(), String> {
     let bootloader = build_bootloader(options.release)?;
     let kernel = build_test_kernel(options.release)?;
     let initrd = build_initrd()?;
-    let disk = make_disk_image("eliOS-test.img", &bootloader, &kernel, &initrd, true)?;
+    let disk = make_disk_image("eliOS-test.img", &bootloader, &kernel, &initrd, "", true)?;
 
     let mut qemu = qemu_command(&disk, &Options { fresh_firmware: true, ..options.clone() })?;
     qemu.args(["-display", "none", "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
@@ -290,12 +297,14 @@ fn cargo(args: &[&str], release: bool, environment: &[(&str, &str)]) -> Result<S
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Puts the bootloader, kernel and initrd on the disk image `target/<name>`.
+/// Puts the bootloader, kernel, initrd and kernel command line on the disk
+/// image `target/<name>`.
 fn make_disk_image(
     name: &str,
     bootloader: &Path,
     kernel: &Path,
     initrd: &Path,
+    command_line: &str,
     fresh: bool,
 ) -> Result<PathBuf, String> {
     let read = |path: &Path| fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()));
@@ -303,6 +312,7 @@ fn make_disk_image(
         ("EFI/BOOT/BOOTX64.EFI", read(bootloader)?),
         ("EFI/eliOS/kernel.elf", read(kernel)?),
         ("EFI/eliOS/initrd.cpio", read(initrd)?),
+        ("EFI/eliOS/cmdline.txt", command_line.as_bytes().to_vec()),
     ];
     let disk = workspace_root().join("target").join(name);
     image::build(&disk, &files, fresh)?;
@@ -361,6 +371,7 @@ fn build_initrd() -> Result<PathBuf, String> {
     symlink("/bin/eliutils", &sbin.join("init"))?;
     // Root's home starts out like everyone else's.
     copy_tree(&rootfs.join("etc/skel"), &rootfs.join("root"))?;
+    add_test_account(&rootfs)?;
     build_c_programs(&root.join("user/c"), &rootfs)?;
     add_busybox(&rootfs)?;
 
@@ -371,6 +382,26 @@ fn build_initrd() -> Result<PathBuf, String> {
     let path = root.join("target/initrd.cpio");
     fs::write(&path, archive).map_err(|e| format!("writing {}: {e}", path.display()))?;
     Ok(path)
+}
+
+/// The account development images come with, so trying a build (in QEMU
+/// or on the laptop) starts at the login screen with someone to log in as:
+/// `test`, password `1234`, an administrator. The installer leaves it
+/// behind; installed systems get the account made during installation.
+const TEST_ACCOUNT: &str =
+    "\n# For trying out development builds (password 1234).\nuser test\n    name = Test User\n    admin = yes\n";
+/// SHA-512 crypt of "1234" (`openssl passwd -6 -salt elitestaccount 1234`).
+const TEST_PASSWORD_HASH: &str =
+    "$6$elitestaccount$rPxv86OrC4jpcdoPPbms4lxhgvrXdM3exJG28XbQs/mAbRZ6kpAIztHVg3vnHkTvhkq4Kh4Yej3uqhm2K.ILM/";
+
+fn add_test_account(rootfs: &Path) -> Result<(), String> {
+    let append = |path: &Path, text: &str| {
+        let mut contents = fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        contents.push_str(text);
+        fs::write(path, contents).map_err(|e| format!("writing {}: {e}", path.display()))
+    };
+    append(&rootfs.join("etc/eli/system.conf"), TEST_ACCOUNT)?;
+    append(&rootfs.join("etc/shadow"), &format!("test:{TEST_PASSWORD_HASH}:20371:0:99999:7:::\n"))
 }
 
 /// Compiles the C programs in `user/c` with the host's C compiler, as

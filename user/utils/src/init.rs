@@ -1,10 +1,12 @@
 //! init: the first user process. It runs /etc/rc if there is one, then
-//! keeps a login session going on the console: `login` asks who you are
-//! and starts your shell, and when you log out, it asks again. As process 1
-//! it also collects orphaned processes when they exit.
+//! keeps a login session going on the console: the login screen
+//! (`greeter`) asks who you are and starts your session, and when you log
+//! out, it asks again. As process 1 it also collects orphaned processes
+//! when they exit.
 //!
-//! On the live system, /etc/autologin names an account (root) to log in
-//! automatically the first time, so the system starts at a prompt.
+//! An account named by `autologin` (in system.conf, or `autologin=NAME` on
+//! the kernel command line, which scripted test sessions use) is logged in
+//! automatically the first time, straight to a shell.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -14,6 +16,7 @@ use eli::{env, eprintln, fs, time};
 
 const SHELL: &str = "/bin/sh";
 const LOGIN: &str = "/bin/login";
+const GREETER: &str = "/bin/greeter";
 const ELI: &str = "/bin/eli";
 
 pub fn main() -> i32 {
@@ -40,13 +43,14 @@ pub fn main() -> i32 {
     let mut autologin = crate::accounts::autologin_user();
     loop {
         let started = time::monotonic_nanos();
-        let arguments: Vec<String> = match autologin.take() {
-            Some(user) => alloc::vec!["login".into(), "-f".into(), user],
-            None => alloc::vec!["login".into()],
+        let (program, arguments): (&str, Vec<String>) = match autologin.take() {
+            Some(user) => (LOGIN, alloc::vec!["login".into(), "-f".into(), user]),
+            None if fs::exists(GREETER) => (GREETER, alloc::vec!["greeter".into()]),
+            None => (LOGIN, alloc::vec!["login".into()]),
         };
-        match spawn(LOGIN, &arguments) {
+        match spawn(program, &arguments) {
             Ok(session) => wait_for(session),
-            Err(error) => eprintln!("init: can't start {LOGIN}: {error}"),
+            Err(error) => eprintln!("init: can't start {program}: {error}"),
         }
         // A session that ends immediately would otherwise respawn in a
         // busy loop.

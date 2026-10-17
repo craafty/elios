@@ -43,7 +43,7 @@ pub fn login(arguments: &[String]) -> i32 {
         let account = users::user_named(&entered);
         let authenticated = preauthenticated || authenticate(&entered, account.is_some());
         match account {
-            Some(user) if authenticated => return start_session(&user),
+            Some(user) if authenticated => return start_session(&user, None),
             _ => {
                 // Pause the same way whether the name or the password was
                 // wrong, so guessing names gains nothing.
@@ -67,8 +67,9 @@ fn authenticate(name: &str, exists: bool) -> bool {
     }
 }
 
-/// Becomes `user` and runs their shell as a login shell, in their home.
-fn start_session(user: &User) -> i32 {
+/// Becomes `user` and, in their home, runs `program` (the desktop, say),
+/// or else their shell as a login shell.
+pub fn start_session(user: &User, program: Option<&str>) -> i32 {
     // The terminal becomes theirs, so programs they run can reopen it.
     let tty_group = users::group_named(TTY_GROUP).map_or(user.gid, |group| group.gid);
     let _ = fs::set_owner("/dev/console", Some(user.uid), Some(tty_group));
@@ -83,6 +84,12 @@ fn start_session(user: &User) -> i32 {
         let _ = fs::set_current_dir("/");
         environment.retain(|variable| !variable.starts_with("HOME="));
         environment.push("HOME=/".into());
+    }
+    if let Some(program) = program {
+        let name = program.rsplit('/').next().unwrap_or(program).to_string();
+        let error = process::exec(program, &[name], &environment);
+        eprintln!("login: can't run {program}: {error}");
+        return 1;
     }
     if let Ok(motd) = fs::read_to_string("/etc/motd") {
         print!("{motd}");

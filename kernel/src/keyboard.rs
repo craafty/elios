@@ -160,7 +160,22 @@ pub fn send_key(key: Key) {
         Key::Delete => b"\x1b[3~",
         Key::PageUp => b"\x1b[5~",
         Key::PageDown => b"\x1b[6~",
-        Key::Function(_) => return,
+        // What Linux's console sends (TERM=linux).
+        Key::Function(n) => match n {
+            1 => b"\x1b[[A",
+            2 => b"\x1b[[B",
+            3 => b"\x1b[[C",
+            4 => b"\x1b[[D",
+            5 => b"\x1b[[E",
+            6 => b"\x1b[17~",
+            7 => b"\x1b[18~",
+            8 => b"\x1b[19~",
+            9 => b"\x1b[20~",
+            10 => b"\x1b[21~",
+            11 => b"\x1b[23~",
+            12 => b"\x1b[24~",
+            _ => return,
+        },
     };
     tty::input(bytes);
 }

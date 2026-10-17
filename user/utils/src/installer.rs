@@ -476,10 +476,11 @@ fn set_up_data(volume: &mut ext2::FileSystem<Device>, plan: &Plan) -> Result<Vec
     }
 
     // The live system's configuration, as a starting point: its packages
-    // come along.
+    // come along, its accounts don't.
     let live = fs::read_to_string("/etc/system.conf")
         .or_else(|_| fs::read_to_string("/etc/eli/system.conf"))
         .unwrap_or_default();
+    let live = crate::manager::without_users(&live);
     let mut config = crate::manager::set_setting(&live, "hostname", &plan.hostname);
     let account = crate::manager::ConfiguredUser {
         name: plan.user.clone(),

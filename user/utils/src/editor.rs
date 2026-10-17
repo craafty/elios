@@ -62,6 +62,8 @@ pub enum Key {
     Tab,
     Escape,
     Control(u8),
+    /// F1 to F12.
+    Function(u8),
     Unknown,
 }
 
@@ -105,6 +107,15 @@ fn read_escape() -> Key {
     loop {
         let Some(byte) = read_byte() else { return Key::Unknown };
         match byte {
+            // Linux's console: F1 to F5 are `ESC [ [ A` to `ESC [ [ E`.
+            b'[' if kind == b'[' && parameter == 0 => {
+                return match read_byte() {
+                    Some(letter @ b'A'..=b'E') => Key::Function(letter - b'A' + 1),
+                    _ => Key::Unknown,
+                };
+            }
+            // xterm: F1 to F4 are `ESC O P` to `ESC O S`.
+            b'P'..=b'S' if kind == b'O' => return Key::Function(byte - b'P' + 1),
             b'0'..=b'9' => parameter = parameter * 10 + u32::from(byte - b'0'),
             b'A' => return Key::Up,
             b'B' => return Key::Down,
@@ -119,6 +130,9 @@ fn read_escape() -> Key {
                     3 => Key::Delete,
                     5 => Key::PageUp,
                     6 => Key::PageDown,
+                    11..=15 => Key::Function(parameter as u8 - 10),
+                    17..=21 => Key::Function(parameter as u8 - 11),
+                    23 | 24 => Key::Function(parameter as u8 - 12),
                     _ => Key::Unknown,
                 };
             }

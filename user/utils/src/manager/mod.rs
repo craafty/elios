@@ -421,6 +421,15 @@ pub fn add_user_block(text: &str, user: &ConfiguredUser) -> String {
     config::add_user(text, user)
 }
 
+/// For the installer: system.conf's text without its accounts (the live
+/// system's, like the `test` account of development images, aren't for
+/// the installed one).
+pub fn without_users(text: &str) -> String {
+    let names: Vec<String> =
+        config::parse(text).map(|config| config.users.into_iter().map(|user| user.name).collect()).unwrap_or_default();
+    names.iter().fold(text.to_string(), |text, name| config::remove_user(&text, name))
+}
+
 /// The packages of the generation in use (that are really in the store).
 pub fn running_packages() -> Vec<String> {
     generations::current()
@@ -429,14 +438,15 @@ pub fn running_packages() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Who to log in without asking, at startup: system.conf's `autologin`,
-/// or on the live system (no data partition), root.
+/// Who to log in without asking, at startup: `autologin=NAME` on the
+/// kernel command line (scripted test sessions), or system.conf's
+/// `autologin`.
 pub fn autologin() -> Option<String> {
-    if let Some(name) = read_config().ok().and_then(|(_, config)| config.autologin) {
-        return Some(name);
+    let line = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    if let Some(name) = line.split_whitespace().find_map(|word| word.strip_prefix("autologin=")) {
+        return Some(name.into());
     }
-    let live = !fs::mounts().iter().any(|mount| mount.target == DATA);
-    live.then(|| "root".into())
+    read_config().ok().and_then(|(_, config)| config.autologin)
 }
 
 /// Whether this system is described by /etc/system.conf (it is once `eli

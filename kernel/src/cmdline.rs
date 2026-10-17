@@ -8,6 +8,8 @@
 //!   of the initrd (the first installer's layout).
 //! - `generation=N`: which system generation to start (eliboot's menu adds
 //!   it; `eli` reads it from /proc/cmdline).
+//! - `autologin=NAME`: init logs NAME in at a shell instead of showing the
+//!   login screen (`cargo xtask session` uses it).
 
 use alloc::string::String;
 use alloc::vec::Vec;

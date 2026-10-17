@@ -42,10 +42,14 @@ cargo xtask run
 ```
 
 The first build installs the nightly Rust toolchain eliOS uses and takes a
-few minutes. A QEMU window opens and eliOS boots to a shell, logged in as
-root (the live system has no password for root). You can type in the
-window, or in the terminal you ran the command from (the serial port is a
-second console). QEMU uses hardware virtualization (KVM) when it's
+few minutes. A QEMU window opens and eliOS boots to its login screen.
+Development builds come with an account to try them with: user `test`,
+password `1234` (an administrator: it can use `sudo`). Left and Right on
+the *session* line choose between the text console and the desktop;
+Enter logs in, and logging out comes back to the login screen (`root`,
+which has no password on the live system, works too). You can type in
+the window, or in the terminal you ran the command from (the serial port
+is a second console). QEMU uses hardware virtualization (KVM) when it's
 available.
 
 Things to try:
@@ -68,12 +72,12 @@ lsblk; df                     # disks, partitions, and free space
 ifconfig; ping -c 3 10.0.2.2  # the network (QEMU's virtual router)
 wget -O - http://example.com/ # the internet, if the host has it
 nettest                       # sockets through glibc: TCP, UDP, poll...
-eli add vim git               # programs from Alpine Linux (needs the internet)
-eli generations; eli rollback # every change is a generation you can go back to
-adduser --admin alice         # an account (--admin: may use sudo)
+sudo eli add vim git          # programs from Alpine Linux (needs the internet)
+eli generations               # every change is a generation you can go back to
+sudo adduser --admin alice    # an account (--admin: may use sudo)
 su - alice                    # become alice; or `logout` and log in as her
 sudo whoami                   # as alice: run a command as root
-poweroff                      # shut down (QEMU exits)
+sudo poweroff                 # shut down (QEMU exits)
 ```
 
 Other ways to run it:
@@ -97,10 +101,11 @@ cargo xtask image             # a fresh bootable disk image, target/eliOS.img
 
 eliOS has a small graphical desktop of its own, `desktop`, which runs
 Wayland programs. Start QEMU with some memory to spare (installed packages
-live in memory on the live system), then in eliOS:
+live in memory on the live system), then choose *Desktop* on the login
+screen, or in a text session:
 
 ```sh
-eli add foot font-dejavu      # a terminal, and a font for it
+sudo eli add foot font-dejavu # a terminal, and a font for it
 desktop foot                  # the desktop, with a terminal in it
 ```
 
@@ -113,7 +118,7 @@ server, content processes, a socket process) working on eliOS's kernel.
 It needs about 4 GiB of memory in QEMU (`cargo xtask run --memory 4G`):
 
 ```sh
-eli add firefox font-dejavu glycin-image-rs glycin-svg
+sudo eli add firefox font-dejavu glycin-image-rs glycin-svg
 desktop firefox https://example.com
 ```
 
@@ -134,18 +139,19 @@ sudo dd if=target/eliOS.img of=/dev/sdX bs=4M conv=fsync   # sdX = the stick
 
 ### Installing it
 
-`installer` (as root, which the live system is) copies eliOS onto another
+`installer` (as root: `sudo installer`) copies eliOS onto another
 disk: erasing it, or alongside another system in the disk's free space
 (the disk needs an EFI System Partition, which any PC with a UEFI-installed
-OS has). It asks for your account; the installed system boots to a login
-prompt, and your account can use `sudo`. Programs added with `eli` on the
+OS has). It asks for your account (the live system's `test` account stays
+behind); the installed system boots to the login screen, and your
+account can use `sudo`. Programs added with `eli` on the
 live system come along. On the installed system, the system itself boots
 from the image every time, and your files, packages and settings live on
 the data partition; press a key while it starts for a menu of earlier
 generations. Try it in QEMU:
 
 ```sh
-cargo xtask run --second-disk     # then, inside eliOS: installer
+cargo xtask run --second-disk     # then, inside eliOS: sudo installer
 cargo xtask run --installed       # boot the installed disk on its own
 ```
 
@@ -180,7 +186,8 @@ may work too, but QEMU is the one eliOS is tested on.
 3. The kernel sets up its own descriptor tables, interrupt controllers,
    timers, page tables, heap and scheduler, unpacks the initrd into an
    in-memory file system, mounts the boot disk at `/disk`, and starts
-   `/sbin/init`, which runs `login`, which starts your shell.
+   `/sbin/init`, which runs the login screen (`greeter`), which starts
+   your shell or the desktop.
 
 ### The kernel
 

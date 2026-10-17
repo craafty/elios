@@ -1298,8 +1298,10 @@ early or late. An empty hash means no password; one starting with `!` or
 
 ### Logging in
 
-init no longer starts a shell itself: it runs **login** on the console, and
-again whenever the session ends. login asks for a name and password (with
+init no longer starts a shell itself: it runs the login screen
+(**greeter**, below) on the console, and again whenever the session ends.
+Plain **login**, the classic prompt, is still there for serial lines and
+for when the greeter can't run. login asks for a name and password (with
 echo off, through the same termios flags as on Linux), pauses two seconds
 after a failure whether the name or the password was wrong (so names can't
 be probed), gives the user the terminal, sets their groups, group id and
@@ -1309,10 +1311,43 @@ changed), changes to their home and runs their shell as a login shell
 `PATH`, `TERM`). The shell's `logout` (or `exit`, or Ctrl+D) ends the
 session and login asks again.
 
-On the live system (no data partition), the first session logs root in
-without asking (the live image is for trying things, and root has no
-password there); `autologin = NAME` in system.conf does the same for any
-system (a kiosk, say). Every later session asks.
+`autologin = NAME` in system.conf logs NAME straight in to a shell for
+the first session (a kiosk, say), and so does `autologin=NAME` on the
+kernel command line, which is how `cargo xtask session` starts at a root
+shell. Every later session asks.
+
+### The login screen (`greeter.rs`)
+
+The greeter is a box in the middle of the console, in the style of the
+`ly` display manager: three fields, *session*, *login* and *password*.
+Up and Down (or Tab) move between them; Left and Right on *session*
+choose Text or Desktop; Enter logs in; F1 powers off and F2 reboots. The
+session is chosen at login, not at boot, so there's no boot menu or
+countdown to wait through, and a broken desktop never locks you out: Text
+still gets a shell.
+
+It's drawn with ordinary escape sequences (cursor positioning, colors,
+box-drawing characters, which the console font has), redrawn after every
+key, so it works on the framebuffer console and a serial line alike and
+needs nothing graphical. Function keys reach programs as the Linux
+console's sequences (`ESC [ [ A` for F1, `ESC [ 1 7 ~` for F6...), and the
+shell's key decoder knows them, so they don't type stray letters.
+
+Checking the password is login's code: unknown names and wrong passwords
+get the same answer after the same two-second pause. On success the
+greeter restores the terminal and calls the same session start as login,
+with the desktop (`/bin/desktop`) instead of the shell if that was the
+choice; the desktop runs as the user, who has the `video` and `input`
+groups for `/dev/fb0` and `/dev/input`. It remembers who logged in last
+and each person's session, in `/data/etc/greeter` (in `/run` on the live
+system), and fills them in next time, starting at the password.
+
+Development images (everything xtask builds) come with an account, `test`
+with password `1234`, an administrator: xtask adds it to the image's
+system.conf and shadow file, so trying a build in QEMU or on the laptop
+needs no account setup. The installer drops the live system's accounts
+from the configuration it copies; the installed system has only the one
+made while installing.
 
 ### su, sudo and passwd
 
@@ -2443,8 +2478,9 @@ usual Ctrl shortcuts. It redraws the line on each key, which the console
 handles cheaply.
 
 **init** (`init.rs`) runs `/etc/rc` if present, then keeps a login session
-going on the console: it runs `login`, and when the session ends, runs it
-again (with a pause if sessions end immediately, to avoid a busy loop). It
+going on the console: it runs the login screen (`greeter`; `login` for an
+automatic login or if the greeter is missing), and when the session ends,
+runs it again (with a pause if sessions end immediately, to avoid a busy loop). It
 also collects orphaned processes. `login` prints the welcome message.
 
 **Accounts** (`accounts.rs`): `login`, `adduser`, `deluser`, `id`,
@@ -2794,8 +2830,11 @@ ordinary, writable disk, and QEMU boots it directly.
 `cargo xtask session -- steps...` boots eliOS headless, types commands at
 the shell (waiting for each prompt, `#` or `$`), can wait for text to
 appear (`@wait Password:`), press keys through the QEMU monitor and take
-screenshots, then prints a clean transcript. Boot counts as done at a
-shell prompt or a login prompt. It's how end-to-end behavior is checked
+screenshots, then prints a clean transcript. Sessions pass
+`autologin=root` on the kernel command line (`\EFI\eliOS\cmdline.txt`),
+so they start at a root shell; `--login-screen` leaves it out, to test the
+greeter (log in with `@early` steps). Boot counts as done at a shell
+prompt or a login prompt. It's how end-to-end behavior is checked
 without a person typing. `@timeout SECONDS` changes how long the following
 steps may take (installing Firefox takes minutes).
 
