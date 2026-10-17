@@ -69,6 +69,12 @@ pub fn init() -> Result<(), &'static str> {
     send_command(WRITE_CONFIG)?;
     write_data(config)?;
     send_command(ENABLE_FIRST_PORT)?;
+    // Held keys repeat after 250 ms, 30 times a second (Linux's choice).
+    // Firmware leaves the keyboard's default, 500 ms and about 11 a second,
+    // which makes holding Backspace feel sluggish. Not fatal if refused.
+    if let Err(why) = set_typematic(0x00) {
+        debug!("keyboard: setting the repeat rate failed: {why}");
+    }
 
     interrupts::set_handler(KEYBOARD_VECTOR, on_interrupt);
     apic::route_isa_irq(KEYBOARD_IRQ, KEYBOARD_VECTOR)?;
@@ -163,6 +169,18 @@ pub fn send_key(key: Key) {
 pub fn simulate_scancode(scancode: u8) {
     send_command(WRITE_FIRST_PORT_OUTPUT).unwrap();
     write_data(scancode).unwrap();
+}
+
+/// Sends "set typematic rate and delay" (0xF3) and its parameter to the
+/// keyboard, each answered with an acknowledgement (0xFA).
+fn set_typematic(parameter: u8) -> Result<(), &'static str> {
+    for byte in [0xF3, parameter] {
+        write_data(byte)?;
+        if read_data()? != 0xFA {
+            return Err("the keyboard didn't acknowledge");
+        }
+    }
+    Ok(())
 }
 
 /// Waits (briefly) until the controller can accept a byte.

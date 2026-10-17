@@ -16,7 +16,7 @@ use crate::keyboard::Key;
 /// An input event: type, code, value (see [`input`]).
 pub type InputEvent = (u16, u16, i32);
 
-const REPEAT_DELAY_MS: u64 = 500;
+const REPEAT_DELAY_MS: u64 = 250;
 const REPEAT_INTERVAL_MS: u64 = 33;
 
 const CAPS_LOCK: u8 = 0x39;
@@ -223,10 +223,10 @@ mod tests {
             let mut keys = Vec::new();
             keyboard.report(&[0, 0, 0x04, 0, 0, 0, 0, 0], 1000, &mut keys, &mut Vec::new());
             assert_eq!(keyboard.repeat(1100), None);
-            assert_eq!(keyboard.repeat(1500), Some(Key::Char('a')));
-            assert_eq!(keyboard.repeat(1510), None);
-            assert_eq!(keyboard.next_repeat(), Some(1533));
-            keyboard.report(&[0; 8], 1520, &mut keys, &mut Vec::new());
+            assert_eq!(keyboard.repeat(1250), Some(Key::Char('a')));
+            assert_eq!(keyboard.repeat(1260), None);
+            assert_eq!(keyboard.next_repeat(), Some(1283));
+            keyboard.report(&[0; 8], 1270, &mut keys, &mut Vec::new());
             assert_eq!(keyboard.next_repeat(), None);
         }
 

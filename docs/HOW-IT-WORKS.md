@@ -1641,7 +1641,10 @@ translate scancodes to set 1, so the decoder needs only one table whatever
 the keyboard speaks. The interrupt handler only queues raw scancodes (in a
 lock-free queue) and wakes the keyboard thread, which decodes them (shift,
 caps lock, ctrl, extended keys; US layout) and feeds the terminal. Keeping
-the handler tiny keeps interrupts short.
+the handler tiny keeps interrupts short. At start-up the keyboard is
+told to repeat held keys after 250 ms, 30 times a second (Linux's
+setting; the power-on default of 500 ms and about 11 a second makes
+holding Backspace drag).
 
 Both this and the USB keyboard driver turn keys into `Key` values and hand
 them to `keyboard::send_key`, which sends the terminal the bytes a terminal
@@ -1752,7 +1755,7 @@ up to six keys held down. eliOS selects the boot protocol, configures the
 keyboard's interrupt endpoint, and keeps one transfer queued on it; each
 completed transfer is a report. A key press is a key that's in a report
 but wasn't in the previous one. USB keyboards don't repeat held keys (PS/2
-ones do it themselves), so the driver does: after 500 ms, every 33 ms. It
+ones do it themselves), so the driver does: after 250 ms, every 33 ms (as PS/2 is set up). It
 also sets the Caps Lock LED.
 
 **Mice** use the boot protocol too: a byte of buttons and signed X, Y and
@@ -2231,7 +2234,10 @@ The layers, bottom up:
   Ethernet address is needed. ARP broadcasts "who has 10.0.2.2?", caches
   answers for five minutes, and holds packets for an address being looked
   up (up to 16, for three tries a second apart). Requests for our own
-  address are answered.
+  address are answered. The gateway is asked about as soon as DHCP
+  finishes, so the first packet out doesn't wait for it (on Wi-Fi that
+  wait made the first `ping` look lost; `ping` also counts late replies,
+  as Linux's does).
 - **IPv4**: headers are checked (version, lengths, checksum) and packets
   for other machines are dropped. Packets go to the local network directly
   or through the gateway, chosen by the netmask. Outgoing packets set

@@ -567,6 +567,7 @@ impl Stack {
             None => {
                 let request = self.arp.queue(next_hop, packet, time::ticks());
                 if request {
+                    debug!("net: ARP: who has {next_hop}?");
                     self.send_arp_request(next_hop);
                 }
             }

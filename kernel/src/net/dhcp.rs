@@ -191,6 +191,12 @@ impl Stack {
                 }
                 self.dhcp.state = State::Bound;
                 self.dhcp.new_dns = Some(dns);
+                // Look the gateway up now, so the first packet out doesn't
+                // wait for it (on Wi-Fi that wait can outlast a ping).
+                if let Some(router) = router {
+                    debug!("net: ARP: who has {router} (the gateway)?");
+                    self.send_arp_request(router);
+                }
             }
             (State::Requesting, NAK) => {
                 self.dhcp.state = State::Discovering;

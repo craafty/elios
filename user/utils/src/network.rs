@@ -270,9 +270,12 @@ pub fn ping(arguments: &[String]) -> i32 {
             return 2;
         }
     };
-    let _ = socket.set_read_timeout(1000);
     println!("PING {host} ({address}): 56 data bytes");
-    let mut received = 0;
+    // Like Linux's ping, one request a second, and a reply counts whenever
+    // it comes: the first often waits for the gateway's Ethernet address
+    // (ARP), and on Wi-Fi that can take longer than a second.
+    let mut sent_at = Vec::new();
+    let mut answered = Vec::new();
     let mut times = Vec::new();
     for sequence in 1..=count {
         // An echo request: type 8, code 0, checksum, identifier (the kernel
@@ -285,36 +288,46 @@ pub fn ping(arguments: &[String]) -> i32 {
             eprintln!("ping: {error}");
             return 1;
         }
+        sent_at.push(sent);
+        answered.push(false);
+        // Listen until the next request is due; after the last, a little
+        // longer for stragglers.
+        let window = if sequence < count { 1_000_000_000 } else { 2_000_000_000 };
         let mut reply = [0u8; 1500];
         loop {
-            match socket.receive_from(&mut reply) {
-                Ok((length, from))
-                    if length >= 8 && reply[0] == 0 && reply[6..8] == (sequence as u16).to_be_bytes() =>
-                {
-                    let microseconds = (time::monotonic_nanos() - sent) / 1000;
-                    println!(
-                        "{} bytes from {}: icmp_seq={sequence} time={}.{:03} ms",
-                        length,
-                        from.ip,
-                        microseconds / 1000,
-                        microseconds % 1000
-                    );
-                    received += 1;
-                    times.push(microseconds);
-                    break;
-                }
-                Ok(_) => continue,
-                Err(_) => {
-                    println!("no reply for icmp_seq={sequence}");
-                    break;
-                }
+            let left_ms = (sent + window).saturating_sub(time::monotonic_nanos()) / 1_000_000;
+            if left_ms == 0 || answered.iter().all(|&done| done) && sequence < count {
+                break;
+            }
+            let _ = socket.set_read_timeout(left_ms);
+            let Ok((length, from)) = socket.receive_from(&mut reply) else { break };
+            if length < 8 || reply[0] != 0 {
+                continue;
+            }
+            let number = usize::from(u16::from_be_bytes([reply[6], reply[7]]));
+            if number == 0 || number > answered.len() || answered[number - 1] {
+                continue;
+            }
+            answered[number - 1] = true;
+            let microseconds = (time::monotonic_nanos() - sent_at[number - 1]) / 1000;
+            println!(
+                "{length} bytes from {}: icmp_seq={number} time={}.{:03} ms",
+                from.ip,
+                microseconds / 1000,
+                microseconds % 1000
+            );
+            times.push(microseconds);
+            if sequence == count && answered.iter().all(|&done| done) {
+                break;
             }
         }
+        // Without a reply, wait out the rest of the second anyway.
         if sequence < count {
             let elapsed_ms = (time::monotonic_nanos() - sent) / 1_000_000;
             time::sleep_ms(1000u64.saturating_sub(elapsed_ms));
         }
     }
+    let received = times.len() as u32;
     println!("--- {host} ping statistics ---");
     let loss = (count - received) * 100 / count.max(1);
     println!("{count} packets transmitted, {received} received, {loss}% packet loss");

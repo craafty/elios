@@ -68,10 +68,17 @@ impl Cache {
     /// Addresses to ask about again; lookups that ran out of attempts are
     /// dropped with their packets.
     pub fn retries(&mut self, now: u64) -> Vec<Ipv4> {
-        self.lookups.retain(|lookup| lookup.attempts < ATTEMPTS || lookup.next_attempt > now);
+        self.lookups.retain(|lookup| {
+            let keep = lookup.attempts < ATTEMPTS || lookup.next_attempt > now;
+            if !keep {
+                debug!("net: ARP: no answer for {}; {} packets dropped", lookup.address, lookup.packets.len());
+            }
+            keep
+        });
         let mut due = Vec::new();
         for lookup in self.lookups.iter_mut().filter(|lookup| lookup.next_attempt <= now) {
             lookup.attempts += 1;
+            debug!("net: ARP: asking for {} again (attempt {})", lookup.address, lookup.attempts);
             lookup.next_attempt = now + RETRY_MS;
             due.push(lookup.address);
         }
@@ -109,6 +116,9 @@ impl Stack {
         let Some(address) = self.config().map(|config| config.address) else { return };
 
         let waiting = self.arp.learn(sender, sender_mac, crate::time::ticks());
+        if !waiting.is_empty() {
+            debug!("net: ARP: {sender} is at {sender_mac:02x?}; sending {} waiting packets", waiting.len());
+        }
         for ip_packet in waiting {
             self.send_frame(sender_mac, super::ETHERTYPE_IPV4, &ip_packet);
         }
