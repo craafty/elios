@@ -563,7 +563,12 @@ impl Stack {
         let next_hop =
             if config.on_link(destination) { destination } else { config.gateway.ok_or(Errno::ENETUNREACH)? };
         match self.arp.lookup(next_hop) {
-            Some(mac) => self.send_frame(mac, ETHERTYPE_IPV4, &packet),
+            Some(mac) => {
+                self.send_frame(mac, ETHERTYPE_IPV4, &packet);
+                if self.arp.refresh_due(next_hop, time::ticks()) {
+                    self.send_arp_request(next_hop);
+                }
+            }
             None => {
                 let request = self.arp.queue(next_hop, packet, time::ticks());
                 if request {

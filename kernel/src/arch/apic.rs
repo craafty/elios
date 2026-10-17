@@ -69,6 +69,16 @@ fn local_write(register: usize, value: u32) {
 
 /// Enables this CPU's local APIC with everything masked except error and
 /// NMI delivery.
+/// The local APIC reports a delivery problem (seen once at boot on the
+/// T440p while the Ethernet chip resets). Logged, not fatal: Linux does
+/// the same.
+fn on_error(_frame: &mut super::interrupts::InterruptFrame) {
+    // The error status register latches on a write, then reads.
+    local_write(ERROR_STATUS, 0);
+    let status = local_read(ERROR_STATUS);
+    debug!("apic: error interrupt, status {status:#x}");
+}
+
 pub fn init_local(madt: &Madt) {
     // SAFETY: IA32_APIC_BASE exists on every x86_64 CPU; setting the enable
     // bit keeps the APIC at its current address.
@@ -93,6 +103,7 @@ pub fn init_local(madt: &Madt) {
     }
 
     local_write(LVT_TIMER, LVT_MASKED);
+    super::interrupts::set_handler(APIC_ERROR, on_error);
     local_write(LVT_ERROR, u32::from(APIC_ERROR));
     // The error status register must be written before it's read.
     local_write(ERROR_STATUS, 0);

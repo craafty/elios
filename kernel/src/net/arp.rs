@@ -8,8 +8,14 @@ use super::{BROADCAST_MAC, ETHERTYPE_ARP, Ipv4, Stack, read_u16};
 
 /// How long answers are trusted.
 const LIFETIME_MS: u64 = 5 * 60 * 1000;
-const RETRY_MS: u64 = 1000;
-const ATTEMPTS: u32 = 3;
+/// Waits between tries: the first answer is often lost on Wi-Fi (the
+/// T440p's first request on Purdue's network went unanswered while the
+/// second came back in 13 ms), so the second try goes out quickly.
+const RETRY_MS: [u64; 4] = [300, 1000, 1000, 1000];
+/// Entries in use are asked about again this long before they expire, so
+/// the gateway never drops out of the cache under a running connection.
+const REFRESH_MS: u64 = 30 * 1000;
+const ATTEMPTS: u32 = 4;
 /// Packets kept per address while waiting for an answer.
 const QUEUE_LIMIT: usize = 16;
 
@@ -17,6 +23,8 @@ struct Entry {
     address: Ipv4,
     mac: [u8; 6],
     expires: u64,
+    /// Whether it has been asked about again before expiring.
+    refreshing: bool,
 }
 
 /// An address being looked up, and the packets waiting for the answer.
@@ -42,6 +50,15 @@ impl Cache {
         self.entries.iter().find(|entry| entry.address == address && entry.expires > now).map(|entry| entry.mac)
     }
 
+    /// Whether `address`, about to be used, should be asked about again:
+    /// once, shortly before its entry expires (the answer renews it).
+    pub fn refresh_due(&mut self, address: Ipv4, now: u64) -> bool {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.address == address) else { return false };
+        let due = !entry.refreshing && entry.expires.saturating_sub(now) < REFRESH_MS;
+        entry.refreshing |= due;
+        due
+    }
+
     /// Holds `packet` until `address` is found. Returns whether a request
     /// should go out now (it's the first packet waiting).
     pub fn queue(&mut self, address: Ipv4, packet: Vec<u8>, now: u64) -> bool {
@@ -51,14 +68,19 @@ impl Cache {
             }
             return false;
         }
-        self.lookups.push(Lookup { address, packets: alloc::vec![packet], attempts: 1, next_attempt: now + RETRY_MS });
+        self.lookups.push(Lookup {
+            address,
+            packets: alloc::vec![packet],
+            attempts: 1,
+            next_attempt: now + RETRY_MS[0],
+        });
         true
     }
 
     /// Records an answer; returns the packets that were waiting for it.
     fn learn(&mut self, address: Ipv4, mac: [u8; 6], now: u64) -> Vec<Vec<u8>> {
         self.entries.retain(|entry| entry.address != address && entry.expires > now);
-        self.entries.push(Entry { address, mac, expires: now + LIFETIME_MS });
+        self.entries.push(Entry { address, mac, expires: now + LIFETIME_MS, refreshing: false });
         match self.lookups.iter().position(|lookup| lookup.address == address) {
             Some(index) => self.lookups.remove(index).packets,
             None => Vec::new(),
@@ -77,9 +99,9 @@ impl Cache {
         });
         let mut due = Vec::new();
         for lookup in self.lookups.iter_mut().filter(|lookup| lookup.next_attempt <= now) {
+            lookup.next_attempt = now + RETRY_MS[lookup.attempts as usize % RETRY_MS.len()];
             lookup.attempts += 1;
             debug!("net: ARP: asking for {} again (attempt {})", lookup.address, lookup.attempts);
-            lookup.next_attempt = now + RETRY_MS;
             due.push(lookup.address);
         }
         due
@@ -144,5 +166,38 @@ impl Stack {
         packet.extend_from_slice(&target.0);
         let destination = if operation == OPERATION_REQUEST { BROADCAST_MAC } else { target_mac };
         self.send_frame(destination, ETHERTYPE_ARP, &packet);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    crate::ktest! {
+        fn lookups_retry_quickly_then_give_up() {
+            let (mut cache, gateway) = (Cache::new(), Ipv4([10, 0, 0, 1]));
+            assert!(cache.queue(gateway, alloc::vec![1], 0));
+            assert!(!cache.queue(gateway, alloc::vec![2], 10));
+            assert!(cache.retries(299).is_empty());
+            assert_eq!(cache.retries(300), [gateway]);
+            assert_eq!(cache.retries(1300), [gateway]);
+            assert_eq!(cache.retries(2300), [gateway]);
+            assert!(cache.retries(3299).is_empty());
+            assert_eq!(cache.next_deadline(), Some(3300));
+            cache.retries(3300);
+            assert_eq!(cache.next_deadline(), None);
+        }
+
+        fn answers_release_packets_and_are_refreshed_once() {
+            let (mut cache, gateway) = (Cache::new(), Ipv4([10, 0, 0, 1]));
+            cache.queue(gateway, alloc::vec![1], 0);
+            assert_eq!(cache.learn(gateway, [2; 6], 5), [alloc::vec![1]]);
+            assert!(!cache.refresh_due(gateway, 1000));
+            let late = 5 + LIFETIME_MS - REFRESH_MS + 1;
+            assert!(cache.refresh_due(gateway, late));
+            assert!(!cache.refresh_due(gateway, late + 1));
+            cache.learn(gateway, [2; 6], late + 2);
+            assert!(!cache.refresh_due(gateway, late + 3));
+        }
     }
 }

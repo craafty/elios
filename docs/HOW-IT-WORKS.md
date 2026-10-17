@@ -2233,7 +2233,9 @@ The layers, bottom up:
 - **ARP** (`arp.rs`): to send to a machine on the local network, its
   Ethernet address is needed. ARP broadcasts "who has 10.0.2.2?", caches
   answers for five minutes, and holds packets for an address being looked
-  up (up to 16, for three tries a second apart). Requests for our own
+  up (up to 16, for four tries: 0.3 s, then a second apart, since the
+  first request was often lost on Wi-Fi). Addresses in use are asked about
+  again shortly before their entries expire. Requests for our own
   address are answered. The gateway is asked about as soon as DHCP
   finishes, so the first packet out doesn't wait for it (on Wi-Fi that
   wait made the first `ping` look lost; `ping` also counts late replies,
