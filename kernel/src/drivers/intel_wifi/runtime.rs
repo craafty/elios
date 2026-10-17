@@ -740,7 +740,17 @@ impl Radio<'_> {
             [(cmd::DATA_QUEUE, 0, cmd::FIFO_BEST_EFFORT), (cmd::MANAGEMENT_QUEUE, cmd::MANAGEMENT_TID, cmd::FIFO_VOICE)]
         {
             let ssn = self.card.enable_queue(queue, 0);
-            self.checked(cmd::QUEUE_CONFIG, &cmd::queue_config(queue, cmd::AP_STATION, tid, fifo, ssn), "queue")?;
+            let response =
+                self.command(cmd::QUEUE_CONFIG, &cmd::queue_config(queue, cmd::AP_STATION, tid, fifo, ssn))?;
+            // The answer isn't a status word: it echoes the token, station,
+            // TID and queue (SCD_QUEUE_CFG_RSP), as the 7260 showed.
+            let echo = response.data.get(..4).unwrap_or_default();
+            debug!("wifi: queue {queue}: firmware answered {echo:02x?}");
+            if echo.get(1) != Some(&cmd::AP_STATION) || echo.get(3) != Some(&(queue as u8)) {
+                return Err(JoinError::Failed(alloc::format!(
+                    "the firmware didn't set up queue {queue} ({echo:02x?})"
+                )));
+            }
         }
         let queues = 1 << cmd::DATA_QUEUE | 1 << cmd::MANAGEMENT_QUEUE;
         let station = Station {
@@ -761,7 +771,10 @@ impl Radio<'_> {
             )));
         }
         let basic = self.basic_rate(&bss);
-        self.checked(cmd::LINK_QUALITY, &cmd::link_quality(cmd::AP_STATION, &[basic], false), "link quality")?;
+        // Linux never reads this command's answer; log it rather than
+        // guess what it means.
+        let response = self.command(cmd::LINK_QUALITY, &cmd::link_quality(cmd::AP_STATION, &[basic], false))?;
+        debug!("wifi: link quality: firmware answered {:02x?}", response.data.get(..8).unwrap_or_default());
 
         // 3. Stay on the channel, then authenticate and associate.
         let response = self.command(cmd::TIME_EVENT, &cmd::time_event(cmd::ADD, JOIN_TIME, 0))?;
