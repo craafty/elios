@@ -1,61 +1,15 @@
-//! Drawing: everything is composed in a back buffer in ordinary memory,
-//! and only the parts that changed are copied to the screen, which is
-//! write-combined video memory (fast to write in order, very slow to
-//! read). Pixels are 32-bit 0xAARRGGBB, which is also what Wayland's
-//! ARGB8888 and XRGB8888 buffers hold and what the framebuffer takes
-//! (blue in the lowest byte).
+//! The screen: everything is composed in a back buffer in ordinary
+//! memory (drawn with `ui::draw`), and only the parts that changed are
+//! copied to the screen, which is write-combined video memory (fast to
+//! write in order, very slow to read).
 
-use alloc::collections::BTreeMap;
-use alloc::format;
-use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use ui::Canvas;
+pub use ui::draw::{Font, Rect};
+
 use crate::sys;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rect {
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
-}
-
-impl Rect {
-    pub const fn new(x: i32, y: i32, width: i32, height: i32) -> Self {
-        Self { x, y, width, height }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.width <= 0 || self.height <= 0
-    }
-
-    pub fn contains(&self, x: i32, y: i32) -> bool {
-        x >= self.x && y >= self.y && x < self.x + self.width && y < self.y + self.height
-    }
-
-    pub fn intersect(&self, other: &Rect) -> Rect {
-        let x = self.x.max(other.x);
-        let y = self.y.max(other.y);
-        let right = (self.x + self.width).min(other.x + other.width);
-        let bottom = (self.y + self.height).min(other.y + other.height);
-        Rect::new(x, y, right - x, bottom - y)
-    }
-
-    pub fn union(&self, other: &Rect) -> Rect {
-        if self.is_empty() {
-            return *other;
-        }
-        if other.is_empty() {
-            return *self;
-        }
-        let x = self.x.min(other.x);
-        let y = self.y.min(other.y);
-        let right = (self.x + self.width).max(other.x + other.width);
-        let bottom = (self.y + self.height).max(other.y + other.height);
-        Rect::new(x, y, right - x, bottom - y)
-    }
-}
 
 /// The screen and the back buffer drawn into.
 pub struct Screen {
@@ -145,15 +99,14 @@ impl Screen {
         }
     }
 
+    fn canvas(&mut self, clip: Rect) -> Canvas<'_> {
+        let mut canvas = Canvas::new(&mut self.back, self.width, self.height);
+        canvas.set_clip(clip);
+        canvas
+    }
+
     pub fn fill(&mut self, rect: Rect, color: u32) {
-        let area = rect.intersect(&self.bounds());
-        if area.is_empty() {
-            return;
-        }
-        for y in area.y..area.y + area.height {
-            let row = (y * self.width + area.x) as usize;
-            self.back[row..row + area.width as usize].fill(color);
-        }
+        self.canvas(rect).fill(rect, color);
     }
 
     /// Draws `pixels` (`width` wide, rows `stride` apart) with its top left
@@ -171,111 +124,13 @@ impl Screen {
         alpha: bool,
         clip: Rect,
     ) {
-        let area = Rect::new(x, y, width, height).intersect(&clip).intersect(&self.bounds());
-        if area.is_empty() {
-            return;
-        }
-        for row in area.y..area.y + area.height {
-            let source_start = (row - y) as usize * stride + (area.x - x) as usize;
-            let Some(source) = pixels.get(source_start..source_start + area.width as usize) else { continue };
-            let target_start = (row * self.width + area.x) as usize;
-            let target = &mut self.back[target_start..target_start + area.width as usize];
-            if !alpha {
-                target.copy_from_slice(source);
-                continue;
-            }
-            for (out, &pixel) in target.iter_mut().zip(source) {
-                let a = pixel >> 24;
-                if a == 0xFF {
-                    *out = pixel;
-                } else if a != 0 {
-                    *out = blend(*out, pixel, a);
-                }
-            }
-        }
+        self.canvas(clip).blit(pixels, width, height, stride, x, y, alpha);
     }
 
     /// Draws `text` with its top-left corner at (`x`, `y`), in `color`
     /// over whatever is there.
     pub fn text(&mut self, font: &mut Font, x: i32, y: i32, text: &str, color: u32, clip: Rect) {
-        let clip = clip.intersect(&self.bounds());
-        let baseline = y + font.ascent;
-        let mut pen = x as f32;
-        for c in text.chars() {
-            let (glyph, advance) = font.glyph(c);
-            let left = pen as i32 + glyph.left;
-            let top = baseline - glyph.top;
-            for row in 0..glyph.height {
-                let py = top + row as i32;
-                for column in 0..glyph.width {
-                    let px = left + column as i32;
-                    let coverage = u32::from(glyph.coverage[row * glyph.width + column]);
-                    if coverage != 0 && clip.contains(px, py) {
-                        let out = &mut self.back[(py * self.width + px) as usize];
-                        *out = blend(*out, premultiply(color, coverage), coverage);
-                    }
-                }
-            }
-            pen += *advance;
-        }
-    }
-}
-
-/// `color` at `alpha` (0 to 255), premultiplied as `blend` wants it.
-fn premultiply(color: u32, alpha: u32) -> u32 {
-    let channel = |shift: u32| (((color >> shift & 0xFF) * alpha + 127) / 255) << shift;
-    alpha << 24 | channel(16) | channel(8) | channel(0)
-}
-
-/// `over` drawn on `under`, with `over`'s (premultiplied) alpha `a`.
-fn blend(under: u32, over: u32, a: u32) -> u32 {
-    let inverse = 255 - a;
-    let channel = |shift: u32| {
-        let value = (over >> shift & 0xFF) + ((under >> shift & 0xFF) * inverse + 127) / 255;
-        value.min(255) << shift
-    };
-    0xFF00_0000 | channel(16) | channel(8) | channel(0)
-}
-
-/// The font the desktop writes with (the system's TrueType font at one
-/// size), with each glyph rasterized the first time it's drawn.
-pub struct Font {
-    face: truetype::Font,
-    size: f32,
-    /// From the top of a line to its baseline, in pixels.
-    pub ascent: i32,
-    pub line_height: i32,
-    glyphs: BTreeMap<char, (truetype::Bitmap, f32)>,
-}
-
-pub const FONT_PATH: &str = "/usr/share/fonts/dejavu/DejaVuSansMono.ttf";
-
-impl Font {
-    pub fn load(size: f32) -> Result<Self, String> {
-        let data = eli::fs::read(FONT_PATH).map_err(|error| format!("can't read {FONT_PATH}: {error}"))?;
-        let face = truetype::Font::parse(data).map_err(|error| format!("{FONT_PATH}: {error:?}"))?;
-        let metrics = face.line_metrics(size);
-        Ok(Self {
-            ascent: metrics.ascent as i32 + 1,
-            line_height: metrics.height() as i32 + 1,
-            face,
-            size,
-            glyphs: BTreeMap::new(),
-        })
-    }
-
-    /// `c`'s bitmap and advance.
-    fn glyph(&mut self, c: char) -> &(truetype::Bitmap, f32) {
-        let (face, size) = (&self.face, self.size);
-        self.glyphs.entry(c).or_insert_with(|| {
-            let glyph = face.glyph_index(c);
-            (face.rasterize(glyph, size), face.advance(glyph, size))
-        })
-    }
-
-    /// How wide `text` is, in pixels.
-    pub fn width(&mut self, text: &str) -> i32 {
-        text.chars().map(|c| self.glyph(c).1).sum::<f32>() as i32
+        self.canvas(clip).text(font, x, y, text, color);
     }
 }
 

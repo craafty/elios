@@ -11,14 +11,15 @@ use alloc::vec::Vec;
 
 use crate::sys;
 
-/// A message received from a client.
+/// A message received: a request (by the compositor) or an event (by a
+/// client).
 pub struct Message {
     pub object: u32,
     pub opcode: u16,
     pub arguments: Vec<u8>,
 }
 
-/// One client's connection: what's been read but not yet handled, and
+/// One end of a connection: what's been read but not yet handled, and
 /// what's waiting to be sent.
 pub struct Connection {
     pub fd: i32,
@@ -28,7 +29,7 @@ pub struct Connection {
     output_fds: Vec<i32>,
 }
 
-/// Why a client is being disconnected.
+/// Why a connection is being given up.
 #[derive(Debug)]
 pub enum Broken {
     Closed,
@@ -40,7 +41,7 @@ impl Connection {
         Self { fd, input: Vec::new(), input_fds: VecDeque::new(), output: Vec::new(), output_fds: Vec::new() }
     }
 
-    /// Reads whatever the client has sent.
+    /// Reads whatever the other side has sent.
     pub fn read(&mut self) -> Result<(), Broken> {
         let mut buffer = [0u8; 16384];
         loop {
@@ -79,17 +80,22 @@ impl Connection {
         Ok(Some(Message { object, opcode: word as u16, arguments }))
     }
 
-    /// The next descriptor the client sent (for an `fd` argument).
+    /// The next descriptor the other side sent (for an `fd` argument).
     pub fn take_fd(&mut self) -> Option<i32> {
         self.input_fds.pop_front()
     }
 
-    pub fn send(&mut self, event: Event) {
-        let size = (event.bytes.len() + 8) as u32;
-        self.output.extend_from_slice(&event.object.to_le_bytes());
-        self.output.extend_from_slice(&(size << 16 | u32::from(event.opcode)).to_le_bytes());
-        self.output.extend_from_slice(&event.bytes);
-        self.output_fds.extend(event.fds);
+    pub fn send(&mut self, message: Outgoing) {
+        let size = (message.bytes.len() + 8) as u32;
+        self.output.extend_from_slice(&message.object.to_le_bytes());
+        self.output.extend_from_slice(&(size << 16 | u32::from(message.opcode)).to_le_bytes());
+        self.output.extend_from_slice(&message.bytes);
+        self.output_fds.extend(message.fds);
+    }
+
+    /// Whether anything is still waiting to be sent.
+    pub fn has_output(&self) -> bool {
+        !self.output.is_empty()
     }
 
     /// Sends what's queued, as much as the socket takes.
@@ -142,6 +148,11 @@ impl<'a> Arguments<'a> {
         self.uint().map(|value| value as i32)
     }
 
+    /// A 24.8 fixed-point number.
+    pub fn fixed(&mut self) -> Result<f64, Broken> {
+        self.int().map(|value| f64::from(value) / 256.0)
+    }
+
     pub fn array(&mut self) -> Result<Vec<u8>, Broken> {
         let len = self.uint()? as usize;
         let bytes = self.bytes.get(self.position..self.position + len).ok_or(Broken::Protocol("array too long"))?;
@@ -160,15 +171,16 @@ impl<'a> Arguments<'a> {
     }
 }
 
-/// An event being built.
-pub struct Event {
+/// A message being built: an event (from the compositor) or a request
+/// (from a client).
+pub struct Outgoing {
     object: u32,
     opcode: u16,
     bytes: Vec<u8>,
     fds: Vec<i32>,
 }
 
-impl Event {
+impl Outgoing {
     pub fn new(object: u32, opcode: u16) -> Self {
         Self { object, opcode, bytes: Vec::new(), fds: Vec::new() }
     }

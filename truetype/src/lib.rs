@@ -43,7 +43,7 @@ pub enum Error {
 }
 
 /// A point in font units (y grows upwards) or pixels (y grows downwards).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Point {
     pub x: f32,
     pub y: f32,

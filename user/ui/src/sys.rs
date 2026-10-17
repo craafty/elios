@@ -1,16 +1,19 @@
-//! The system calls the desktop needs beyond libeli's: memory mapping,
-//! ioctls, epoll, timers, and sockets that carry file descriptors.
+//! The system calls the desktop and its programs need beyond libeli's:
+//! memory mapping, ioctls, polling, timers, and sockets that carry file
+//! descriptors.
 
 use alloc::vec::Vec;
 
 use eli::sys::{Result, call};
 
+const POLL: usize = 7;
 const MMAP: usize = 9;
 const MUNMAP: usize = 11;
 const IOCTL: usize = 16;
 const SOCKET: usize = 41;
 const SENDMSG: usize = 46;
 const RECVMSG: usize = 47;
+const CONNECT: usize = 42;
 const BIND: usize = 49;
 const LISTEN: usize = 50;
 const FTRUNCATE: usize = 77;
@@ -83,13 +86,22 @@ pub unsafe fn unmap(address: *mut u8, len: usize) {
 
 /// A memfd holding `data`, for handing to clients.
 pub fn memory_file(name: &str, data: &[u8]) -> Result<i32> {
+    let fd = shared_memory(name, data.len())?;
+    eli::io::write_all(fd, data)?;
+    Ok(fd)
+}
+
+/// A memfd of `len` zero bytes, to map and share.
+pub fn shared_memory(name: &str, len: usize) -> Result<i32> {
     const MFD_CLOEXEC: usize = 1;
     let name = c_string(name);
     // SAFETY: a valid name.
     let fd = unsafe { call(MEMFD_CREATE, [name.as_ptr() as usize, MFD_CLOEXEC, 0, 0, 0, 0]) }? as i32;
     // SAFETY: plain calls on our own descriptor.
-    unsafe { call(FTRUNCATE, [fd as usize, data.len(), 0, 0, 0, 0]) }?;
-    eli::io::write_all(fd, data)?;
+    if let Err(error) = unsafe { call(FTRUNCATE, [fd as usize, len, 0, 0, 0, 0]) } {
+        let _ = eli::io::close(fd);
+        return Err(error);
+    }
     Ok(fd)
 }
 
@@ -108,6 +120,28 @@ pub fn listen_unix(path: &str) -> Result<i32> {
     unsafe {
         call(BIND, [fd as usize, address.as_ptr() as usize, 2 + path.len() + 1, 0, 0, 0])?;
         call(LISTEN, [fd as usize, 64, 0, 0, 0, 0])?;
+    }
+    Ok(fd)
+}
+
+/// A connection to the Unix socket at `path`.
+pub fn connect_unix(path: &str) -> Result<i32> {
+    const AF_UNIX: usize = 1;
+    const SOCK_STREAM: usize = 1;
+    const SOCK_CLOEXEC: usize = 0o2000000;
+    if path.len() >= 108 {
+        return Err(eli::Error(36));
+    }
+    // SAFETY: plain socket creation.
+    let fd = unsafe { call(SOCKET, [AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, 0, 0, 0]) }? as i32;
+    let mut address = [0u8; 110];
+    address[..2].copy_from_slice(&(AF_UNIX as u16).to_le_bytes());
+    address[2..2 + path.len()].copy_from_slice(path.as_bytes());
+    // SAFETY: a valid sockaddr_un of the length given.
+    if let Err(error) = unsafe { call(CONNECT, [fd as usize, address.as_ptr() as usize, 2 + path.len() + 1, 0, 0, 0]) }
+    {
+        let _ = eli::io::close(fd);
+        return Err(error);
     }
     Ok(fd)
 }
@@ -235,6 +269,24 @@ impl Epoll {
             })
             .collect()
     }
+}
+
+pub const POLLIN: i16 = 0x1;
+pub const POLLOUT: i16 = 0x4;
+pub const POLLERR: i16 = 0x8;
+pub const POLLHUP: i16 = 0x10;
+
+/// Waits until one of `fds` (descriptor, events wanted) is ready or
+/// `timeout_ms` passes (-1: forever); returns what happened to each.
+pub fn poll(fds: &[(i32, i16)], timeout_ms: i32) -> Vec<i16> {
+    let mut entries: Vec<[i32; 2]> = fds.iter().map(|&(fd, events)| [fd, i32::from(events as u16)]).collect();
+    // SAFETY: an array of `struct pollfd` (int fd; short events, revents).
+    let result =
+        unsafe { call(POLL, [entries.as_mut_ptr() as usize, entries.len(), timeout_ms as isize as usize, 0, 0, 0]) };
+    if result.is_err() {
+        return alloc::vec![0; fds.len()];
+    }
+    entries.iter().map(|entry| (entry[1] >> 16) as i16).collect()
 }
 
 /// A repeating timer, readable on each tick.

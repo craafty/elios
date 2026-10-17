@@ -2577,7 +2577,7 @@ socket, `$XDG_RUNTIME_DIR/wayland-0`, and draw their windows into shared
 memory they hand it; it composes them on the screen and sends them input.
 It's one event loop around `epoll`, with a 60 Hz timer for redrawing.
 
-- **The wire protocol** (`wire.rs`): messages are an object id, a size and
+- **The wire protocol** (`user/ui/src/wire.rs`, shared with clients): messages are an object id, a size and
   opcode, and 32-bit-aligned arguments (integers, 24.8 fixed-point
   numbers, strings, arrays, object ids); file descriptors travel beside
   them as `SCM_RIGHTS`, in the order messages use them.
@@ -2605,8 +2605,8 @@ It's one event loop around `epoll`, with a 60 Hz timer for redrawing.
   libxkbcommon, plus key codes and modifier states. Mice move a pointer
   with a little acceleration; the arrow is the desktop's own, unless the
   client under it sets one.
-- **Drawing** (`render.rs`): into a back buffer, blending surfaces with
-  alpha, and only the damaged part is copied to the screen (video memory is
+- **Drawing** (`render.rs`, with the toolkit's `Canvas`): into a back
+  buffer, blending surfaces with alpha, and only the damaged part is copied to the screen (video memory is
   slow to read, so it's only written). Text is the system's TrueType
   font (below), each character rasterized once and kept, and blended onto
   the background by its coverage.
@@ -2614,6 +2614,48 @@ It's one event loop around `epoll`, with a 60 Hz timer for redrawing.
 Shortcuts: Super+Enter a terminal, Super+F Firefox, Super+Tab the next
 window, Super+Q closes the front one, Ctrl+Alt+Backspace quits back to the
 text console. `desktop PROGRAM` starts a program once it's up.
+
+### The toolkit (`user/ui`)
+
+eliOS's own graphical programs are built on `ui`, a small library that the
+desktop shares (the wire format, drawing, fonts). It has no retained widget
+tree or layout engine: a program keeps its own state, draws everything
+into a pixel buffer when something changed, and hands the window the
+rectangle it touched. For a terminal, a file explorer and dialogs that's
+simpler than a framework and fast enough: redrawing a window is a few
+memory fills and cached glyphs.
+
+- **Windows** (`window.rs`): a Wayland client. `Window::open` connects to
+  `$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`, binds `wl_compositor`, `wl_shm`,
+  `xdg_wm_base` and `wl_seat`, and waits for the first `configure`.
+  Drawing goes into a canvas in ordinary memory; `present(rect)` copies
+  what changed into a shared-memory buffer (a `memfd`) and commits it.
+  Each buffer remembers which parts are stale since it was last used, so
+  switching buffers copies only those. At most one frame is in flight:
+  the next commit waits for the frame callback, so a busy program can't
+  flood the compositor. `wait` polls the connection (and any descriptors
+  the program asks for, such as a terminal's pty) and returns plain
+  events: resize, close, focus, keys, pointer moves, button presses with
+  a click count (double clicks: within 400 ms and 4 px), scroll lines.
+  Key repeat happens on the client side, at the rate the compositor gives.
+- **Keys** (`keys.rs`): evdev key codes are turned into characters with
+  a US layout table of eliOS's own, rather than compiling the XKB
+  keymap the compositor sends; modifiers arrive as XKB's bit masks.
+- **Drawing** (`draw.rs`): `Canvas` fills (blending translucent colours),
+  borders, blits, scrolls a region (a terminal scrolling by a line moves
+  pixels instead of redrawing text), and fills paths with the TrueType
+  rasterizer, so rounded rectangles and icons are anti-aliased by the
+  same code as letters. Everything clips to a rectangle. `Font` caches
+  each rasterized glyph by character.
+- **Widgets** (`widgets.rs`): functions and small structs that draw and
+  handle input but own nothing else: buttons, a one-line text field
+  (selection, word moves, Ctrl+A), a list with keyboard navigation and a
+  draggable scroll bar, popup menus with separators and disabled items,
+  and icons (folder, file, program, home, disk, up) drawn as paths on a
+  16-unit grid so they scale. The colours are in `theme`, shared with the
+  desktop's bar.
+
+`uidemo` shows every widget in one window (`desktop uidemo`).
 
 ### Fonts (`truetype/`)
 

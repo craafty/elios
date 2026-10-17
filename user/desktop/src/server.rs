@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use crate::render::Rect;
 use crate::surface::{Popup, Role, Subsurface, Surface, Toplevel, Xdg};
 use crate::sys;
-use crate::wire::{Arguments, Broken, Connection, Event, Message};
+use crate::wire::{Arguments, Broken, Connection, Message, Outgoing};
 
 /// A client's surface, as (client, surface object id).
 pub type SurfaceRef = (u32, u32);
@@ -167,7 +167,7 @@ impl Client {
         }
     }
 
-    pub fn send(&mut self, event: Event) {
+    pub fn send(&mut self, event: Outgoing) {
         self.connection.send(event);
     }
 
@@ -194,7 +194,7 @@ impl Client {
     /// Forgets an object the client destroyed, telling it the id is free.
     pub fn remove(&mut self, id: u32) {
         if self.objects.remove(&id).is_some() && id < 0xFF00_0000 {
-            self.send(Event::new(1, 1).uint(id));
+            self.send(Outgoing::new(1, 1).uint(id));
         }
     }
 }
@@ -249,15 +249,15 @@ impl Client {
                 // sync
                 0 => {
                     let callback = args.uint()?;
-                    self.send(Event::new(callback, 0).uint(*serial));
-                    self.send(Event::new(1, 1).uint(callback));
+                    self.send(Outgoing::new(callback, 0).uint(*serial));
+                    self.send(Outgoing::new(1, 1).uint(callback));
                 }
                 // get_registry
                 1 => {
                     let registry = args.uint()?;
                     self.add(registry, Kind::Registry, 1)?;
                     for (name, interface, version) in GLOBALS {
-                        self.send(Event::new(registry, 0).uint(name).string(interface).uint(version));
+                        self.send(Outgoing::new(registry, 0).uint(name).string(interface).uint(version));
                     }
                 }
                 _ => return Err(Broken::Protocol("bad wl_display request")),
@@ -513,14 +513,14 @@ impl Client {
         self.add(new, kind, version)?;
         match kind {
             Kind::Shm => {
-                self.send(Event::new(new, 0).uint(FORMAT_ARGB8888));
-                self.send(Event::new(new, 0).uint(FORMAT_XRGB8888));
+                self.send(Outgoing::new(new, 0).uint(FORMAT_ARGB8888));
+                self.send(Outgoing::new(new, 0).uint(FORMAT_XRGB8888));
             }
             Kind::Seat => {
                 // Pointer and keyboard.
-                self.send(Event::new(new, 0).uint(3));
+                self.send(Outgoing::new(new, 0).uint(3));
                 if version >= 2 {
-                    self.send(Event::new(new, 1).string("seat0"));
+                    self.send(Outgoing::new(new, 1).string("seat0"));
                 }
             }
             Kind::Output => return Ok(Action::NewOutput(new, version)),
@@ -657,7 +657,7 @@ impl Client {
                             )
                         });
                         // Copied: the client can have the buffer back.
-                        self.send(Event::new(id, 0));
+                        self.send(Outgoing::new(id, 0));
                     }
                 }
             }

@@ -20,14 +20,13 @@ mod render;
 mod server;
 mod shell;
 mod surface;
-mod sys;
-mod wire;
 
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use eli::{eprintln, println};
+use ui::{sys, wire};
 
 use crate::render::{Font, Screen};
 use crate::server::Client;

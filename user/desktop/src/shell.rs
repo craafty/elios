@@ -20,7 +20,7 @@ use crate::render::{self, Font, Rect, Screen};
 use crate::server::{Action, Client, Kind, SurfaceRef};
 use crate::surface::Role;
 use crate::sys;
-use crate::wire::Event;
+use crate::wire::Outgoing;
 
 pub const BAR_HEIGHT: i32 = 28;
 /// The size of the bar's text, in pixels per em.
@@ -121,7 +121,7 @@ impl Desktop {
         self.serial
     }
 
-    fn send(&mut self, client: u32, event: Event) {
+    fn send(&mut self, client: u32, event: Outgoing) {
         if let Some(client) = self.clients.get_mut(&client) {
             client.send(event);
         }
@@ -172,12 +172,12 @@ impl Desktop {
         // A 15.6-inch screen's millimetres, for toolkits that care.
         self.send(
             client,
-            Event::new(output, 0).int(0).int(0).int(344).int(194).int(0).string("eliOS").string("Screen").int(0),
+            Outgoing::new(output, 0).int(0).int(0).int(344).int(194).int(0).string("eliOS").string("Screen").int(0),
         );
-        self.send(client, Event::new(output, 1).uint(3).int(width).int(height).int(60_000));
+        self.send(client, Outgoing::new(output, 1).uint(3).int(width).int(height).int(60_000));
         if version >= 2 {
-            self.send(client, Event::new(output, 3).int(1));
-            self.send(client, Event::new(output, 2));
+            self.send(client, Outgoing::new(output, 3).int(1));
+            self.send(client, Outgoing::new(output, 2));
         }
     }
 
@@ -185,20 +185,20 @@ impl Desktop {
         let mut text = self.keymap.clone().into_bytes();
         text.push(0);
         if let Ok(fd) = sys::memory_file("keymap", &text) {
-            self.send(client, Event::new(keyboard, 0).uint(1).fd(fd).uint(text.len() as u32));
+            self.send(client, Outgoing::new(keyboard, 0).uint(1).fd(fd).uint(text.len() as u32));
         }
         let version = self.clients.get(&client).and_then(|c| c.objects.get(&keyboard)).map_or(1, |o| o.version);
         if version >= 4 {
             // 25 repeats a second, after 400 ms.
-            self.send(client, Event::new(keyboard, 5).int(25).int(400));
+            self.send(client, Outgoing::new(keyboard, 5).int(25).int(400));
         }
         if let Some((owner, surface)) = self.focus
             && owner == client
         {
             let serial = self.next_serial();
-            self.send(client, Event::new(keyboard, 1).uint(serial).uint(surface).array(&[]));
+            self.send(client, Outgoing::new(keyboard, 1).uint(serial).uint(surface).array(&[]));
             let (depressed, locked) = (self.depressed, self.locked);
-            self.send(client, Event::new(keyboard, 4).uint(serial).uint(depressed).uint(0).uint(locked).uint(0));
+            self.send(client, Outgoing::new(keyboard, 4).uint(serial).uint(depressed).uint(0).uint(locked).uint(0));
         }
     }
 
@@ -285,7 +285,7 @@ impl Desktop {
     fn enter_outputs(&mut self, (client, surface): SurfaceRef) {
         let outputs = self.clients.get(&client).map(|c| c.objects_of(Kind::Output)).unwrap_or_default();
         for (output, _) in outputs {
-            self.send(client, Event::new(surface, 0).uint(output));
+            self.send(client, Outgoing::new(surface, 0).uint(output));
         }
     }
 
@@ -368,11 +368,11 @@ impl Desktop {
             states.push(4);
         }
         let bytes: Vec<u8> = states.iter().flat_map(|state| state.to_le_bytes()).collect();
-        c.send(Event::new(object, 0).int(size.0).int(size.1).array(&bytes));
+        c.send(Outgoing::new(object, 0).int(size.0).int(size.1).array(&bytes));
         self.serial = self.serial.wrapping_add(1);
         let serial = self.serial;
         if let Some(c) = self.clients.get_mut(&client) {
-            c.send(Event::new(xdg_object, 0).uint(serial));
+            c.send(Outgoing::new(xdg_object, 0).uint(serial));
         }
     }
 
@@ -421,9 +421,9 @@ impl Desktop {
         {
             popup.rect = rect;
         }
-        self.send(client, Event::new(object, 0).int(rect.x).int(rect.y).int(rect.width).int(rect.height));
+        self.send(client, Outgoing::new(object, 0).int(rect.x).int(rect.y).int(rect.width).int(rect.height));
         let serial = self.next_serial();
-        self.send(client, Event::new(xdg_object, 0).uint(serial));
+        self.send(client, Outgoing::new(xdg_object, 0).uint(serial));
     }
 
     /// Where a surface's (0, 0) is on screen.
@@ -491,7 +491,7 @@ impl Desktop {
             let serial = self.next_serial();
             let keyboards = self.clients.get(&client).map(|c| c.objects_of(Kind::Keyboard)).unwrap_or_default();
             for (keyboard, _) in keyboards {
-                self.send(client, Event::new(keyboard, 2).uint(serial).uint(surface));
+                self.send(client, Outgoing::new(keyboard, 2).uint(serial).uint(surface));
             }
             if self.windows.contains(&(client, surface)) {
                 self.configure_toplevel((client, surface));
@@ -509,8 +509,8 @@ impl Desktop {
             let keyboards = self.clients.get(&client).map(|c| c.objects_of(Kind::Keyboard)).unwrap_or_default();
             let (depressed, locked) = (self.depressed, self.locked);
             for (keyboard, _) in keyboards {
-                self.send(client, Event::new(keyboard, 1).uint(serial).uint(surface).array(&keys));
-                self.send(client, Event::new(keyboard, 4).uint(serial).uint(depressed).uint(0).uint(locked).uint(0));
+                self.send(client, Outgoing::new(keyboard, 1).uint(serial).uint(surface).array(&keys));
+                self.send(client, Outgoing::new(keyboard, 4).uint(serial).uint(depressed).uint(0).uint(locked).uint(0));
             }
         }
         self.screen.damage_all();
@@ -675,7 +675,7 @@ impl Desktop {
             let callbacks: Vec<u32> =
                 client.surfaces.values_mut().flat_map(|s| core::mem::take(&mut s.frame_callbacks)).collect();
             for callback in callbacks {
-                client.send(Event::new(callback, 0).uint(time));
+                client.send(Outgoing::new(callback, 0).uint(time));
                 client.remove(callback);
             }
         }
@@ -736,11 +736,11 @@ impl Desktop {
     }
 
     /// Sends a pointer event and, for new enough pointers, a frame.
-    fn pointer_event(&mut self, client: u32, make: impl Fn(u32) -> Event) {
+    fn pointer_event(&mut self, client: u32, make: impl Fn(u32) -> Outgoing) {
         for (pointer, version) in self.pointers(client) {
             self.send(client, make(pointer));
             if version >= 5 {
-                self.send(client, Event::new(pointer, 5));
+                self.send(client, Outgoing::new(pointer, 5));
             }
         }
     }
@@ -758,7 +758,7 @@ impl Desktop {
             && self.surface((client, surface)).is_some()
         {
             let serial = self.next_serial();
-            self.pointer_event(client, |pointer| Event::new(pointer, 1).uint(serial).uint(surface));
+            self.pointer_event(client, |pointer| Outgoing::new(pointer, 1).uint(serial).uint(surface));
         }
         self.damage_cursor();
         self.cursor = None;
@@ -766,7 +766,7 @@ impl Desktop {
         if let Some(((client, surface), local_x, local_y)) = hit {
             let serial = self.next_serial();
             self.pointer_event(client, |pointer| {
-                Event::new(pointer, 0).uint(serial).uint(surface).fixed(local_x).fixed(local_y)
+                Outgoing::new(pointer, 0).uint(serial).uint(surface).fixed(local_x).fixed(local_y)
             });
         }
         self.damage_cursor();
@@ -792,7 +792,7 @@ impl Desktop {
             && self.pointer_focus.is_some_and(|(owner, _)| owner == client)
         {
             let time = self.time();
-            self.pointer_event(client, |pointer| Event::new(pointer, 2).uint(time).fixed(local_x).fixed(local_y));
+            self.pointer_event(client, |pointer| Outgoing::new(pointer, 2).uint(time).fixed(local_x).fixed(local_y));
         }
     }
 
@@ -834,7 +834,7 @@ impl Desktop {
             let time = self.time();
             let state = u32::from(pressed);
             self.pointer_event(client, |pointer| {
-                Event::new(pointer, 3).uint(serial).uint(time).uint(button).uint(state)
+                Outgoing::new(pointer, 3).uint(serial).uint(time).uint(button).uint(state)
             });
         }
     }
@@ -856,12 +856,12 @@ impl Desktop {
         let axis = if vertical { 0 } else { 1 };
         for (pointer, version) in self.pointers(client) {
             if version >= 5 {
-                self.send(client, Event::new(pointer, 6).uint(0)); // source: wheel
-                self.send(client, Event::new(pointer, 8).uint(axis).int(steps));
+                self.send(client, Outgoing::new(pointer, 6).uint(0)); // source: wheel
+                self.send(client, Outgoing::new(pointer, 8).uint(axis).int(steps));
             }
-            self.send(client, Event::new(pointer, 4).uint(time).uint(axis).fixed(f64::from(steps) * 15.0));
+            self.send(client, Outgoing::new(pointer, 4).uint(time).uint(axis).fixed(f64::from(steps) * 15.0));
             if version >= 5 {
-                self.send(client, Event::new(pointer, 5));
+                self.send(client, Outgoing::new(pointer, 5));
             }
         }
     }
@@ -871,7 +871,7 @@ impl Desktop {
         for popup in popups.into_iter().rev() {
             if let Some(Role::Popup(p)) = self.surface(popup).map(|s| &s.role) {
                 let object = p.object;
-                self.send(popup.0, Event::new(object, 1));
+                self.send(popup.0, Outgoing::new(object, 1));
             }
         }
         let next = self.windows.last().copied();
@@ -893,7 +893,7 @@ impl Desktop {
     fn close(&mut self, window: SurfaceRef) {
         if let Some(toplevel) = self.surface(window).and_then(|s| s.toplevel()) {
             let object = toplevel.object;
-            self.send(window.0, Event::new(object, 1));
+            self.send(window.0, Outgoing::new(object, 1));
         }
     }
 
@@ -936,9 +936,9 @@ impl Desktop {
         let keyboards = self.clients.get(&client).map(|c| c.objects_of(Kind::Keyboard)).unwrap_or_default();
         let (depressed, locked) = (self.depressed, self.locked);
         for (keyboard, _) in keyboards {
-            self.send(client, Event::new(keyboard, 3).uint(serial).uint(time).uint(code).uint(u32::from(pressed)));
+            self.send(client, Outgoing::new(keyboard, 3).uint(serial).uint(time).uint(code).uint(u32::from(pressed)));
             if bit != 0 || code == 58 {
-                self.send(client, Event::new(keyboard, 4).uint(serial).uint(depressed).uint(0).uint(locked).uint(0));
+                self.send(client, Outgoing::new(keyboard, 4).uint(serial).uint(depressed).uint(0).uint(locked).uint(0));
             }
         }
     }

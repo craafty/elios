@@ -1,0 +1,11 @@
+[package]
+name = "ui"
+version.workspace = true
+edition.workspace = true
+
+# The desktop's toolkit: the Wayland wire format and a client for it,
+# drawing (rectangles, shapes, TrueType text) and simple widgets. Shared
+# by the compositor and the programs that run in it.
+[dependencies]
+eli = { path = "../eli" }
+truetype = { path = "../../truetype" }
