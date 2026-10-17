@@ -391,7 +391,13 @@ column 7 always empty as letter spacing.
 
 `info!`, `warn!`, `error!` and `debug!` print timestamped, colored lines.
 Debug messages go to serial only, to keep the screen readable (the boot
-memory map, for instance, is debug output).
+memory map, for instance, is debug output). Once `/sbin/init` starts, info
+messages stop reaching the screen too (they still go to serial, `dmesg`
+and the log file), like Linux's console log level: a driver logging while
+the shell waits for input would otherwise push the prompt up and leave the
+cursor on an empty line. Warnings and errors still show. Commands that
+start slow work report its outcome themselves (`wifi connect` prints the
+address DHCP gives).
 
 Everything printed is also kept in a 64 KiB ring buffer. This solves an
 ordering problem: the console can't exist until the heap does, but the

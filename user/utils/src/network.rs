@@ -219,7 +219,26 @@ pub fn wifi(arguments: &[String]) -> i32 {
             print!("{networks}");
         }
     }
+    if arguments[1] == "connect" {
+        wait_for_address("wlan0");
+    }
     0
+}
+
+/// Waits a while for DHCP to give `interface` an address and prints it
+/// (the kernel's own messages about it no longer reach the screen).
+fn wait_for_address(interface: &str) {
+    let Ok(socket) = DatagramSocket::udp() else { return };
+    let deadline = time::monotonic_nanos() + 15_000_000_000;
+    while time::monotonic_nanos() < deadline {
+        let address = interface_query(&socket, interface, SIOCGIFADDR).map(address_of);
+        if let Some(address) = address.filter(|address| address.0 != [0; 4]) {
+            println!("address {address}");
+            return;
+        }
+        time::sleep_ms(250);
+    }
+    println!("no address yet (DHCP is still asking; see ifconfig)");
 }
 
 /// `ping [-c count] host`: ICMP echo requests, one a second.

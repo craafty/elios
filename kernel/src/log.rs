@@ -1,6 +1,7 @@
 //! Kernel output. Everything printed goes to the serial port and, once there
 //! is one, the screen console. Debug messages go to serial only, to keep the
-//! screen readable.
+//! screen readable, and once programs are running (see [`quiet_console`])
+//! so do info messages: they'd land in the middle of the shell's prompt.
 //!
 //! Output is also kept in an in-memory log, so messages printed before the
 //! console existed can be shown on it afterwards. A second, larger log keeps
@@ -9,6 +10,7 @@
 //! port, that file is the only record of what happened.
 
 use core::fmt::{self, Write as _};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sync::SpinLock;
 use crate::{console, serial, time};
@@ -133,6 +135,19 @@ pub fn write_terminal(text: &str) {
     });
 }
 
+/// Whether only warnings and errors still go to the screen.
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Stops info messages from reaching the screen, as Linux's console log
+/// level does once the system is up: a driver logging while the shell
+/// waits for input would push its prompt up and leave the cursor on an
+/// empty line. They still go to serial, `dmesg` and the log file.
+// The test kernel never starts init.
+#[cfg_attr(test, allow(dead_code))]
+pub fn quiet_console() {
+    QUIET.store(true, Ordering::Relaxed);
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     let _ = LOG.lock().write_fmt(args);
@@ -149,11 +164,17 @@ pub fn _log(level: Level, args: fmt::Arguments) {
     let uptime = time::uptime_nanos();
     let (seconds, micros) = (uptime / 1_000_000_000, uptime % 1_000_000_000 / 1000);
     let line = format_args!("\x1B[90m{seconds:>4}.{micros:06}\x1B[0m {} {args}\n", level.tag());
-    if level == Level::Debug {
-        let _ = FULL_LOG.lock().write_fmt(line);
-        serial::write_fmt(line);
-    } else {
-        _print(line);
+    match level {
+        Level::Debug => {
+            let _ = FULL_LOG.lock().write_fmt(line);
+            serial::write_fmt(line);
+        }
+        Level::Info if QUIET.load(Ordering::Relaxed) => {
+            let _ = LOG.lock().write_fmt(line);
+            let _ = FULL_LOG.lock().write_fmt(line);
+            serial::write_fmt(line);
+        }
+        _ => _print(line),
     }
 }
 

@@ -197,7 +197,10 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
     #[cfg(not(test))]
     {
         match process::start_init("/sbin/init") {
-            Ok(_) => info!("boot complete, starting /sbin/init"),
+            Ok(_) => {
+                info!("boot complete, starting /sbin/init");
+                log::quiet_console();
+            }
             Err(error) => error!("can't start /sbin/init: {error:?}; is the initrd missing?"),
         }
         task::exit()
