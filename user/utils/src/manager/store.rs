@@ -140,7 +140,7 @@ pub fn fetch(package: &Package, repositories: &[String], label: &str) -> Result<
     let _ = fs::create_dir(STORE);
     let unpacking = format!("{STORE}/.unpacking-{id}");
     if fs::exists(&unpacking) {
-        let _ = crate::commands::remove_tree(&unpacking);
+        let _ = eli::fs::remove_tree(&unpacking);
     }
     fs::create_dir(&unpacking).map_err(|error| format!("{unpacking}: {error}"))?;
     for entry in &entries {

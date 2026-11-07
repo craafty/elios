@@ -356,24 +356,13 @@ fn rmdir(arguments: &[String]) -> i32 {
     status
 }
 
-pub fn remove_tree(path: &str) -> eli::Result<()> {
-    if fs::symlink_metadata(path)?.kind == FileType::Directory {
-        for entry in fs::read_dir(path)? {
-            remove_tree(&format!("{path}/{}", entry.name))?;
-        }
-        fs::remove_dir(path)
-    } else {
-        fs::remove_file(path)
-    }
-}
-
 fn rm(arguments: &[String]) -> i32 {
     let (flags, paths) = split_flags(arguments);
     let recursive = flags.contains('r') || flags.contains('R');
     let force = flags.contains('f');
     let mut status = 0;
     for path in paths {
-        let result = if recursive { remove_tree(path) } else { fs::remove_file(path) };
+        let result = if recursive { fs::remove_tree(path) } else { fs::remove_file(path) };
         if let Err(error) = result
             && !(force && error == eli::Error::NOT_FOUND)
         {

@@ -441,6 +441,19 @@ pub fn copy_tree(from: &str, to: &str) -> Result<()> {
     Ok(())
 }
 
+/// Removes a file, or a directory and everything in it (`rm -r`).
+/// Symbolic links are removed, not followed.
+pub fn remove_tree(path: &str) -> Result<()> {
+    if symlink_metadata(path)?.kind == FileType::Directory {
+        for entry in read_dir(path)? {
+            remove_tree(&alloc::format!("{path}/{}", entry.name))?;
+        }
+        remove_dir(path)
+    } else {
+        remove_file(path)
+    }
+}
+
 /// Writes everything waiting to the disks.
 pub fn sync() {
     // SAFETY: takes no arguments.

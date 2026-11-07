@@ -364,7 +364,7 @@ fn clean() -> Result<(), String> {
     let keep: Vec<u32> = all.iter().rev().take(5).copied().chain(current).collect();
     let mut removed_generations = 0;
     for &number in all.iter().filter(|number| !keep.contains(number)) {
-        if crate::commands::remove_tree(&format!("{GENERATIONS}/{number}")).is_ok() {
+        if eli::fs::remove_tree(&format!("{GENERATIONS}/{number}")).is_ok() {
             removed_generations += 1;
         }
     }
@@ -372,7 +372,7 @@ fn clean() -> Result<(), String> {
         keep.iter().filter_map(|&number| generations::load(number).ok()).flat_map(|g| g.packages).collect();
     let mut removed_packages = 0;
     for entry in fs::read_dir(STORE).unwrap_or_default() {
-        if !used.contains(&entry.name) && crate::commands::remove_tree(&format!("{STORE}/{}", entry.name)).is_ok() {
+        if !used.contains(&entry.name) && eli::fs::remove_tree(&format!("{STORE}/{}", entry.name)).is_ok() {
             removed_packages += 1;
         }
     }

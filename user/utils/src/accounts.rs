@@ -286,7 +286,7 @@ pub fn deluser(arguments: &[String]) -> i32 {
             users::shadow_entries().unwrap_or_default().into_iter().filter(|entry| entry.name != *name).collect();
         let _ = users::write_shadow(&shadow);
         if remove_home {
-            let _ = crate::commands::remove_tree(&user.home);
+            let _ = eli::fs::remove_tree(&user.home);
         }
         println!("Removed {name}.");
         return 0;
@@ -307,7 +307,7 @@ pub fn deluser(arguments: &[String]) -> i32 {
         eprintln!("deluser: can't update the account files: {error}");
         return 1;
     }
-    if remove_home && let Err(error) = crate::commands::remove_tree(&user.home) {
+    if remove_home && let Err(error) = eli::fs::remove_tree(&user.home) {
         eprintln!("deluser: can't remove {}: {error}", user.home);
         return 1;
     }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apk", "tls", "boot", "bootinfo", "ext2", "fat", "kernel", "truetype", "user/desktop", "user/term", "user/ui", "user/eli", "user/utils", "xtask"]
+members = ["apk", "tls", "boot", "bootinfo", "ext2", "fat", "kernel", "truetype", "user/desktop", "user/files", "user/term", "user/ui", "user/eli", "user/utils", "xtask"]
 # The bootloader and kernel only build for their own targets, which xtask
 # selects. A bare `cargo build` builds just the host-side tooling.
 default-members = ["xtask"]

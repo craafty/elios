@@ -1,13 +1,13 @@
 //! The desktop's shell: how windows are arranged, drawn and given input.
 //!
 //! It's deliberately simple. A bar along the top has buttons to start a
-//! terminal and Firefox, a tab per window, and a clock. Every window fills
+//! terminal, the file explorer and Firefox, a tab per window, and a clock. Every window fills
 //! the rest of the screen (maximized, so toolkits leave out their shadows
 //! and rounded corners), and the focused one is on top; dialogs (windows
 //! with a parent) float, centered, at the size they choose. Popup menus go
 //! where their positioner says, moved to stay on screen.
 //!
-//! Shortcuts: Super+Enter a terminal, Super+F Firefox, Super+Tab the next
+//! Shortcuts: Super+Enter a terminal, Super+E files, Super+F Firefox, Super+Tab the next
 //! window, Super+Q closes a window, Ctrl+Alt+Backspace quits the desktop.
 
 use alloc::collections::BTreeMap;
@@ -38,6 +38,7 @@ const BUTTON: u32 = 0xFF1E_2750;
 #[derive(Clone, Copy)]
 enum Launcher {
     Terminal,
+    Files,
     Browser,
 }
 
@@ -584,7 +585,9 @@ impl Desktop {
         let text_y = (BAR_HEIGHT - self.font.line_height) / 2;
         self.screen.text(&mut self.font, 10, text_y, "eliOS", TEXT, clip);
         let mut x = 10 + self.font.width("eliOS") + 12;
-        for (label, launcher) in [("Terminal", Launcher::Terminal), ("Firefox", Launcher::Browser)] {
+        for (label, launcher) in
+            [("Terminal", Launcher::Terminal), ("Files", Launcher::Files), ("Firefox", Launcher::Browser)]
+        {
             let rect = Rect::new(x, 4, self.font.width(label) + 16, BAR_HEIGHT - 8);
             self.screen.fill(rect, BUTTON);
             self.screen.text(&mut self.font, x + 8, text_y, label, TEXT, clip);
@@ -955,6 +958,7 @@ impl Desktop {
         }
         match code {
             28 => self.launch(Launcher::Terminal),
+            18 => self.launch(Launcher::Files),
             33 => self.launch(Launcher::Browser),
             16 => {
                 if let Some(window) = self.windows.last().copied() {
@@ -975,6 +979,7 @@ impl Desktop {
     fn launch(&mut self, launcher: Launcher) {
         let candidates: &[&str] = match launcher {
             Launcher::Terminal => &["term", "foot"],
+            Launcher::Files => &["files"],
             Launcher::Browser => &["firefox", "firefox-esr"],
         };
         let Some(path) = candidates.iter().find_map(|name| eli::process::find_program(name)) else {

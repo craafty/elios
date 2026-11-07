@@ -2704,6 +2704,44 @@ package and a font from the network before the desktop had a terminal.
 - **Not yet:** the copy and paste buffer is inside each `term`; a
   clipboard shared between programs comes with the desktop's.
 
+### The file explorer (`user/files`)
+
+`files [folder]` (the bar's Files button, Super+E) shows a folder: a
+toolbar (back, forward, up, and the path, which can be typed into, with
+`~` for home), a sidebar of places, the folder's entries with sizes and
+dates, and a status line with the free space. It's built only from
+`user/ui`'s widgets: the sidebar and the entries are two `List`s, the
+path and the answers to questions are `TextField`s, the right-click menu
+is a `Menu`.
+
+- **Reading a folder** (`folder.rs`): `getdents64` for the names, then a
+  `stat` of each (following links, so a link to a folder opens like one;
+  a dangling link still shows). Folders come first, then the chosen
+  column; names compare without case. Hidden (dot) files are counted but
+  left out until Ctrl+H.
+- **Places** are home, the root, and every mount whose source is a disk
+  (`/proc/mounts`): the boot disk (`/disk`), `/data`, USB sticks. They're
+  read again, and the folder too, whenever the window gets the keyboard
+  back: there's no inotify yet, and that's when a change made in a
+  terminal would be looked for.
+- **Opening**: folders open in place; programs (any execute bit) run in a
+  `term`, so their output shows; files whose first 4 KiB have no NUL byte
+  open in `edit` in a `term`. Programs start as grandchildren (fork,
+  fork, exec; the middle process exits at once), so the explorer never
+  has zombies to reap.
+- **Changing things**: renaming and making folders ask for the name in
+  the status line (rename selects the name without its extension, as
+  people usually keep that); deleting asks first and removes folders
+  with everything in them (`eli::fs::remove_tree`). Copy and cut keep one
+  path; paste copies the tree (`fs::copy_tree`, keeping permissions) or
+  renames it, copying and deleting when the destination is another file
+  system (`EXDEV`). A pasted name that's taken becomes "name (copy).ext".
+  Pasting a folder into itself is refused.
+- **Not yet:** selecting several entries, a clipboard shared with other
+  programs (it comes with the desktop's), copying in the background
+  (a big copy stops the window until it's done), and opening files with
+  anything but `edit`.
+
 ### Fonts (`truetype/`)
 
 The desktop and its programs write with a TrueType font, read and

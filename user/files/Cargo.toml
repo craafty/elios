@@ -1,0 +1,9 @@
+[package]
+name = "files"
+version.workspace = true
+edition.workspace = true
+
+# eliOS's file explorer.
+[dependencies]
+eli = { path = "../eli" }
+ui = { path = "../ui" }

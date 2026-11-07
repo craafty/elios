@@ -508,6 +508,9 @@ pub struct Menu {
     /// Where it's drawn, set by [`Menu::place`].
     pub rect: Rect,
     pub hovered: Option<usize>,
+    /// Where the click that opened it was: its release there doesn't
+    /// choose the item that happens to be under the pointer.
+    origin: (i32, i32),
 }
 
 #[derive(Debug, Clone)]
@@ -551,7 +554,7 @@ impl Menu {
     /// A menu of `items` with its top-left corner at (x, y) (moved to fit
     /// inside `bounds`, the window).
     pub fn new(items: Vec<MenuItem>, font: &mut Font, x: i32, y: i32, bounds: Rect) -> Self {
-        let mut menu = Menu { items, rect: Rect::default(), hovered: None };
+        let mut menu = Menu { items, rect: Rect::default(), hovered: None, origin: (x, y) };
         menu.place(font, x, y, bounds);
         menu
     }
@@ -589,6 +592,11 @@ impl Menu {
     pub fn click(&mut self, font: &Font, x: i32, y: i32) -> MenuChoice {
         if !self.rect.contains(x, y) {
             return MenuChoice::Dismissed;
+        }
+        if (x, y) == self.origin {
+            // The release of the click that opened the menu, which opens
+            // with an item under the pointer.
+            return MenuChoice::Open;
         }
         self.item_at(font, x, y).map_or(MenuChoice::Open, MenuChoice::Chosen)
     }
