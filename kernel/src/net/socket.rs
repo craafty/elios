@@ -299,6 +299,15 @@ pub fn connect(file: &SocketFile, remote: Endpoint, nonblocking: bool) -> Result
                 bind_datagram_if_needed(stack, file.id)?;
                 if let Some(Socket::Datagram(datagram)) = stack.sockets.get_mut(file.id) {
                     datagram.remote = Some(remote);
+                    // As on Linux, a connected socket bound to any address
+                    // gets the one its packets will come from, which
+                    // `getsockname` then shows: that's how programs (Firefox's
+                    // WebRTC, for one) learn the default route's address.
+                    if let Some(local) = &mut datagram.local
+                        && local.address == Ipv4::ANY
+                    {
+                        local.address = source;
+                    }
                 }
                 return Ok(());
             }

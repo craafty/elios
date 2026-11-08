@@ -1508,7 +1508,12 @@ Alpine's Firefox runs unmodified. What it needed, in the order it asked:
   interface names through `if_indextoname` (see Networking); then ICE,
   DTLS and SRTP are Firefox's own, over ordinary UDP sockets. A loopback
   call (two peer connections in one page, camera and microphone) connects
-  and plays the video.
+  and plays the video. Without camera permission, Firefox offers only the
+  default route's address, which it learns by `connect`ing a UDP socket
+  to 8.8.8.8 and calling `getsockname`: a connected datagram socket must
+  report the source address routing chose, not `0.0.0.0`. With that, a
+  STUN server (Google's) returns the public address as a server-reflexive
+  candidate, which is what calls across the internet need.
 - `/proc/PID/stat` with all 52 of Linux's fields: BusyBox's `ps`,
   `pidof` and `killall` parse it with a number reader that runs off the
   end of a shorter line.
@@ -2644,7 +2649,8 @@ through an echo server in both directions at once, nonblocking connect,
 `poll` and `select`, `MSG_PEEK`, `shutdown`, timeouts, refused
 connections; then `getifaddrs`, interface names both ways, and UDP
 between two sockets bound to the machine's own address (as WebRTC's host
-candidates talk in a call to oneself). A kernel test reads a netlink dump. A kernel test pings loopback and QEMU's virtual router. By
+candidates talk in a call to oneself), and that a connected UDP socket
+names its source address. A kernel test reads a netlink dump. A kernel test pings loopback and QEMU's virtual router. By
 hand: downloads from a web server on the host (`wget` with an MD5 check)
 and from the internet, and connections from the host into eliOS through a
 forwarded port (`cargo xtask run --forward 8080:80`).

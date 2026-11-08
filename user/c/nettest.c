@@ -220,6 +220,19 @@ int main(void) {
     close(a);
     close(b);
 
+    /* How WebRTC finds the default route's address: connect a UDP socket
+       somewhere and ask for its name. */
+    a = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in far = {.sin_family = AF_INET, .sin_port = htons(53)};
+    inet_pton(AF_INET, "8.8.8.8", &far.sin_addr);
+    struct sockaddr_in chosen = {0};
+    length = sizeof chosen;
+    check("a connected UDP socket has a source address",
+          connect(a, (struct sockaddr *)&far, sizeof far) == 0 &&
+              getsockname(a, (struct sockaddr *)&chosen, &length) == 0 &&
+              chosen.sin_addr.s_addr == own.sin_addr.s_addr && chosen.sin_port != 0);
+    close(a);
+
     printf(failures ? "%d FAILED\n" : "all passed\n", failures);
     return failures != 0;
 }
