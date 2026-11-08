@@ -10,6 +10,7 @@ pub mod address_space;
 pub mod credentials;
 pub mod elf;
 pub mod futex;
+pub mod seccomp;
 pub mod signal;
 pub mod timers;
 pub mod user;
@@ -129,6 +130,8 @@ pub struct UserThread {
     /// another thread, and the frame put there instead (see
     /// [`handle_kernel_fault`]).
     scratch: SpinLock<Option<(u64, Vec<u64>)>>,
+    /// The system call filters on this thread (see [`seccomp`]).
+    pub seccomp: SpinLock<seccomp::Mode>,
 }
 
 impl UserThread {
@@ -235,6 +238,7 @@ struct NewThread {
     fs_base: u64,
     gs_base: u64,
     clear_child_tid: u64,
+    seccomp: seccomp::Mode,
 }
 
 /// Adds a thread to `process` that enters user mode with `new.frame`.
@@ -251,6 +255,7 @@ fn start_thread(process: &Arc<Process>, new: NewThread) {
         syscall_stack: AtomicU64::new(0),
         syscall_rip: AtomicU64::new(0),
         scratch: SpinLock::new(None),
+        seccomp: SpinLock::new(new.seccomp),
     });
     process.threads.lock().push(thread.clone());
     let options = Spawn {
@@ -397,6 +402,7 @@ pub fn start(path: &str, arguments: Vec<String>) -> Result<Pid> {
             fs_base: 0,
             gs_base: 0,
             clear_child_tid: 0,
+            seccomp: seccomp::Mode::Disabled,
         },
     );
     Ok(process.pid)
@@ -497,6 +503,7 @@ pub fn clone(frame: &InterruptFrame, args: &CloneArgs) -> Result<Pid> {
                 fs_base,
                 gs_base: syscall::user_gs_base(),
                 clear_child_tid,
+                seccomp: me.seccomp.lock().clone(),
             },
         );
         return Ok(tid);
@@ -537,6 +544,7 @@ pub fn clone(frame: &InterruptFrame, args: &CloneArgs) -> Result<Pid> {
             fs_base,
             gs_base: syscall::user_gs_base(),
             clear_child_tid,
+            seccomp: me.seccomp.lock().clone(),
         },
     );
     Ok(child.pid)
@@ -1127,7 +1135,7 @@ mod tests {
         fn linux_c_programs_pass_their_self_tests() {
             // Built by the host's C compiler, if there was one.
             for program in [
-                "ctest", "sigtest", "threadtest", "nettest", "permtest", "timertest", "memtest", "eventtest", "unixtest", "ptytest", "vdsotest", "videotest",
+                "ctest", "sigtest", "threadtest", "nettest", "permtest", "timertest", "memtest", "eventtest", "unixtest", "ptytest", "vdsotest", "videotest", "seccomptest",
                 "hello-c",
                 "hello-dynamic",
             ] {

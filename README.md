@@ -382,6 +382,7 @@ eliOS's own rasterizer in `truetype/`.
 - [x] **Video calls:** WebRTC in Firefox connects (route netlink for
       `getifaddrs` and `ip`, interface ioctls on every socket, `waitid`);
       a loopback call with the camera and microphone plays, in VP8 or
-      H.264 (Cisco's OpenH264 plugin, which Firefox downloads); next, a
-      real Teams meeting
+      H.264 (Cisco's OpenH264 plugin, which Firefox downloads), with
+      Firefox's own seccomp-bpf sandboxes on (filters, traps to `SIGSYS`,
+      thread sync); next, a real Teams meeting
 - [ ] **Next:** Wi-Fi working on the T440p, Bluetooth

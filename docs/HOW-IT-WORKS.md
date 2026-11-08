@@ -1266,6 +1266,49 @@ zero SIGFPE. If the program handles the signal, the handler runs (that's how
 `sigtest` recovers from a null pointer write with `siglongjmp`); otherwise
 the process ends and the kernel logs why.
 
+### seccomp (`process/seccomp.rs`)
+
+A thread can limit the system calls it and everything it starts may make:
+sandboxes depend on it, and Firefox puts every child process (content,
+media decoding, network, extensions, plugins) under a filter before it
+touches anything from the web. Linux's interface is followed exactly,
+because that sandbox code (Chromium's, which Firefox uses) checks the
+details.
+
+- A **filter** is a classic BPF program run on every system call over a
+  64-byte `seccomp_data` record: the call's number, the architecture
+  (`AUDIT_ARCH_X86_64`), the address after the `syscall` instruction, and
+  the six arguments. The kernel validates it the way Linux does (only
+  seccomp's instructions, aligned loads inside the record, forward jumps
+  inside the program, no division by a constant 0, a return at the end),
+  so a program accepted here is accepted there, and it always ends.
+- Filters **stack**: a new one goes in front of the thread's chain (an
+  `Arc` list, shared with the threads and children that inherit it, and
+  kept across `execve`). All run; the strictest action wins (actions
+  compare as signed numbers, so `KILL_PROCESS` beats everything), and a
+  tie goes to the newest filter's data.
+- **Actions**: `ALLOW` and `LOG` run the call; `ERRNO` skips it and
+  returns the errno in the low bits; `KILL_THREAD` and `KILL_PROCESS`
+  end it as if by `SIGSYS`; `TRACE` and `USER_NOTIF` fail with `ENOSYS`,
+  as on Linux when nothing traces or listens. `TRAP` skips the call and
+  raises `SIGSYS`, which can't be blocked or ignored (if it's not handled,
+  the process ends): `si_errno` is the filter's data, `si_code` is
+  `SYS_SECCOMP`, and the siginfo carries the call's address, number and
+  architecture, with `rax` left as the call number. Chromium's handler
+  checks all of those against the signal frame before emulating the call
+  (that's how its sandboxed processes ask a broker process to open files
+  for them), and writes the result into the saved `rax`.
+- Installing a filter takes `no_new_privs` or root (so a filter can't
+  trick a setuid program). `SECCOMP_FILTER_FLAG_TSYNC` puts it on every
+  thread of the process at once, provided each thread's filters are among
+  the caller's; Firefox's processes already have a dozen threads when they
+  sandbox themselves.
+- Strict mode (`SECCOMP_SET_MODE_STRICT`, the original seccomp) allows only
+  `read`, `write`, `exit` and `rt_sigreturn` and kills with `SIGKILL`.
+- Programs detect seccomp-bpf by installing a NULL filter and expecting
+  `EFAULT`. `/proc/PID/status` shows `Seccomp:` and `NoNewPrivs:`.
+  `seccomptest` checks all of this.
+
 ## 14. Users and permissions
 
 `process/credentials.rs`, `fs/mod.rs` (the checks), `user/eli/src/users.rs`,
@@ -1519,12 +1562,9 @@ Alpine's Firefox runs unmodified. What it needed, in the order it asked:
   first start. The plugin is built against glibc, but musl's loader
   treats `libc.so.6`, `libm.so.6` and `libpthread.so.0` as itself and
   ignores symbol versions, and every glibc symbol it uses exists in musl,
-  so it runs as is. Firefox refuses to load media plugins on Linux
-  without a seccomp-bpf sandbox, which eliOS doesn't have yet: the
-  parent's check is the `media.gmp.insecure.allow` preference, set for
-  every profile by `/etc/firefox/policies/policies.json`, and the plugin
-  process's own check is `MOZ_DISABLE_GMP_SANDBOX`, which the desktop
-  sets. A loopback call forced to H.264 (`setCodecPreferences`) plays.
+  so it runs as is. Firefox loads media plugins on Linux only into a
+  process it can sandbox with seccomp-bpf (see section 13), which it
+  does here as for its other child processes. A loopback call forced to H.264 (`setCodecPreferences`) plays.
 - `/proc/PID/stat` with all 52 of Linux's fields: BusyBox's `ps`,
   `pidof` and `killall` parse it with a number reader that runs off the
   end of a shorter line.

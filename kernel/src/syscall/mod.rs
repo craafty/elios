@@ -152,6 +152,15 @@ extern "sysv64" fn syscall_dispatch(frame: &mut InterruptFrame) {
         thread.syscall_stack.store(frame.rsp, core::sync::atomic::Ordering::Relaxed);
         thread.syscall_rip.store(frame.rip, core::sync::atomic::Ordering::Relaxed);
     }
+    if let Some(thread) = &thread
+        && let Some(rax) = seccomp_refuses(thread, number, &a, frame.rip)
+    {
+        thread.syscall.store(0, core::sync::atomic::Ordering::Relaxed);
+        frame.rax = rax;
+        arch::disable_interrupts();
+        process::before_return_to_user(frame, None);
+        return;
+    }
     let mut result = dispatch(number, a, frame);
     if let Some(thread) = &thread {
         result = process::finish_system_call(thread, result);
@@ -171,6 +180,35 @@ extern "sysv64" fn syscall_dispatch(frame: &mut InterruptFrame) {
     // result to restart.
     let restartable = (number != 15).then_some(number);
     process::before_return_to_user(frame, restartable);
+}
+
+/// Runs the thread's seccomp filters over a system call. Returns `None` to
+/// let the call run, or the value to return without running it.
+fn seccomp_refuses(thread: &process::UserThread, number: u64, a: &[u64; 6], rip: u64) -> Option<u64> {
+    use process::seccomp::{self, Verdict};
+    match seccomp::check(thread, number, a, rip) {
+        Verdict::Allow => None,
+        Verdict::Return(value) => Some(value),
+        Verdict::Trap(data) => {
+            // The handler sees the registers as they were at the call
+            // (rax is still its number) and the call's address and number
+            // in the siginfo; sandboxes check both before emulating it.
+            let info = signal::SignalInfo {
+                errno: i32::from(data),
+                code: 1, // SYS_SECCOMP
+                fields: [rip, u64::from(number as u32) | u64::from(seccomp::ARCH_X86_64) << 32],
+            };
+            signal::raise_seccomp_trap(thread, info);
+            Some(number)
+        }
+        Verdict::KillThread => {
+            if thread.process.threads.lock().len() == 1 {
+                process::exit_group(process::signal_status(signal::SIGSYS));
+            }
+            process::exit_thread(process::signal_status(signal::SIGSYS))
+        }
+        Verdict::KillProcess(number) => process::exit_group(process::signal_status(number)),
+    }
 }
 
 fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64> {
@@ -297,7 +335,7 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         // readahead: a hint.
         187 => Ok(0),
         138 => files::fstatfs(a[0], a[1]),
-        157 => processes::prctl(a[0], a[1]),
+        157 => processes::prctl(a[0], a[1], a[2]),
         158 => processes::arch_prctl(a[0], a[1]),
         162 | 306 => mounts::sync(),
         165 => mounts::mount(a[0], a[1], a[2], a[3], a[4]),
@@ -362,6 +400,7 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         295 | 327 => files::vectored_at(a[0], a[1], a[2], a[3], false),
         296 | 328 => files::vectored_at(a[0], a[1], a[2], a[3], true),
         302 => system::prlimit(a[1], a[3]),
+        317 => process::seccomp::seccomp(a[0], a[1] as u32 as u64, a[2]),
         318 => system::getrandom(a[0], a[1]),
         319 => files::memfd_create(a[0], a[1]),
         324 => system::membarrier(a[0]),

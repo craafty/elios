@@ -319,9 +319,11 @@ const PR_CAPBSET_READ: u64 = 23;
 const PR_SET_NO_NEW_PRIVS: u64 = 38;
 const PR_GET_NO_NEW_PRIVS: u64 = 39;
 const PR_GET_NAME: u64 = 16;
+const PR_GET_SECCOMP: u64 = 21;
+const PR_SET_SECCOMP: u64 = 22;
 
 /// `prctl`: only naming the process is supported.
-pub fn prctl(option: u64, argument: u64) -> Result<u64> {
+pub fn prctl(option: u64, argument: u64, argument3: u64) -> Result<u64> {
     let process = process::current();
     match option {
         PR_SET_NAME => {
@@ -358,6 +360,13 @@ pub fn prctl(option: u64, argument: u64) -> Result<u64> {
             Ok(0)
         }
         PR_GET_NO_NEW_PRIVS => Ok(u64::from(process.no_new_privileges.load(core::sync::atomic::Ordering::Relaxed))),
+        PR_GET_SECCOMP => Ok(process::current_thread().seccomp.lock().number()),
+        // The older way into seccomp: mode 1 is strict, 2 a filter.
+        PR_SET_SECCOMP => match argument {
+            1 => process::seccomp::seccomp(0, 0, argument3),
+            2 => process::seccomp::seccomp(1, 0, argument3),
+            _ => Err(Errno::EINVAL),
+        },
         // Whether a capability is in the bounding set: all are.
         PR_CAPBSET_READ if argument < 64 => Ok(1),
         _ => Err(Errno::EINVAL),

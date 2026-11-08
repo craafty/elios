@@ -574,9 +574,10 @@ fn status(pid: Pid) -> String {
     };
     let ids = &info.credentials;
     let groups: Vec<String> = ids.groups.iter().map(ToString::to_string).collect();
+    let process = process::find(pid);
     format!(
         "Name:\t{}\nState:\t{state}\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{}\n\
-         Uid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nGroups:\t{}\nThreads:\t{}\nVmRSS:\t{} kB\n",
+         Uid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nGroups:\t{}\nThreads:\t{}\nVmRSS:\t{} kB\nNoNewPrivs:\t{}\nSeccomp:\t{}\n",
         info.name,
         info.parent,
         ids.uid,
@@ -589,7 +590,12 @@ fn status(pid: Pid) -> String {
         ids.egid,
         groups.join(" "),
         info.threads,
-        info.memory / 1024
+        info.memory / 1024,
+        u8::from(process.as_ref().is_some_and(|p| p.no_new_privileges.load(core::sync::atomic::Ordering::Relaxed))),
+        process
+            .as_ref()
+            .and_then(|p| p.threads.lock().first().map(|thread| thread.seccomp.lock().number()))
+            .unwrap_or(0),
     )
 }
 

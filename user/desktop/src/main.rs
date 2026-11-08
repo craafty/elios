@@ -98,11 +98,6 @@ fn main() -> i32 {
     eli::env::set_var("XDG_SESSION_TYPE", "wayland");
     eli::env::set_var("GDK_BACKEND", "wayland");
     eli::env::set_var("MOZ_ENABLE_WAYLAND", "1");
-    // Firefox's H.264 for video calls is Cisco's OpenH264 plugin, which
-    // runs in a process Firefox insists on sandboxing with seccomp-bpf
-    // (which eliOS lacks) unless told not to. The parent's side of the same
-    // check is `media.gmp.insecure.allow` in /etc/firefox/policies.
-    eli::env::set_var("MOZ_DISABLE_GMP_SANDBOX", "1");
 
     let Ok(epoll) = sys::Epoll::new() else {
         eprintln!("desktop: no epoll");

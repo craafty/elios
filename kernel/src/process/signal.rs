@@ -40,6 +40,7 @@ pub const SIGTTIN: u32 = 21;
 pub const SIGTTOU: u32 = 22;
 pub const SIGURG: u32 = 23;
 pub const SIGWINCH: u32 = 28;
+pub const SIGSYS: u32 = 31;
 pub const SIGNAL_COUNT: usize = 65;
 
 /// Handler values with special meanings.
@@ -63,10 +64,13 @@ pub struct SigAction {
 }
 
 /// What a handler (or `sigwaitinfo`) is told about a signal beyond its
-/// number: the `si_code`, and the two words after it in `siginfo_t` (for a
-/// timer: its id and overrun count, then the value it was created with).
+/// number: `si_errno`, `si_code`, and the two words after them in
+/// `siginfo_t` (for a timer: its id and overrun count, then the value it
+/// was created with; for seccomp's `SIGSYS`: the call's address, then its
+/// number and architecture).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SignalInfo {
+    pub errno: i32,
     pub code: i32,
     pub fields: [u64; 2],
 }
@@ -254,6 +258,22 @@ pub fn raise_fault(thread: &UserThread, signal: u32, address: u64) -> bool {
         signals.fault_address = address;
     }
     handled
+}
+
+/// Raises seccomp's `SIGSYS` for a system call a filter trapped. Like a
+/// fault it can't be blocked or ignored: if the program doesn't handle it,
+/// the process ends.
+pub fn raise_seccomp_trap(thread: &UserThread, info: SignalInfo) {
+    let action = thread.process.signals.lock().actions[SIGSYS as usize];
+    let mut signals = thread.signals.lock();
+    let handled = action.handler != SIG_DFL && action.handler != SIG_IGN && signals.blocked & bit(SIGSYS) == 0;
+    if !handled {
+        drop(signals);
+        crate::arch::enable_interrupts();
+        super::exit_group(super::signal_status(SIGSYS));
+    }
+    signals.pending |= bit(SIGSYS);
+    signals.info.set(SIGSYS, info);
 }
 
 /// Whether the running thread should stop a blocking system call: a signal
@@ -528,6 +548,7 @@ fn siginfo(signal: u32, info: SignalInfo, fault_address: u64) -> [u8; 32] {
         bytes[8..12].copy_from_slice(&1i32.to_le_bytes());
         bytes[16..24].copy_from_slice(&fault_address.to_le_bytes());
     } else {
+        bytes[4..8].copy_from_slice(&info.errno.to_le_bytes());
         bytes[8..12].copy_from_slice(&info.code.to_le_bytes());
         bytes[16..24].copy_from_slice(&info.fields[0].to_le_bytes());
         bytes[24..32].copy_from_slice(&info.fields[1].to_le_bytes());

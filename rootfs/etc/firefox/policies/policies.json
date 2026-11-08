@@ -1,7 +1,0 @@
-{
-  "policies": {
-    "Preferences": {
-      "media.gmp.insecure.allow": { "Value": true, "Status": "default" }
-    }
-  }
-}

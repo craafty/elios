@@ -89,7 +89,8 @@ fn fire_due() {
     }
     for (pid, id, signal, notify, value, overrun) in firing {
         let Some(process) = find(pid) else { continue };
-        let info = SignalInfo { code: SI_TIMER, fields: [u64::from(id as u32) | u64::from(overrun) << 32, value] };
+        let info =
+            SignalInfo { errno: 0, code: SI_TIMER, fields: [u64::from(id as u32) | u64::from(overrun) << 32, value] };
         match notify {
             Notify::Signal => signal::send_with_info(&process, signal, info),
             Notify::Thread(tid) => {
