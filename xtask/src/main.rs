@@ -1,5 +1,6 @@
 //! Build and run eliOS. Invoked as `cargo xtask <command>`.
 
+mod camera;
 mod image;
 mod mirror;
 mod session;
@@ -682,6 +683,9 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
         None => String::from("none,id=sound"),
     };
     qemu.args(["-audiodev", &audio, "-device", "ich9-intel-hda", "-device", "hda-micro,audiodev=sound"]);
+    // A pretend webcam (see camera.rs), so the video driver gets tested.
+    let socket = workspace_root().join(format!("target/camera-{}.sock", std::process::id()));
+    qemu.args(camera::start(&socket)?);
     // A USB mouse, so mice get tested; the window's pointer goes to it.
     qemu.arg("-device").arg(format!("usb-mouse,bus=xhci.0{}", place(3)));
     qemu.arg("-device")

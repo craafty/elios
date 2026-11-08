@@ -2119,6 +2119,90 @@ In QEMU, `cargo xtask run --audio-wav FILE` records what eliOS plays (the
 sound card's output otherwise goes nowhere); with that backend QEMU has no
 microphone, so recording only works without it.
 
+### Cameras (`drivers/usb/video.rs`, `video.rs`)
+
+Video calls need the webcam. Nearly every webcam, the T440p's built-in
+one (04f2:b39a) included, is a **USB video class** (UVC) device, so one
+driver covers them all. Programs see them through Linux's **V4L2**
+interface (`/dev/video0`, major 81, group `video`), which is what
+Firefox's WebRTC code uses.
+
+**Describing the camera.** A UVC camera has a control interface and a
+streaming interface. The streaming interface's class-specific
+descriptors list formats (raw YUYV, Motion-JPEG), each followed by its
+frame sizes, each with the frame intervals it can do (in 100 ns units).
+Its alternate setting 0 has no endpoints; the others each have one
+isochronous IN endpoint, of increasing bandwidth. `VideoFunction::parse`
+reads all that from the raw configuration descriptor. Formats whose GUID
+isn't one V4L2 knows (YUY2 becomes YUYV, NV12, MJPEG) are left out.
+
+**Starting a stream** is a negotiation. The driver sends a *probe*
+structure (format, frame size, interval) with `SET_CUR`, reads back what
+the camera made of it with `GET_CUR` (including the biggest frame and
+the bytes it will send per service interval), and sends that back as the
+*commit*. Then it selects the alternate setting with the least bandwidth
+that is still enough (`SET_INTERFACE`) and configures the endpoint. The
+structure is 26 bytes in UVC 1.0, 34 in 1.1 and 48 in 1.5; the version
+is in the control interface's header.
+
+**Isochronous transfers** are USB's guaranteed-bandwidth, no-retry kind:
+a high-speed camera sends up to three packets every 125 µs microframe,
+and a packet that doesn't arrive is simply gone. The xHCI endpoint
+context for one carries the interval (as a power of two of microframes),
+the packet size, the burst (high-speed endpoints that send more than one
+packet a microframe say so in bits 11-12 of `wMaxPacketSize`; SuperSpeed
+ones in a companion descriptor) and the bytes per interval. Each
+transfer descriptor is one Isoch TRB with its own page buffer, holding
+one interval's packets, marked "start as soon as possible". The driver
+keeps 128 queued (16 ms). Every one interrupts on completion, so the
+event says how much arrived, but only every eighth raises an interrupt
+(the others have "block event interrupt"), so there is one a millisecond.
+A camera posts 8000 events a second, so the event ring grew to four
+pages. When a transfer completes, its contents go to the assembler and
+its buffer goes straight back in the queue. Transfers the controller
+skipped (a missed service interval) are requeued too.
+
+**Putting frames together.** Each packet starts with a header (UVC
+2.4.3.3): its length, then flags. The *frame ID* bit flips at every new
+frame, *end of frame* marks the last packet, and *error* marks a damaged
+one. The assembler appends packet bodies until the frame ends (at end of
+frame, or when the frame ID flips without one). It drops the frame if
+anything was marked as an error, or, for uncompressed formats, if it
+isn't exactly the size the format says (a lost packet).
+
+**V4L2** (`video.rs`) is the program's side. A program asks for the
+formats (`ENUM_FMT`), sizes (`ENUM_FRAMESIZES`) and rates
+(`ENUM_FRAMEINTERVALS`), tries and sets a format (`TRY_FMT`, `S_FMT`:
+the nearest size offered) and rate (`S_PARM`). Then it asks for buffers
+(`REQBUFS`), maps them (`QUERYBUF` gives each one's offset; one memory
+object holds them all, which `mmap` of a character device with a memory
+object maps), queues them (`QBUF`) and starts the stream (`STREAMON`).
+Each finished frame is copied into the oldest queued buffer, which moves
+to the done list, and `poll` says readable. The program takes it with
+`DQBUF` (which has the size, sequence number and monotonic timestamp),
+reads it in place and queues it again. A frame that finds no buffer
+queued is dropped, as on Linux, so a slow program gets fewer frames
+rather than older ones. The open file that made the buffers owns the
+stream. Others can still ask about formats but get `EBUSY` if they try
+to take it, and closing the file stops the stream. There are no controls
+(brightness and so on) yet: `QUERYCTRL` says there are none.
+`/proc/video` lists each camera, its formats, and whether it's
+streaming.
+
+**Testing without a camera.** QEMU has no emulated webcam, but it can
+attach a USB device from elsewhere over **usbredir**, a protocol for
+forwarding USB devices across a socket. `xtask/src/camera.rs` is the
+other end: a pretend UVC camera (YUYV at 640x480, 320x240 and 160x120;
+30 or 15 frames a second) that answers descriptors and requests and
+streams isochronous packets with a test picture. In frame *n* the luma
+is `(x + y + 2n) & 255`, with eight chroma bars. `videotest`
+(`user/c/videotest.c`) streams it the way Firefox does and checks every
+pixel of every frame. Two usbredir details took finding out. QEMU's xHCI
+needs the 64-bit-ids and 32-bit-bulk-length capabilities. And the
+`hello` packets that announce them use the 12-byte header (32-bit id),
+because the peer doesn't know about 64-bit ids until they have been
+exchanged.
+
 ## 19. Networking
 
 `net/`, `drivers/e1000.rs`, `syscall/net.rs`.

@@ -24,6 +24,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::hid::{BootKeyboard, BootMouse};
 use super::storage::{self, Found, Status, UsbDisk};
+use super::video::{self as uvc, Assembler, UvcCamera, VideoFunction};
 use super::{Descriptors, InterruptInterface, KEYBOARDS, SETTLED, SetupPacket, StorageInterface};
 use crate::arch::{apic, interrupts};
 use crate::drivers::block;
@@ -84,6 +85,7 @@ const TRB_NORMAL: u32 = 1;
 const TRB_SETUP: u32 = 2;
 const TRB_DATA: u32 = 3;
 const TRB_STATUS: u32 = 4;
+const TRB_ISOCH: u32 = 5;
 const TRB_LINK: u32 = 6;
 const TRB_ENABLE_SLOT: u32 = 9;
 const TRB_DISABLE_SLOT: u32 = 10;
@@ -103,17 +105,33 @@ const TRB_INTERRUPT_ON_SHORT: u32 = 1 << 2;
 const TRB_INTERRUPT_ON_COMPLETION: u32 = 1 << 5;
 const TRB_IMMEDIATE_DATA: u32 = 1 << 6;
 const TRB_DIRECTION_IN: u32 = 1 << 16;
+/// Isochronous TRBs: no interrupt for this event (one is raised every few).
+const TRB_BLOCK_EVENT_INTERRUPT: u32 = 1 << 9;
+/// Isochronous TRBs: start as soon as possible, not at a given frame.
+const TRB_START_ASAP: u32 = 1 << 31;
 
 const COMPLETION_SUCCESS: u8 = 1;
 const COMPLETION_STALL: u8 = 6;
 const COMPLETION_SHORT_PACKET: u8 = 13;
+const COMPLETION_RING_UNDERRUN: u8 = 14;
+const COMPLETION_RING_OVERRUN: u8 = 15;
+const COMPLETION_MISSED_SERVICE: u8 = 23;
 
 /// Each ring is one page of TRBs, the last of which links back to the
 /// first.
 const RING_TRBS: usize = PAGE_SIZE as usize / 16;
+/// The event ring is bigger: a camera posts an event per microframe (8000
+/// a second), and the ring must hold them while the controller's thread is
+/// busy elsewhere.
+const EVENT_RING_PAGES: usize = 4;
+const EVENT_TRBS: usize = RING_TRBS * EVENT_RING_PAGES;
+/// Isochronous transfers kept queued for a camera: 16 ms at one a
+/// microframe.
+const VIDEO_TRANSFERS: usize = 128;
 
 // Endpoint types in endpoint contexts.
 const ENDPOINT_BULK_OUT: u32 = 2;
+const ENDPOINT_ISOCH_IN: u32 = 5;
 const ENDPOINT_CONTROL: u32 = 4;
 const ENDPOINT_BULK_IN: u32 = 6;
 const ENDPOINT_INTERRUPT_IN: u32 = 7;
@@ -144,6 +162,8 @@ static SIGNAL: AtomicBool = AtomicBool::new(false);
 static NEXT_DEVICE: AtomicU64 = AtomicU64::new(1);
 /// The names of USB disks: (device, LUN) to `sdX`.
 static DISK_NAMES: SpinLock<BTreeMap<(u64, u8), String>> = SpinLock::new(BTreeMap::new());
+/// Cameras' /dev/video files, by device.
+static CAMERAS: SpinLock<BTreeMap<u64, Arc<crate::video::Device>>> = SpinLock::new(BTreeMap::new());
 /// The largest storage transfer: 64 KiB, one TRB (which mustn't cross a
 /// 64 KiB boundary).
 const STORAGE_BUFFER_PAGES: usize = 16;
@@ -293,6 +313,24 @@ struct StorageEndpoints {
     tag: u32,
 }
 
+/// A camera's isochronous stream: the transfers queued, each into a
+/// buffer of its own, in the order the controller fills them.
+struct VideoStream {
+    interface: u8,
+    /// Device context index.
+    endpoint: u8,
+    ring: Ring,
+    /// Bytes per transfer: what the endpoint moves in a service interval.
+    transfer: u32,
+    /// The TRB control bits for each transfer (burst counts).
+    control: u32,
+    buffer_pages: usize,
+    in_flight: VecDeque<(u64, u64)>,
+    queued: u64,
+    assembler: Assembler,
+    sink: Arc<crate::video::Device>,
+}
+
 /// A hub's status change endpoint, and its ports.
 struct HubState {
     ports: u8,
@@ -337,6 +375,7 @@ struct Device {
     hid: Vec<HidEndpoint>,
     storage: Option<StorageEndpoints>,
     bluetooth: Option<BluetoothEndpoint>,
+    video: Option<VideoStream>,
 }
 
 pub struct Controller {
@@ -360,6 +399,10 @@ pub struct Controller {
     found: Vec<Found>,
     /// Devices removed whose disks should go.
     removed: Vec<u64>,
+    /// Cameras found (device, slot, name, function) and removed, to
+    /// register and unregister outside the lock too.
+    cameras_found: Vec<(u64, u8, String, VideoFunction)>,
+    cameras_removed: Vec<u64>,
 }
 
 /// Starts a thread for each xHCI controller.
@@ -440,7 +483,7 @@ impl Controller {
             context_size: if parameters & (1 << 2) != 0 { 64 } else { 32 },
             device_contexts: Dma::new(1).ok_or("out of memory")?,
             commands: Ring::new().ok_or("out of memory")?,
-            event_ring: Dma::new(1).ok_or("out of memory")?,
+            event_ring: Dma::new(EVENT_RING_PAGES).ok_or("out of memory")?,
             event_dequeue: 0,
             event_cycle: true,
             pending: VecDeque::new(),
@@ -448,6 +491,8 @@ impl Controller {
             name,
             found: Vec::new(),
             removed: Vec::new(),
+            cameras_found: Vec::new(),
+            cameras_removed: Vec::new(),
         };
         controller.reset()?;
 
@@ -470,7 +515,7 @@ impl Controller {
         // The event ring is one segment, described by a one-entry table.
         let table = Dma::new(1).ok_or("out of memory")?;
         table.write64(0, c.event_ring.phys);
-        table.write32(8, RING_TRBS as u32);
+        table.write32(8, EVENT_TRBS as u32);
         mmio_write(c.runtime + ERSTSZ, 1);
         mmio_write64(c.runtime + ERDP, c.event_ring.phys);
         mmio_write64(c.runtime + ERSTBA, table.phys);
@@ -584,10 +629,27 @@ impl Controller {
     /// Registers the disks found and unregisters the ones removed (outside
     /// the controller's lock: registering reads from the disk).
     fn update_disks(shared: &Arc<Mutex<Self>>) {
-        let (found, removed) = {
+        let (found, removed, cameras_found, cameras_removed) = {
             let mut controller = shared.lock();
-            (core::mem::take(&mut controller.found), core::mem::take(&mut controller.removed))
+            (
+                core::mem::take(&mut controller.found),
+                core::mem::take(&mut controller.removed),
+                core::mem::take(&mut controller.cameras_found),
+                core::mem::take(&mut controller.cameras_removed),
+            )
         };
+        for device in cameras_removed {
+            let camera = CAMERAS.lock().remove(&device);
+            if let Some(camera) = camera {
+                crate::video::unregister(&camera);
+            }
+        }
+        for (device, slot, name, function) in cameras_found {
+            let camera = UvcCamera { controller: shared.clone(), slot, device, function };
+            if let Some(video) = crate::video::register(name, Arc::new(camera)) {
+                CAMERAS.lock().insert(device, video);
+            }
+        }
         for device in removed {
             let names: Vec<((u64, u8), String)> =
                 DISK_NAMES.lock().iter().filter(|((id, _), _)| *id == device).map(|(k, v)| (*k, v.clone())).collect();
@@ -632,6 +694,10 @@ impl Controller {
         let Some(device) = self.devices.get_mut(&event.slot) else { return };
         if device.hub.as_ref().is_some_and(|hub| hub.endpoint == event.endpoint) {
             self.on_hub_change(event);
+            return;
+        }
+        if device.video.as_ref().is_some_and(|video| video.endpoint == event.endpoint) {
+            self.on_video(event);
             return;
         }
         let Some(hid) = device.hid.iter_mut().find(|hid| hid.endpoint == event.endpoint) else { return };
@@ -704,7 +770,7 @@ impl Controller {
             endpoint: (control >> 16 & 0x1F) as u8,
         };
         self.event_dequeue += 1;
-        if self.event_dequeue == RING_TRBS {
+        if self.event_dequeue == EVENT_TRBS {
             self.event_dequeue = 0;
             self.event_cycle = !self.event_cycle;
         }
@@ -881,6 +947,7 @@ impl Controller {
             hid: Vec::new(),
             storage: None,
             bluetooth: None,
+            video: None,
             hub: None,
         };
         self.device_contexts.write64(usize::from(slot) * 8, device.output.phys);
@@ -993,6 +1060,26 @@ impl Controller {
             if let Err(error) = self.start_bluetooth(slot, &bluetooth, vendor) {
                 warn!("bluetooth: {description}: {error}");
             }
+        } else if let Some(function) = VideoFunction::parse(&configuration) {
+            self.control_transfer(slot, SetupPacket::set_configuration(descriptors.configuration), None)?;
+            info!("usb: {}: port {port}: {description}: camera, {}", self.name, uvc::describe(&function));
+            for format in &function.formats {
+                let fourcc = format.fourcc.to_le_bytes();
+                for frame in &format.frames {
+                    debug!(
+                        "uvc: format {} {} frame {}: {}x{}, intervals {:?}, up to {} bytes",
+                        format.index,
+                        core::str::from_utf8(&fourcc).unwrap_or("?"),
+                        frame.index,
+                        frame.width,
+                        frame.height,
+                        frame.intervals,
+                        frame.max_bytes
+                    );
+                }
+            }
+            let id = self.devices[&slot].id;
+            self.cameras_found.push((id, slot, description, function));
         } else {
             info!("usb: {}: port {port}: {description} (no driver)", self.name);
         }
@@ -1741,6 +1828,10 @@ impl Controller {
             if let Some(hub) = device.hub {
                 pages.extend([hub.ring.memory.phys, hub.buffer.phys]);
             }
+            if let Some(video) = device.video {
+                pages.extend(video_pages(&video));
+            }
+            self.cameras_removed.push(device.id);
             if let Some(storage) = device.storage {
                 pages.extend([storage.input_ring.memory.phys, storage.output_ring.memory.phys, storage.wrappers.phys]);
                 pages.extend((0..STORAGE_BUFFER_PAGES as u64).map(|page| storage.buffer.phys + page * PAGE_SIZE));
@@ -1749,6 +1840,219 @@ impl Controller {
             pages.into_iter().for_each(frames::free);
         }
     }
+}
+
+/// Cameras.
+impl Controller {
+    /// Starts a camera streaming: negotiates the format with the camera
+    /// (probe and commit), picks the alternate setting with the bandwidth
+    /// it asked for, and queues isochronous transfers on its endpoint.
+    pub(super) fn start_video(
+        &mut self,
+        camera: &UvcCamera,
+        format: usize,
+        size: usize,
+        interval: u32,
+        sink: Arc<crate::video::Device>,
+    ) -> Result<(), String> {
+        let slot = camera.slot;
+        if self.devices.get(&slot).is_none_or(|device| device.id != camera.device) {
+            return Err("no such device".into());
+        }
+        self.stop_video(slot, camera.device);
+        let function = &camera.function;
+        let chosen = function.formats.get(format).ok_or("no such format")?;
+        let frame = chosen.frames.get(size).ok_or("no such frame size")?;
+        let interface = function.streaming_interface;
+        let mut probe = function.probe(chosen.index, frame.index, interval);
+        let length = probe.len() as u16;
+        debug!("uvc: probe {:02x?}", probe);
+        self.control_transfer(slot, uvc::set_cur(interface, uvc::PROBE, length), Some(&mut probe))?;
+        let mut answer = alloc::vec![0u8; probe.len()];
+        let got = self.control_transfer(slot, uvc::get_cur(interface, uvc::PROBE, length), Some(&mut answer))?;
+        if got < 26 {
+            return Err(format!("the probe answer is too short ({got} bytes)"));
+        }
+        debug!("uvc: probe answer {:02x?}", &answer[..got]);
+        let read = |at: usize| u32::from_le_bytes(answer[at..at + 4].try_into().unwrap());
+        let (frame_bytes, payload) = (read(18), read(22));
+        self.control_transfer(slot, uvc::set_cur(interface, uvc::COMMIT, length), Some(&mut answer))?;
+        let alternate = function.alternate_for(payload).ok_or("no isochronous endpoint")?;
+        self.control_transfer(slot, uvc::set_interface(interface, alternate.setting), None)?;
+
+        // The endpoint context (xHCI 6.2.3): high-speed endpoints that move
+        // more than one packet a microframe say so in wMaxPacketSize's top
+        // bits, which become the burst size; SuperSpeed ones in their
+        // companion descriptor.
+        let speed = self.devices[&slot].speed;
+        let packet = u32::from(alternate.packet_size & 0x7FF).max(1);
+        let (burst, mult) = if speed >= SPEED_SUPER {
+            (u32::from(alternate.burst), u32::from(alternate.mult))
+        } else {
+            (u32::from(alternate.packet_size >> 11 & 3), 0)
+        };
+        let transfer = alternate.bandwidth.max(1);
+        let interval_field = u32::from(alternate.interval.clamp(1, 16)) - 1;
+        let interval_field = if matches!(speed, SPEED_LOW | SPEED_FULL) { interval_field + 3 } else { interval_field };
+        let endpoint = (alternate.address & 0xF) * 2 + 1;
+        let words = [
+            mult << 8 | interval_field << 16 | (transfer >> 16) << 24,
+            ENDPOINT_ISOCH_IN << 3 | burst << 8 | packet << 16,
+            (transfer & 0xFFFF) << 16 | transfer.min(0xFFFF),
+        ];
+        // Each transfer is one service interval's packets: bursts of
+        // `burst + 1`, the last perhaps shorter (xHCI 4.11.2.3).
+        let packets = transfer.div_ceil(packet);
+        let bursts = packets.div_ceil(burst + 1);
+        let control = TRB_ISOCH << 10
+            | TRB_INTERRUPT_ON_SHORT
+            | TRB_INTERRUPT_ON_COMPLETION
+            | TRB_START_ASAP
+            | (bursts - 1) << 7
+            | ((packets - 1) % (burst + 1)) << 16;
+        debug!(
+            "uvc: alternate {} for {payload} bytes per interval: endpoint {:#04x}, context {:08x?}, trb control {control:#x}",
+            alternate.setting, alternate.address, words
+        );
+        let ring = Ring::new().ok_or("out of memory")?;
+        if let Err(error) = self.configure_isochronous(slot, endpoint, Some((words, ring.start()))) {
+            frames::free(ring.memory.phys);
+            let _ = self.control_transfer(slot, uvc::set_interface(interface, 0), None);
+            return Err(error);
+        }
+
+        let (_, image) = chosen.layout(frame);
+        let expected = (!chosen.compressed()).then_some(image as usize);
+        let limit = image.max(frame_bytes).max(frame.max_bytes) as usize + 4096;
+        // Buffers are aligned to their size, so none crosses a 64 KiB line
+        // (which a TRB's buffer mustn't).
+        let buffer_pages = (transfer as usize).div_ceil(PAGE_SIZE as usize).next_power_of_two();
+        let mut stream = VideoStream {
+            interface,
+            endpoint,
+            ring,
+            transfer,
+            control,
+            buffer_pages,
+            in_flight: VecDeque::new(),
+            queued: 0,
+            assembler: Assembler::new(expected, limit),
+            sink,
+        };
+        for _ in 0..VIDEO_TRANSFERS {
+            let Some(buffer) = frames::allocate_contiguous(buffer_pages, buffer_pages) else { break };
+            Self::queue_video(&mut stream, buffer);
+        }
+        if let Some(device) = self.devices.get_mut(&slot) {
+            device.video = Some(stream);
+        }
+        self.ring_doorbell(slot, endpoint);
+        info!(
+            "uvc: streaming format {} frame {} at {interval} (100 ns), {frame_bytes}-byte frames, alternate {} ({transfer} bytes per interval)",
+            chosen.index, frame.index, alternate.setting
+        );
+        Ok(())
+    }
+
+    /// Stops a camera's stream, if it's still the same device.
+    pub(super) fn stop_video(&mut self, slot: u8, device_id: u64) {
+        let Some(device) = self.devices.get_mut(&slot) else { return };
+        if device.id != device_id {
+            return;
+        }
+        let Some(stream) = device.video.take() else { return };
+        if let Err(error) = self.configure_isochronous(slot, stream.endpoint, None) {
+            warn!("uvc: can't stop the endpoint: {error}");
+        }
+        let _ = self.control_transfer(slot, uvc::set_interface(stream.interface, 0), None);
+        info!("uvc: stopped after {} frames ({} damaged)", stream.assembler.frames, stream.assembler.dropped);
+        video_pages(&stream).into_iter().for_each(frames::free);
+    }
+
+    /// Adds (with its context words and ring) or drops an isochronous
+    /// endpoint.
+    fn configure_isochronous(&mut self, slot: u8, index: u8, add: Option<([u32; 3], u64)>) -> Result<(), String> {
+        let size = self.context_size;
+        let device = self.devices.get(&slot).ok_or("no such device")?;
+        let input = &device.input;
+        for offset in (0..size * 33).step_by(4) {
+            input.write32(offset, 0);
+        }
+        let mut last = (device.output.read32(0) >> 27) & 0x1F;
+        match add {
+            Some((words, ring)) => {
+                input.write32(4, 1 | 1 << index);
+                let context = (1 + usize::from(index)) * size;
+                input.write32(context, words[0]);
+                input.write32(context + 4, words[1]);
+                input.write64(context + 8, ring);
+                input.write32(context + 16, words[2]);
+                last = last.max(u32::from(index));
+            }
+            None => {
+                input.write32(0, 1 << index);
+                input.write32(4, 1);
+            }
+        }
+        for (offset, word) in Self::slot_context(device, last).into_iter().enumerate() {
+            input.write32(size + offset * 4, word);
+        }
+        let phys = input.phys;
+        self.command(phys, TRB_CONFIGURE_ENDPOINT << 10 | u32::from(slot) << 24)?;
+        Ok(())
+    }
+
+    fn queue_video(stream: &mut VideoStream, buffer: u64) {
+        // An interrupt every eighth transfer (a millisecond) is plenty.
+        let block = if stream.queued % 8 == 7 { 0 } else { TRB_BLOCK_EVENT_INTERRUPT };
+        stream.queued += 1;
+        let trb = stream.ring.push(buffer, stream.transfer, stream.control | block);
+        stream.in_flight.push_back((trb, buffer));
+    }
+
+    /// A camera's transfer finished: its packet goes to the assembler, and
+    /// its buffer back in the queue. Transfers the controller skipped
+    /// (missed service intervals) are requeued too.
+    fn on_video(&mut self, event: Event) {
+        let slot = event.slot;
+        let Some(stream) = self.devices.get_mut(&slot).and_then(|device| device.video.as_mut()) else { return };
+        let position = stream.in_flight.iter().position(|&(trb, _)| trb == event.parameter);
+        match (event.completion, position) {
+            (COMPLETION_RING_UNDERRUN | COMPLETION_RING_OVERRUN, _) => {
+                debug!("uvc: ring ran dry (completion code {})", event.completion);
+            }
+            (_, Some(position)) => {
+                for done in 0..=position {
+                    let Some((_, buffer)) = stream.in_flight.pop_front() else { break };
+                    let received = matches!(event.completion, COMPLETION_SUCCESS | COMPLETION_SHORT_PACKET);
+                    if done == position && received {
+                        let length = stream.transfer.saturating_sub(event.residual) as usize;
+                        // SAFETY: the buffer is `buffer_pages` pages, at
+                        // least `transfer` bytes, and the controller is done
+                        // with it until it's queued again.
+                        let data = unsafe { core::slice::from_raw_parts(phys_to_virt(buffer), length) };
+                        let sink = &stream.sink;
+                        stream.assembler.payload(data, &mut |frame| sink.frame(frame));
+                    } else if done == position && event.completion != COMPLETION_MISSED_SERVICE {
+                        debug!("uvc: transfer failed (completion code {})", event.completion);
+                    }
+                    Self::queue_video(stream, buffer);
+                }
+            }
+            (_, None) => {}
+        }
+        let endpoint = stream.endpoint;
+        self.ring_doorbell(slot, endpoint);
+    }
+}
+
+/// The memory a camera stream uses.
+fn video_pages(stream: &VideoStream) -> Vec<u64> {
+    let mut pages = alloc::vec![stream.ring.memory.phys];
+    for &(_, buffer) in &stream.in_flight {
+        pages.extend((0..stream.buffer_pages as u64).map(|page| buffer + page * PAGE_SIZE));
+    }
+    pages
 }
 
 impl Event {

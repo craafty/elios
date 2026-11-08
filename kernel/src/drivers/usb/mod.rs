@@ -11,6 +11,7 @@
 
 mod hid;
 mod storage;
+mod video;
 mod xhci;
 
 use core::sync::atomic::{AtomicUsize, Ordering};

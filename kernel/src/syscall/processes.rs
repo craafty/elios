@@ -374,14 +374,16 @@ pub fn mmap(address: u64, len: u64, protection: u64, flags: u64, fd: u64, offset
             }
             Backing::Device { phys: phys + offset, cache }
         } else {
-            if file.inode.metadata().kind != FileKind::Regular {
-                return Err(Errno::ENODEV);
-            }
+            // Devices with memory of their own (camera buffers) map it.
+            let device_object = match file.inode.metadata().kind {
+                FileKind::Regular => None,
+                _ => Some(file.inode.memory_object().ok_or(Errno::ENODEV)?),
+            };
             let writing = shared && protection & PROT_WRITE != 0;
             if writing && !file.writable() {
                 return Err(Errno::EACCES);
             }
-            let object = match file.inode.memory_object() {
+            let object = match device_object.or_else(|| file.inode.memory_object()) {
                 Some(object) => object,
                 // Writing to a disk file through memory would need the
                 // pages written back, which isn't done.

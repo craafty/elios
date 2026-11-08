@@ -40,6 +40,7 @@ mod syscall;
 mod task;
 mod time;
 mod tty;
+mod video;
 
 use core::fmt::{self, Write as _};
 use core::panic::PanicInfo;

@@ -371,5 +371,9 @@ eliOS's own rasterizer in `truetype/`.
 - [x] **Faster clocks:** a vDSO, so `clock_gettime`, `gettimeofday` and
       `time` read the TSC in the program without a system call (glibc and
       musl both use it)
-- [ ] **Next:** the camera (for video calls), Wi-Fi working on the T440p,
-      Bluetooth
+- [x] **Camera:** a USB video class driver (descriptors, probe and
+      commit, isochronous xHCI transfers, frame assembly) behind Linux's
+      V4L2 interface (`/dev/video0`), tested against a pretend camera
+      xtask attaches to QEMU over usbredir (`videotest`); to try on the
+      T440p's webcam
+- [ ] **Next:** Wi-Fi working on the T440p, Bluetooth
