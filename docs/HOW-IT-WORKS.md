@@ -2555,7 +2555,8 @@ given), `wifi connect NETWORK --user NAME` for enterprise networks (it
 asks for the password), `wifi disconnect`. Network names may contain
 spaces, quoted or not: `wifi connect Purdue Guest` takes the longest run
 of words that names a network in the last scan, and anything after it is
-the password. They write to `/proc/wifi` (root only; `connect` sends the
+the password. They write to `/proc/wifi` (root and the `netdev` group, 28, which
+every configured user is in, like `audio`; `connect` sends the
 name, password and user name on separate lines) and wait for the state
 to settle; `ifconfig` then shows `wlan0`'s address. Not yet: scanning
 while connected, roaming, WPA3, EAP methods other than PEAP/MS-CHAPv2,
@@ -3125,7 +3126,8 @@ It's one event loop around `epoll`, with a 60 Hz timer for redrawing.
   content into one) follow the parent's commits when synchronized.
 - **The shell** (`shell.rs`): a bar along the top (the app menu, buttons
   for a terminal, the file explorer and, once it's installed, Firefox, a
-  tab per window, the network status and a clock); every window maximized below
+  tab per window, the network status and a clock, and the user's name,
+  whose menu has Settings and Log out); every window maximized below
   it, so toolkits leave out shadows and rounded corners; dialogs centered;
   popup menus where their positioner says, slid to stay on screen; the
   focused window on top. Frame callbacks are answered after each redraw.
@@ -3161,6 +3163,15 @@ It's one event loop around `epoll`, with a 60 Hz timer for redrawing.
   from the default route in `/proc/net/route` and `/proc/wifi`, checked
   every two seconds (as is whether Firefox is installed, for its button).
   There's no battery yet: reading one needs ACPI's AML interpreter.
+  Clicking it opens Settings.
+- **Logging out** (the user's menu, or Ctrl+Alt+Backspace) ends the
+  desktop, and with it every program it started: each runs in a process
+  group of its own, so the desktop sends `SIGTERM` to each group (which
+  reaches Firefox's helper processes too), gives them two seconds, then
+  sends `SIGKILL` to whatever is left. Groups that have ended are
+  forgotten every two seconds, so a reused number is never signalled.
+  The greeter then comes back (or the shell, if the desktop was started
+  from one).
 
 Shortcuts: Super alone the app menu, Super+Enter a terminal, Super+E the
 file explorer, Super+F Firefox, Super+Tab the next
@@ -3339,6 +3350,32 @@ character map, closed outlines and composites, and the rasterizer against
 shapes whose coverage is known exactly (a half-pixel-shifted square, a
 diagonal); `TRUETYPE_SAMPLE=out.pgm` also writes a sample of text to look
 at.
+
+### Settings (`user/ui/src/bin/settings.rs`)
+
+`settings [bluetooth]` (the user's menu on the bar, or a click on the
+network status) is Wi-Fi and Bluetooth without commands. It reads
+`/proc/wifi` and `/proc/bluetooth` every half second and writes the same
+requests the `wifi` and `bluetooth` commands do. Those requests return
+straight away: the kernel scans, signs in and pairs in the background,
+and the next reading shows how it went. So the window never waits,
+and what it shows is always what the hardware is doing.
+
+- **Wi-Fi**: the networks from the last scan, strongest first. Each name
+  appears once, at the signal of its best access point. Each shows signal
+  bars and what joining needs: nothing (open), a password (WPA2), or a
+  user name and password (WPA2-Enterprise, such as eduroam or PAL3.0).
+  Networks the driver can't join (WEP, WPA1, WPA3) are marked and refused
+  with a reason. Connect (or a double click) opens a small form for the
+  password; the password field shows dots (`TextField::secret`). Scan,
+  and Disconnect while connected.
+- **Bluetooth**: paired devices first, with the kernel's state ("connected,
+  keyboard, 60 reports"), then those found by the last scan, named by
+  their class of device (keyboard, mouse, headphones). Pair, Connect,
+  Disconnect, Forget. While a keyboard is pairing by passkey, the window
+  shows the number to type.
+
+Ordinary users can use it: the two files belong to the `netdev` group.
 
 ### Linux programs
 

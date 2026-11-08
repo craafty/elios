@@ -121,10 +121,14 @@ programs and text files open in a terminal; copying a file also puts its
 path on the clipboard. The eliOS button (or the Super key on its own) opens
 the app menu: every installed program with a `.desktop` file, so Firefox
 appears there, and gets its own bar button, once it's added. The bar also
-shows the network (the Wi-Fi network's name, Wired or Offline) and the
-time. Super+Enter opens a terminal,
+shows the network (the Wi-Fi network's name, Wired or Offline), the
+time, and your name, whose menu has Settings and Log out. Settings (also
+opened by clicking the network status) joins Wi-Fi networks, including
+enterprise ones with a user name and password, and scans for, pairs,
+connects and forgets Bluetooth devices, with no commands needed. Super+Enter opens a terminal,
 Super+E the file explorer, Super+Tab switches windows, Super+Q closes one, and
-Ctrl+Alt+Backspace goes back to the text console.
+Ctrl+Alt+Backspace logs out (as the menu does, ending every program the
+desktop started).
 
 Firefox is Alpine's, unmodified, with its multi-process design (a fork
 server, content processes, a socket process) working on eliOS's kernel.
@@ -370,7 +374,8 @@ eliOS's own rasterizer in `truetype/`.
       explorer (`files`, done), a shared clipboard, an app menu (Firefox
       appears once it's added) and a status area (done), smoother touchpad
       and TrackPoint movement (resynchronizing packets, speed-based
-      acceleration; to try on the laptop); next, the desktop preinstalled
+      acceleration; to try on the laptop), Settings for Wi-Fi and
+      Bluetooth and a Log out menu (done); next, the desktop preinstalled
 - [x] **Firefox:** Alpine's Firefox browses HTTPS sites in the desktop
       (package triggers, `mremap`, `statx`, `prctl` and `arch_prctl`
       additions, `/proc/sys`, namespaces refused so sandboxes fall back),

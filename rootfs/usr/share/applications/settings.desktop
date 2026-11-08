@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Settings
+Comment=Wi-Fi and Bluetooth
+Exec=settings
+Categories=Settings;

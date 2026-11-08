@@ -178,6 +178,7 @@ fn main() -> i32 {
             disconnect(&mut desktop, &epoll, id);
         }
     }
+    desktop.end_programs();
     for device in &devices {
         // SAFETY: EVIOCGRAB takes its argument by value.
         let _ = unsafe { sys::ioctl(device.fd, EVIOCGRAB, 0) };

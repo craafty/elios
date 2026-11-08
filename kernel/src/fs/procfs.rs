@@ -61,17 +61,33 @@ impl Inode for Generated {
     }
 }
 
-/// A generated file that can also be written, to control something.
+/// A generated file that can also be written, to control something: by
+/// root, and by the members of `group` if it has one.
 struct Control {
     file: Generated,
     write: Writer,
+    group: Option<u32>,
 }
+
+/// The group whose members may control Wi-Fi and Bluetooth (`netdev`, as
+/// on Alpine): everyone using the computer, so the desktop's settings
+/// work without root.
+const NETWORK_GROUP: u32 = 28;
 
 fn control(
     generate: impl Fn() -> String + Send + Sync + 'static,
     write: impl Fn(&[u8]) -> Result<()> + Send + Sync + 'static,
 ) -> Arc<dyn Inode> {
+    control_by(generate, write, None)
+}
+
+fn control_by(
+    generate: impl Fn() -> String + Send + Sync + 'static,
+    write: impl Fn(&[u8]) -> Result<()> + Send + Sync + 'static,
+    group: Option<u32>,
+) -> Arc<dyn Inode> {
     Arc::new(Control {
+        group,
         file: Generated {
             inode: ramfs::next_inode_number(),
             generate: Box::new(generate),
@@ -83,7 +99,10 @@ fn control(
 
 impl Inode for Control {
     fn metadata(&self) -> Metadata {
-        Metadata { permissions: 0o644, ..self.file.metadata() }
+        match self.group {
+            Some(gid) => Metadata { permissions: 0o664, gid, ..self.file.metadata() },
+            None => Metadata { permissions: 0o644, ..self.file.metadata() },
+        }
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
@@ -182,13 +201,18 @@ pub fn create() -> Arc<dyn Inode> {
             // "disconnect") for the `wifi` command.
             entries.push((
                 "wifi".into(),
-                control(crate::drivers::intel_wifi::status_text, crate::drivers::intel_wifi::control),
+                control_by(
+                    crate::drivers::intel_wifi::status_text,
+                    crate::drivers::intel_wifi::control,
+                    Some(NETWORK_GROUP),
+                ),
             ));
         }
         if crate::bluetooth::present() {
             // Status, devices found, and requests ("scan") for the
             // `bluetooth` command.
-            entries.push(("bluetooth".into(), control(crate::bluetooth::status_text, crate::bluetooth::control)));
+            let file = control_by(crate::bluetooth::status_text, crate::bluetooth::control, Some(NETWORK_GROUP));
+            entries.push(("bluetooth".into(), file));
         }
         for info in process::list() {
             entries.push((info.pid.to_string(), process_directory(info.pid)));

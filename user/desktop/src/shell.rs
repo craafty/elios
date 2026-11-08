@@ -49,6 +49,10 @@ enum Launcher {
 #[derive(Clone, Copy)]
 enum BarItem {
     Apps,
+    /// The user's name, at the right end: settings and logging out.
+    Session,
+    /// The network status: opens the settings.
+    Status,
     Launch(Launcher),
     Window(SurfaceRef),
     Close(SurfaceRef),
@@ -83,6 +87,11 @@ pub struct Desktop {
     bar: Vec<(Rect, BarItem)>,
     pub running: bool,
     children: Vec<u32>,
+    /// The process groups of the programs started (each its own), so
+    /// logging out can end them and everything they started.
+    groups: Vec<u32>,
+    /// Who is logged in, on the session button.
+    user: String,
     clock: String,
     /// The time zone the clock shows, looked at again every few seconds.
     zone: eli::time::Zone,
@@ -100,9 +109,26 @@ pub struct Desktop {
     status: String,
 }
 
-/// The open app menu, below its bar button.
+/// A row of a menu.
+enum Entry {
+    Start(App),
+    LogOut,
+}
+
+impl Entry {
+    fn name(&self) -> &str {
+        match self {
+            Entry::Start(app) => &app.name,
+            Entry::LogOut => "Log out",
+        }
+    }
+}
+
+/// The open app (or session) menu, below its bar button.
 struct AppMenu {
-    apps: Vec<App>,
+    entries: Vec<Entry>,
+    /// Whether it's the session menu, under the user's name.
+    session: bool,
     rect: Rect,
     /// The row under the pointer or chosen with the arrow keys.
     selected: Option<usize>,
@@ -143,6 +169,8 @@ impl Desktop {
             bar: Vec::new(),
             running: true,
             children: Vec::new(),
+            groups: Vec::new(),
+            user: eli::env::var("USER").filter(|user| !user.is_empty()).unwrap_or_else(|| String::from("Session")),
             clock: String::new(),
             zone: eli::time::local_zone(),
         }
@@ -697,7 +725,8 @@ impl Desktop {
         self.bar.clear();
         let text_y = (BAR_HEIGHT - self.font.line_height) / 2;
         let apps = Rect::new(4, 4, self.font.width("eliOS") + 16, BAR_HEIGHT - 8);
-        self.screen.fill(apps, if self.menu.is_some() { HIGHLIGHT } else { BAR_COLOR });
+        let open = self.menu.as_ref().is_some_and(|menu| !menu.session);
+        self.screen.fill(apps, if open { HIGHLIGHT } else { BAR_COLOR });
         self.screen.text(&mut self.font, apps.x + 8, text_y, "eliOS", TEXT, clip);
         self.bar.push((apps, BarItem::Apps));
         let mut x = apps.x + apps.width + 8;
@@ -716,12 +745,14 @@ impl Desktop {
         // A tab per window (dialogs belong to their parents).
         let windows: Vec<SurfaceRef> = self.windows.iter().copied().filter(|&w| !self.is_dialog(w)).collect();
         let clock_width = self.font.width("00:00") + 24;
+        let session_width = self.font.width(&self.user) + 16;
+        let right = width - session_width - 4;
         let mut status = self.status.clone();
         while self.font.width(&status) > 240 {
             status.pop();
         }
         let status_width = if status.is_empty() { 0 } else { self.font.width(&status) + 24 };
-        let space = (width - x - clock_width - status_width).max(0);
+        let space = (right - x - clock_width - status_width).max(0);
         let tab_width = if windows.is_empty() { 0 } else { (space / windows.len() as i32).min(240) };
         for window in windows {
             let title = self
@@ -744,10 +775,19 @@ impl Desktop {
             self.bar.push((rect, BarItem::Window(window)));
             x += tab_width;
         }
-        let status_x = width - clock_width - status_width + 8;
+        let status_x = right - clock_width - status_width + 8;
         self.screen.text(&mut self.font, status_x, text_y, &status, DIM_TEXT, clip);
+        if !status.is_empty() {
+            self.bar.push((Rect::new(status_x - 8, 4, status_width, BAR_HEIGHT - 8), BarItem::Status));
+        }
         let clock = self.clock.clone();
-        self.screen.text(&mut self.font, width - clock_width + 8, text_y, &clock, TEXT, clip);
+        self.screen.text(&mut self.font, right - clock_width + 8, text_y, &clock, TEXT, clip);
+        let session = Rect::new(right, 4, session_width, BAR_HEIGHT - 8);
+        let open = self.menu.as_ref().is_some_and(|menu| menu.session);
+        self.screen.fill(session, if open { HIGHLIGHT } else { BUTTON });
+        let user = self.user.clone();
+        self.screen.text(&mut self.font, session.x + 8, text_y, &user, TEXT, clip);
+        self.bar.push((session, BarItem::Session));
     }
 
     fn draw_menu(&mut self, clip: Rect) {
@@ -759,7 +799,7 @@ impl Desktop {
         self.screen.fill(rect, BAR_LINE);
         let inside = Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2);
         self.screen.fill(inside, BAR_COLOR);
-        let names: Vec<String> = menu.apps.iter().map(|app| app.name.clone()).collect();
+        let names: Vec<String> = menu.entries.iter().map(|entry| String::from(entry.name())).collect();
         let selected = menu.selected;
         if names.is_empty() {
             let y = rect.y + MENU_PADDING + (MENU_ROW - self.font.line_height) / 2;
@@ -775,23 +815,45 @@ impl Desktop {
         }
     }
 
-    /// Opens the app menu (or closes it if it's open).
+    /// Opens the app menu (or closes the open menu).
     fn toggle_menu(&mut self) {
-        if let Some(menu) = self.menu.take() {
-            self.screen.damage(menu.rect);
-            self.screen.damage(Rect::new(0, 0, self.screen.width, BAR_HEIGHT));
+        if self.close_menu() {
             return;
         }
-        let apps = apps::list();
-        let widest = apps.iter().map(|app| self.font.width(&app.name)).max().unwrap_or(0);
+        let entries = apps::list().into_iter().map(Entry::Start).collect();
+        self.open_menu(entries, false);
+        self.browser_installed = browser_path().is_some();
+    }
+
+    /// Opens the session menu under the user's name (or closes the open
+    /// menu).
+    fn toggle_session_menu(&mut self) {
+        if self.close_menu() {
+            return;
+        }
+        let settings =
+            App { name: String::from("Settings"), command: alloc::vec![String::from("settings")], terminal: false };
+        self.open_menu(alloc::vec![Entry::Start(settings), Entry::LogOut], true);
+    }
+
+    /// Closes the menu; whether one was open.
+    fn close_menu(&mut self) -> bool {
+        let Some(menu) = self.menu.take() else { return false };
+        self.screen.damage(menu.rect);
+        self.screen.damage(Rect::new(0, 0, self.screen.width, BAR_HEIGHT));
+        true
+    }
+
+    fn open_menu(&mut self, entries: Vec<Entry>, session: bool) {
+        let widest = entries.iter().map(|entry| self.font.width(entry.name())).max().unwrap_or(0);
         let width = (widest + 40).max(self.font.width("No apps installed") + 28).max(220);
-        let rows = apps.len().max(1) as i32;
+        let rows = entries.len().max(1) as i32;
         let height = (rows * MENU_ROW + 2 * MENU_PADDING).min(self.screen.height - BAR_HEIGHT - 8);
-        let rect = Rect::new(4, BAR_HEIGHT, width, height);
-        self.menu = Some(AppMenu { apps, rect, selected: None });
+        let x = if session { self.screen.width - width - 4 } else { 4 };
+        let rect = Rect::new(x, BAR_HEIGHT, width, height);
+        self.menu = Some(AppMenu { entries, session, rect, selected: None });
         self.screen.damage(rect);
         self.screen.damage(Rect::new(0, 0, self.screen.width, BAR_HEIGHT));
-        self.browser_installed = browser_path().is_some();
     }
 
     /// The menu row at a point on screen.
@@ -801,7 +863,7 @@ impl Desktop {
             return None;
         }
         let index = ((y - menu.rect.y - MENU_PADDING) / MENU_ROW) as usize;
-        (index < menu.apps.len()).then_some(index)
+        (index < menu.entries.len()).then_some(index)
     }
 
     fn select_in_menu(&mut self, selected: Option<usize>) {
@@ -817,9 +879,16 @@ impl Desktop {
     /// Starts the menu's chosen app and closes the menu.
     fn choose_in_menu(&mut self, index: usize) {
         let Some(menu) = self.menu.as_ref() else { return };
-        let Some(app) = menu.apps.get(index) else { return };
-        let (command, terminal) = (app.command.clone(), app.terminal);
-        self.toggle_menu();
+        let (command, terminal) = match menu.entries.get(index) {
+            Some(Entry::Start(app)) => (app.command.clone(), app.terminal),
+            Some(Entry::LogOut) => {
+                self.close_menu();
+                self.running = false;
+                return;
+            }
+            None => return,
+        };
+        self.close_menu();
         let (program, arguments) = if terminal {
             let mut arguments = alloc::vec![String::from("-e")];
             arguments.extend(command);
@@ -827,20 +896,19 @@ impl Desktop {
         } else {
             (command[0].clone(), command[1..].to_vec())
         };
-        match eli::process::find_program(&program) {
-            Some(path) => self.run(&path, &arguments),
-            None => eli::eprintln!("desktop: {program} isn't installed"),
-        }
+        self.start(&program, &arguments);
     }
 
     /// Keys while the menu is open: arrows choose, Enter starts, Escape
     /// closes; others are swallowed.
     fn menu_key(&mut self, code: u32) {
         let Some(menu) = &self.menu else { return };
-        let count = menu.apps.len();
+        let count = menu.entries.len();
         let selected = menu.selected;
         match code {
-            1 => self.toggle_menu(),
+            1 => {
+                self.close_menu();
+            }
             28 | 96 => {
                 if let Some(index) = selected {
                     self.choose_in_menu(index);
@@ -917,7 +985,7 @@ impl Desktop {
         let clock = format!("{:02}:{:02}", now.hour, now.minute);
         if clock != self.clock {
             self.clock = clock;
-            self.screen.damage(Rect::new(self.screen.width - 80, 0, 80, BAR_HEIGHT));
+            self.screen.damage(Rect::new(0, 0, self.screen.width, BAR_HEIGHT));
         }
         self.ticks = self.ticks.wrapping_add(1);
         if self.ticks.is_multiple_of(120) {
@@ -935,6 +1003,10 @@ impl Desktop {
         // Programs that ended.
         while let Ok(Some((pid, _))) = eli::process::wait(-1, true) {
             self.children.retain(|&child| child != pid);
+        }
+        // Forget groups that have ended (so a reused number isn't signalled).
+        if self.ticks.is_multiple_of(120) {
+            self.groups.retain(|&group| eli::process::kill(-(group as i32), 0).is_ok());
         }
     }
 
@@ -1059,9 +1131,13 @@ impl Desktop {
                 }
                 return;
             }
-            // A click elsewhere closes it (and on the eliOS button, only that).
-            self.toggle_menu();
-            if self.bar.iter().any(|(rect, item)| matches!(item, BarItem::Apps) && rect.contains(x, y)) {
+            // A click elsewhere closes it (and on its own button, only that).
+            let session = self.menu.as_ref().is_some_and(|menu| menu.session);
+            self.close_menu();
+            let own_button = self.bar.iter().any(|(rect, item)| {
+                rect.contains(x, y) && matches!((item, session), (BarItem::Apps, false) | (BarItem::Session, true))
+            });
+            if own_button {
                 return;
             }
         }
@@ -1148,6 +1224,8 @@ impl Desktop {
         let item = self.bar.iter().find(|(rect, _)| rect.contains(x, y)).map(|&(_, item)| item);
         match item {
             Some(BarItem::Apps) => self.toggle_menu(),
+            Some(BarItem::Session) => self.toggle_session_menu(),
+            Some(BarItem::Status) => self.start("settings", &[]),
             Some(BarItem::Launch(launcher)) => self.launch(launcher),
             Some(BarItem::Window(window)) => self.set_keyboard_focus(Some(window)),
             Some(BarItem::Close(window)) => self.close(window),
@@ -1277,8 +1355,42 @@ impl Desktop {
                 eli::eprintln!("desktop: can't run {path}: {error}");
                 eli::process::exit(127);
             }
-            Ok(pid) => self.children.push(pid),
+            Ok(pid) => {
+                self.children.push(pid);
+                self.groups.push(pid);
+            }
             Err(error) => eli::eprintln!("desktop: can't start {path}: {error}"),
+        }
+    }
+
+    /// Starts an installed program by name.
+    fn start(&mut self, name: &str, arguments: &[String]) {
+        match eli::process::find_program(name) {
+            Some(path) => self.run(&path, arguments),
+            None => eli::eprintln!("desktop: {name} isn't installed"),
+        }
+    }
+
+    /// Ends every program the desktop started, and theirs (Firefox's
+    /// helpers), when the session ends: asked politely, then, after a
+    /// moment for saving, made to.
+    pub fn end_programs(&mut self) {
+        self.groups.retain(|&group| eli::process::kill(-(group as i32), 0).is_ok());
+        for &group in &self.groups {
+            let _ = eli::process::kill(-(group as i32), eli::process::SIGTERM);
+        }
+        let deadline = eli::time::monotonic_nanos() + 2_000_000_000;
+        while eli::time::monotonic_nanos() < deadline {
+            while let Ok(Some(_)) = eli::process::wait(-1, true) {}
+            self.groups.retain(|&group| eli::process::kill(-(group as i32), 0).is_ok());
+            if self.groups.is_empty() {
+                return;
+            }
+            eli::time::sleep_ms(50);
+        }
+        for &group in &self.groups {
+            eli::eprintln!("desktop: process group {group} didn't end; killing it");
+            let _ = eli::process::kill(-(group as i32), eli::process::SIGKILL);
         }
     }
 }

@@ -89,6 +89,8 @@ pub struct TextField {
     scroll: i32,
     /// Shown instead of the text, dimmed, while it's empty.
     pub placeholder: String,
+    /// A password: each character is drawn as a dot.
+    pub secret: bool,
 }
 
 impl TextField {
@@ -120,6 +122,15 @@ impl TextField {
         if self.text.is_char_boundary(start) && self.text.is_char_boundary(end) && start <= end {
             self.anchor = Some(start);
             self.cursor = end;
+        }
+    }
+
+    /// The text up to byte `end` as drawn (dots for a secret field).
+    fn shown(&self, end: usize) -> String {
+        if self.secret {
+            self.text[..end].chars().map(|_| SECRET_DOT).collect()
+        } else {
+            String::from(&self.text[..end])
         }
     }
 
@@ -233,7 +244,7 @@ impl TextField {
         let mut pen = 0.0;
         let mut cursor = self.text.len();
         for (index, c) in self.text.char_indices() {
-            let advance = font.advance(c);
+            let advance = font.advance(if self.secret { SECRET_DOT } else { c });
             if pen + advance / 2.0 > target as f32 {
                 cursor = index;
                 break;
@@ -254,7 +265,7 @@ impl TextField {
             canvas.text(font, inner.x, y, &self.placeholder.clone(), theme::DIM_TEXT);
         }
         // Keep the cursor in view.
-        let cursor_x = font.width(&self.text[..self.cursor]);
+        let cursor_x = font.width(&self.shown(self.cursor));
         if cursor_x - self.scroll > inner.width - 2 {
             self.scroll = cursor_x - inner.width + 2;
         } else if cursor_x < self.scroll {
@@ -262,11 +273,11 @@ impl TextField {
         }
         let left = inner.x - self.scroll;
         if let Some((start, end)) = self.selection().filter(|_| focused) {
-            let x0 = left + font.width(&self.text[..start]);
-            let x1 = left + font.width(&self.text[..end]);
+            let x0 = left + font.width(&self.shown(start));
+            let x1 = left + font.width(&self.shown(end));
             canvas.fill(Rect::new(x0, y, x1 - x0, font.line_height), theme::SELECTION);
         }
-        let text = self.text.clone();
+        let text = self.shown(self.text.len());
         canvas.text(font, left, y, &text, theme::TEXT);
         if focused {
             canvas.fill(Rect::new(left + cursor_x, y, 2, font.line_height), theme::TEXT);
@@ -276,6 +287,8 @@ impl TextField {
 }
 
 const FIELD_PADDING: i32 = 8;
+/// What a secret field shows for each character.
+const SECRET_DOT: char = '\u{2022}';
 
 /// A scrolling list of rows with an optional selection. The program draws
 /// each row; the list keeps track of which are in view.

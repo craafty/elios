@@ -22,9 +22,9 @@ pub const SHADOW: &str = "/etc/shadow";
 pub const ADMIN_GROUP: &str = "wheel";
 
 /// Groups every user of the computer is in: the devices of the person at
-/// it (sound, the screen, keyboards and mice), as desktop Linux systems
-/// grant them.
-pub const SEAT_GROUPS: [&str; 3] = ["audio", "video", "input"];
+/// it (sound, the screen, keyboards and mice) and its Wi-Fi and Bluetooth
+/// (`netdev`), as desktop Linux systems grant them.
+pub const SEAT_GROUPS: [&str; 4] = ["audio", "video", "input", "netdev"];
 
 /// Ordinary accounts get user ids from here up.
 pub const FIRST_USER_ID: u32 = 1000;
