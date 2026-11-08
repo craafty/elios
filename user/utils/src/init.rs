@@ -32,12 +32,12 @@ pub fn main() -> i32 {
     // The system as /etc/system.conf describes it: accounts, hostname,
     // packages (see the `eli` command).
     if let Ok(pid) = spawn(ELI, &["eli".into(), "boot".into()]) {
-        wait_for(pid);
+        let _ = wait_for(pid);
     }
     if fs::exists("/etc/rc")
         && let Ok(pid) = spawn(SHELL, &[SHELL.into(), "/etc/rc".into()])
     {
-        wait_for(pid);
+        let _ = wait_for(pid);
     }
 
     let mut autologin = crate::accounts::autologin_user();
@@ -48,9 +48,18 @@ pub fn main() -> i32 {
             None if fs::exists(GREETER) => (GREETER, alloc::vec!["greeter".into()]),
             None => (LOGIN, alloc::vec!["login".into()]),
         };
-        match spawn(program, &arguments) {
+        let ended = match spawn(program, &arguments) {
             Ok(session) => wait_for(session),
-            Err(error) => eprintln!("init: can't start {program}: {error}"),
+            Err(error) => {
+                eprintln!("init: can't start {program}: {error}");
+                None
+            }
+        };
+        // The desktop's Power off and Restart.
+        match ended.and_then(process::ExitStatus::code) {
+            Some(process::SESSION_POWER_OFF) => eprintln!("init: power off: {}", process::power_off()),
+            Some(process::SESSION_RESTART) => eprintln!("init: restart: {}", process::reboot()),
+            _ => {}
         }
         // A session that ends immediately would otherwise respawn in a
         // busy loop.
@@ -74,13 +83,14 @@ fn spawn(program: &str, arguments: &[String]) -> eli::Result<u32> {
     Ok(pid)
 }
 
-/// Waits for one process, collecting any orphans that exit meanwhile.
-fn wait_for(pid: u32) {
+/// Waits for one process, collecting any orphans that exit meanwhile;
+/// how it ended.
+fn wait_for(pid: u32) -> Option<process::ExitStatus> {
     loop {
         match process::wait(-1, false) {
-            Ok(Some((exited, _))) if exited == pid => return,
+            Ok(Some((exited, status))) if exited == pid => return Some(status),
             Ok(_) => {}
-            Err(_) => return,
+            Err(_) => return None,
         }
     }
 }

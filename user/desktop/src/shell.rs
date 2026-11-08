@@ -86,6 +86,9 @@ pub struct Desktop {
     buttons_down: u32,
     bar: Vec<(Rect, BarItem)>,
     pub running: bool,
+    /// What the desktop exits with: 0 (log out) or a request for init to
+    /// power off or restart (`eli::process::SESSION_*`).
+    pub exit_code: i32,
     children: Vec<u32>,
     /// The process groups of the programs started (each its own), so
     /// logging out can end them and everything they started.
@@ -115,6 +118,8 @@ pub struct Desktop {
 enum Entry {
     Start(App),
     LogOut,
+    Restart,
+    PowerOff,
 }
 
 impl Entry {
@@ -122,6 +127,8 @@ impl Entry {
         match self {
             Entry::Start(app) => &app.name,
             Entry::LogOut => "Log out",
+            Entry::Restart => "Restart",
+            Entry::PowerOff => "Power off",
         }
     }
 }
@@ -170,6 +177,7 @@ impl Desktop {
             buttons_down: 0,
             bar: Vec::new(),
             running: true,
+            exit_code: 0,
             children: Vec::new(),
             groups: Vec::new(),
             sound_server: false,
@@ -611,12 +619,12 @@ impl Desktop {
     /// What should have the keyboard: the topmost grabbing popup, or the
     /// top window.
     fn top_focus(&self) -> Option<SurfaceRef> {
-        self.popups
-            .iter()
-            .rev()
-            .find(|&&popup| matches!(self.surface(popup).map(|s| &s.role), Some(Role::Popup(p)) if p.grab))
-            .or(self.windows.last())
-            .copied()
+        self.popups.iter().rev().find(|&&popup| self.grabs(popup)).or(self.windows.last()).copied()
+    }
+
+    /// Whether a popup took an input grab (menus do; tooltips don't).
+    fn grabs(&self, popup: SurfaceRef) -> bool {
+        matches!(self.surface(popup).map(|s| &s.role), Some(Role::Popup(p)) if p.grab)
     }
 
     fn set_keyboard_focus(&mut self, focus: Option<SurfaceRef>) {
@@ -836,7 +844,8 @@ impl Desktop {
         }
         let settings =
             App { name: String::from("Settings"), command: alloc::vec![String::from("settings")], terminal: false };
-        self.open_menu(alloc::vec![Entry::Start(settings), Entry::LogOut], true);
+        let entries = alloc::vec![Entry::Start(settings), Entry::LogOut, Entry::Restart, Entry::PowerOff];
+        self.open_menu(entries, true);
     }
 
     /// Closes the menu; whether one was open.
@@ -884,7 +893,12 @@ impl Desktop {
         let Some(menu) = self.menu.as_ref() else { return };
         let (command, terminal) = match menu.entries.get(index) {
             Some(Entry::Start(app)) => (app.command.clone(), app.terminal),
-            Some(Entry::LogOut) => {
+            Some(entry @ (Entry::LogOut | Entry::Restart | Entry::PowerOff)) => {
+                self.exit_code = match entry {
+                    Entry::Restart => eli::process::SESSION_RESTART,
+                    Entry::PowerOff => eli::process::SESSION_POWER_OFF,
+                    _ => 0,
+                };
                 self.close_menu();
                 self.running = false;
                 return;
@@ -1148,8 +1162,12 @@ impl Desktop {
             return;
         }
         if pressed && self.buttons_down == 1 {
-            // A click outside a client's popups closes them.
-            if !self.popups.is_empty() {
+            // A click outside a client's menus closes them, and does
+            // nothing else. Popups without a grab (tooltips, like the one
+            // over a Firefox tab) are left to their client: the click goes
+            // through, or closing a tab would take two.
+            let menus = self.popups.iter().any(|&popup| self.grabs(popup));
+            if menus {
                 let over_popup = self.surface_at(x, y).is_some_and(|((client, _), _, _)| {
                     self.popups.iter().any(|&(owner, _)| owner == client)
                         && self.popups.iter().any(|&popup| self.surface_rect(popup).is_some_and(|r| r.contains(x, y)))
@@ -1167,7 +1185,7 @@ impl Desktop {
             if let Some(((client, surface), _, _)) = self.surface_at(x, y) {
                 let window = self.windows.iter().copied().find(|&w| w.0 == client && self.contains_surface(w, surface));
                 if let Some(window) = window
-                    && self.popups.is_empty()
+                    && !menus
                 {
                     self.set_keyboard_focus(Some(window));
                 }

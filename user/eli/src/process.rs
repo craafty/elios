@@ -242,6 +242,13 @@ pub fn find_program(name: &str) -> Option<String> {
         .find(|candidate| crate::fs::metadata(candidate).is_ok_and(|m| m.kind == crate::fs::FileType::File))
 }
 
+/// Exit statuses a login session (the desktop) ends with to have init,
+/// which may, turn the computer off or restart it once the session's
+/// programs are gone: the user who is sitting at it may do that, as on
+/// other desktops, but only root may make the system call.
+pub const SESSION_POWER_OFF: i32 = 80;
+pub const SESSION_RESTART: i32 = 82;
+
 const REBOOT_MAGIC1: usize = 0xFEE1_DEAD;
 const REBOOT_MAGIC2: usize = 0x2812_1969;
 

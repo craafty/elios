@@ -122,7 +122,7 @@ path on the clipboard. The eliOS button (or the Super key on its own) opens
 the app menu: every installed program with a `.desktop` file, so Firefox
 appears there, and gets its own bar button, once it's added. The bar also
 shows the network (the Wi-Fi network's name, Wired or Offline), the
-time, and your name, whose menu has Settings and Log out. Settings (also
+time, and your name, whose menu has Settings, Log out, Restart and Power off. Settings (also
 opened by clicking the network status) joins Wi-Fi networks, including
 enterprise ones with a user name and password, and scans for, pairs,
 connects and forgets Bluetooth devices, with no commands needed. Super+Enter opens a terminal,

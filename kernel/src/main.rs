@@ -25,6 +25,7 @@ mod framebuffer;
 mod fs;
 mod input;
 mod keyboard;
+mod load;
 mod logfile;
 mod logo;
 mod memory;
@@ -193,6 +194,7 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
     }
     keyboard::start_terminal_input();
     console::start_blinking();
+    load::start();
     arch::enable_interrupts();
 
     #[cfg(test)]

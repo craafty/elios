@@ -412,7 +412,11 @@ show up on the machine that has it. So a second, 512 KiB ring keeps
 stripped as it's written), with bytes numbered from boot so a reader can
 ask for what it hasn't seen. A kernel thread appends what's new to
 `/disk/logs/boot.log` every two seconds, and once more before a restart or
-power off; the previous boot's log is renamed to `previous-boot.log`. A
+power off; the previous boot's log is renamed to `previous-boot.log`.
+While the computer is busy (over 10% across the CPUs), `load.rs` adds a
+line every ten seconds: each CPU's busy share, memory in use, and the
+five programs that used the most CPU time, with their memory, so a slow
+video can be measured from the log afterwards. A
 hang loses at most two seconds, and the stick can be read on any other
 computer. It's on for the live system and off for installed ones (whose
 `/disk` is the computer's EFI partition), and `savelog`/`savelog=0` on
@@ -1875,6 +1879,14 @@ hands the screen back. Members of the `video` group may open it (every
 user of the computer is one, as on desktop Linux systems; `input` and
 `audio` likewise).
 
+`FBIO_WAITFORVSYNC` waits for the display's next vertical blank, where
+that can be known: on Intel graphics (`drivers/intel_display.rs`), which
+only reads registers and changes nothing GOP set up. It finds the pipe
+whose primary plane is on, its height (`PIPESRC`), and checks that its
+scanline counter (`PIPEDSL`) moves; the wait sleeps while most of a frame
+is left and spins for the last couple of milliseconds, giving up after
+40 ms. Elsewhere (QEMU) the ioctl fails and the desktop stops asking.
+
 ### PS/2 keyboard (`keyboard.rs`)
 
 The i8042 controller is configured to interrupt on key presses and to
@@ -2771,7 +2783,11 @@ seconds, or opens signaling and asks nothing for 1.5, we lead anyway.
 
 The sound comes from sound card 0 ("audio follows the headset"): while
 a stream is open, the card's speakers are muted (its volume setting
-stays and is applied to the headset's samples instead), and a thread
+stays and is applied to the headset's samples instead). Starting a stream
+opens its routes, which unmutes every amplifier on them, so the codec
+remembers the last volume setting and puts it back as the last step:
+otherwise the first program to play after the headset connected would
+come out of both. A thread
 copies what the card is about to play every 10 ms: the frames between
 the card's position and 20 ms past it that programs have written
 (`Pcm::tap`; played frames may already be overwritten, so it never looks
@@ -3204,10 +3220,16 @@ It's one event loop around `epoll`, with a 60 Hz timer for redrawing.
 - **The shell** (`shell.rs`): a bar along the top (the app menu, buttons
   for a terminal, the file explorer and, once it's installed, Firefox, a
   tab per window, the network status and a clock, and the user's name,
-  whose menu has Settings and Log out); every window maximized below
+  whose menu has Settings, Log out, Restart and Power off; the last two
+  end the session with exit status 80 or 82, which init, as root, turns
+  into the system call); every window maximized below
   it, so toolkits leave out shadows and rounded corners; dialogs centered;
   popup menus where their positioner says, slid to stay on screen; the
-  focused window on top. Frame callbacks are answered after each redraw.
+  focused window on top. A click outside a popup that grabbed input (a
+  menu) only closes it; popups without a grab (tooltips) are the
+  client's business, and the click goes through: Firefox shows a tab's
+  tooltip as one, and swallowing the click would make closing a tab take
+  two. Frame callbacks are answered after each redraw.
 - **Input**: keyboards and mice are read from `/dev/input` (grabbed, so
   the text console stops seeing keys). Clients get a keymap, a US layout
   in XKB's text format (`keymap.rs`), which they compile with
@@ -3224,7 +3246,10 @@ It's one event loop around `epoll`, with a 60 Hz timer for redrawing.
   The first report after a 50 ms pause isn't accelerated.
 - **Drawing** (`render.rs`, with the toolkit's `Canvas`): into a back
   buffer, blending surfaces with alpha, and only the damaged part is copied to the screen (video memory is
-  slow to read, so it's only written). Text is the system's TrueType
+  slow to read, so it's only written). The copy waits for vertical blank
+  (`FBIO_WAITFORVSYNC`) and goes top to bottom, far faster than the
+  display scans, so it stays ahead of the scanout and video doesn't
+  tear. Text is the system's TrueType
   font (below), each character rasterized once and kept, and blended onto
   the background by its coverage.
 

@@ -22,6 +22,9 @@ const FBIOPUT_VSCREENINFO: u64 = 0x4601;
 const FBIOGET_FSCREENINFO: u64 = 0x4602;
 const FBIOPAN_DISPLAY: u64 = 0x4606;
 const FBIOBLANK: u64 = 0x4611;
+/// `_IOW('F', 0x20, u32)`: wait for the next vertical blank (the argument,
+/// which CRTC, must be 0).
+const FBIO_WAITFORVSYNC: u64 = 0x4004_4620;
 
 /// Linux's character device major number for framebuffers.
 const FB_MAJOR: u64 = 29;
@@ -136,6 +139,15 @@ impl Inode for Client {
                 info[48..52].copy_from_slice(&(screen.stride * 4).to_le_bytes());
                 user::write_bytes(argument, &info)?;
                 Ok(0)
+            }
+            // Only where the display's scanout can be watched (Intel
+            // graphics); elsewhere programs learn they can't wait.
+            FBIO_WAITFORVSYNC => {
+                if crate::drivers::intel_display::wait_for_vblank() {
+                    Ok(0)
+                } else {
+                    Err(Errno::ENOTTY)
+                }
             }
             _ => Err(Errno::ENOTTY),
         }

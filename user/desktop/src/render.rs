@@ -23,10 +23,15 @@ pub struct Screen {
     pub back: Vec<u32>,
     /// What has to be redrawn and copied.
     pub damage: Rect,
+    fd: i32,
+    /// Copies wait for the display's vertical blank (where the kernel can
+    /// tell when that is), so moving pictures don't tear.
+    vsync: bool,
 }
 
 const FBIOGET_VSCREENINFO: usize = 0x4600;
 const FBIOGET_FSCREENINFO: usize = 0x4602;
+const FBIO_WAITFORVSYNC: usize = 0x4004_4620;
 
 impl Screen {
     /// Opens /dev/fb0 (which hides the text console) and maps it.
@@ -56,6 +61,8 @@ impl Screen {
             swap_red_blue: variable[8] == 0,
             back: vec![0; (width * height) as usize],
             damage: Rect::new(0, 0, width, height),
+            fd,
+            vsync: true,
         })
     }
 
@@ -80,6 +87,14 @@ impl Screen {
         self.damage = Rect::new(0, 0, 0, 0);
         if area.is_empty() {
             return;
+        }
+        if self.vsync {
+            let crtc = 0u32;
+            // SAFETY: the argument is a u32, as the ioctl takes.
+            let waited = unsafe { sys::ioctl(self.fd, FBIO_WAITFORVSYNC, &raw const crtc as usize) };
+            // Copying from the top down is far quicker than the display
+            // scans, so starting in the blank keeps ahead of it.
+            self.vsync = waited.is_ok();
         }
         for y in area.y..area.y + area.height {
             let row = (y * self.width + area.x) as usize;

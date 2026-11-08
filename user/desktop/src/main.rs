@@ -185,7 +185,7 @@ fn main() -> i32 {
     }
     sys::unlink(&socket_path);
     println!("desktop: goodbye");
-    0
+    desktop.exit_code
 }
 
 /// `$XDG_RUNTIME_DIR`, or a private directory in /tmp.

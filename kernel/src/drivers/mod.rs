@@ -5,6 +5,7 @@ pub mod block;
 pub mod dma;
 pub mod e1000;
 pub mod hda;
+pub mod intel_display;
 pub mod intel_wifi;
 pub mod nvme;
 pub mod pci;
@@ -50,6 +51,7 @@ pub fn init() {
     }
     e1000::probe(&devices);
     hda::probe(&devices);
+    intel_display::probe(&devices);
     intel_wifi::probe(&devices);
     usb::probe(&devices);
 }

@@ -18,6 +18,7 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Sends verbs to a codec: the controller's command rings, or a test's
 /// simulation. `verb` is 12 bits with an 8-bit payload, or (for the
@@ -180,6 +181,12 @@ pub struct Codec {
     pub outputs: Vec<Path>,
     /// The route from the microphone (or line in) to an ADC.
     pub input: Option<Path>,
+    /// The last [`set_volume`](Self::set_volume) for playback and capture
+    /// (step, and bit 31 for unmuted), put back whenever a stream starts:
+    /// opening a route unmutes every amp on it, the volume amp included,
+    /// and a muted card (sound going to a Bluetooth headset) must stay
+    /// muted when a program starts playing.
+    levels: [AtomicU32; 2],
 }
 
 fn parameter(link: &mut impl Link, nid: u16, parameter: u8) -> u32 {
@@ -226,7 +233,8 @@ impl Codec {
             }
             widgets.insert(nid, Widget { nid, kind, caps, connections, pin_caps, config, in_amp, out_amp });
         }
-        let mut codec = Codec { address, vendor, widgets, outputs: Vec::new(), input: None };
+        let mut codec =
+            Codec { address, vendor, widgets, outputs: Vec::new(), input: None, levels: Default::default() };
         codec.find_routes(link);
         Some(codec)
     }
@@ -333,6 +341,15 @@ impl Codec {
             link.send(dac, Verb::Long(SET_STREAM_FORMAT, format));
             link.send(dac, Verb::Short(SET_CHANNEL_STREAM, tag << 4));
         }
+        self.restore_volume(link, true);
+    }
+
+    /// Puts the volume amp back to the last setting (if there was one).
+    fn restore_volume(&self, link: &mut impl Link, output: bool) {
+        let level = self.levels[usize::from(!output)].load(Ordering::Relaxed);
+        if level != 0 {
+            self.set_volume(link, output, level & 0x7F, level & 1 << 31 != 0);
+        }
     }
 
     /// Sets up the input route to record into stream `tag` in `format`.
@@ -343,6 +360,7 @@ impl Codec {
             link.send(adc, Verb::Long(SET_STREAM_FORMAT, format));
             link.send(adc, Verb::Short(SET_CHANNEL_STREAM, tag << 4));
         }
+        self.restore_volume(link, false);
     }
 
     /// Stops converters from taking part in a stream.
@@ -440,6 +458,9 @@ impl Codec {
     /// `step`, or mutes it. Every output route gets the same.
     pub fn set_volume(&self, link: &mut impl Link, output: bool, step: u32, unmuted: bool) {
         let Some((nid, _, _)) = self.volume_amp(output) else { return };
+        // Never 0, so 0 means "not set yet".
+        let level = step.min(0x7F) | if unmuted { 1 << 31 } else { 1 << 30 };
+        self.levels[usize::from(!output)].store(level, Ordering::Relaxed);
         let targets: Vec<u16> = if output {
             // The same kind of amp on the other routes (their own DACs).
             let position = self.outputs[0].nodes.iter().position(|&n| n == nid).unwrap_or(0);
@@ -704,6 +725,21 @@ mod tests {
             for dac in [0x02, 0x03] {
                 assert!(sent.contains(&(dac, 0x706 << 8 | 0x10)));
                 assert!(sent.contains(&(dac, 0x2 << 16 | 0x11)));
+            }
+        }
+
+        fn starting_a_stream_keeps_the_volume() {
+            let mut link = Simulated::thinkpad();
+            let codec = Codec::discover(&mut link, 0).unwrap();
+            // Muted at step 0x20 (as while sound goes to a headset).
+            codec.set_volume(&mut link, true, 0x20, false);
+            link.sent.clear();
+            codec.start_output(&mut link, 1, 0x11);
+            // Opening the routes unmutes the DACs' amps, then the setting
+            // comes back last, so that is what they're left at.
+            for dac in [0x02u16, 0x03] {
+                let last = link.sent.iter().rev().find(|&&(nid, code)| nid == dac && code >> 16 == 0x3);
+                assert_eq!(last, Some(&(dac, 0x3 << 16 | 0xB0A0)));
             }
         }
     }
