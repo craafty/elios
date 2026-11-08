@@ -219,8 +219,9 @@ may work too, but QEMU is the one eliOS is tested on.
   setuid programs, all with Linux's rules.
 - **Devices:** framebuffer console (with ANSI escape codes and its own 8x16
   font), USB (an xHCI driver, with keyboards, mice, storage and hubs), PS/2
-  keyboards and mice (laptop touchpads and TrackPoints; `/proc/mouse` shows
-  what the touchpad reported), Linux-style input
+  keyboards and mice (laptop touchpads and TrackPoints; Synaptics touchpads
+  in absolute mode, so a ClickPad clicks and two fingers scroll;
+  `/proc/mouse` shows what the touchpad reported), Linux-style input
   devices (`/dev/input/event*`), serial port, Local and
   I/O APICs, PIT/TSC/APIC timers, CMOS clock, PCI with MSI/MSI-X, AHCI and
   NVMe, Intel e1000 network cards (including the I217/I218 built into

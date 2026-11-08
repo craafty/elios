@@ -36,6 +36,7 @@ const SYN_DROPPED: u16 = 3;
 
 pub const REL_X: u16 = 0x00;
 pub const REL_Y: u16 = 0x01;
+pub const REL_HWHEEL: u16 = 0x06;
 pub const REL_WHEEL: u16 = 0x08;
 
 pub const BTN_LEFT: u16 = 0x110;

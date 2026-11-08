@@ -151,6 +151,8 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
         1 => info!("smp: running on 1 CPU"),
         count => info!("smp: running on {count} CPUs"),
     }
+    // Before the drivers: some take options from it (`mouse=basic`).
+    cmdline::init(boot_info.command_line());
     match keyboard::init() {
         Ok(()) => {
             info!("keyboard: PS/2 ready");
@@ -162,7 +164,6 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
         Err(error) => warn!("keyboard: {error}"),
     }
 
-    cmdline::init(boot_info.command_line());
     net::init();
     drivers::init();
     let initrd = boot_info.initrd();

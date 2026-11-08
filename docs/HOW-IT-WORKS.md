@@ -3367,7 +3367,10 @@ of it is eliOS's own code, in the `apk` crate: DEFLATE decompression, tar
 RSA with 4096-bit keys (Montgomery multiplication), PEM keys, the index
 format, Alpine's version ordering (`1.2_rc1 < 1.2 < 1.2_p1`, `-r2 > -r1`)
 and dependency resolution (by name, version, shared library `so:...` or
-command `cmd:...`). Its host tests check it against Python's zlib, tarfile
+command `cmd:...`, plus `install_if`: a package that comes by itself once
+everything it names is installed, the way a library's plugins follow it;
+GTK aborts with "No image loaders are configured" unless libglycin's
+loaders, `glycin-image-rs` and `glycin-svg`, arrive that way). Its host tests check it against Python's zlib, tarfile
 and hashlib and against OpenSSL, and against real Alpine files when
 they're provided.
 

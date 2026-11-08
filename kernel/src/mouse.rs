@@ -10,8 +10,10 @@
 //! IntelliMouse convention, which every wheel mouse follows).
 //!
 //! Touchpads also have their own richer protocols (absolute positions,
-//! several fingers); this driver uses only the basic mouse one, but logs
-//! what a Synaptics touchpad says about itself for later.
+//! several fingers). A Synaptics touchpad is switched to its absolute mode
+//! (`synaptics.rs`), which is what lets a ClickPad click and two fingers
+//! scroll; `mouse=basic` on the kernel command line keeps the basic
+//! protocol instead, in case some touchpad misbehaves in absolute mode.
 //!
 //! Losing a byte would shift every later packet by one, turning movement
 //! into button presses and wild jumps, so the decoder resynchronizes: a
@@ -27,9 +29,12 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::arch::interrupts::{self, IRQ_BASE, InterruptFrame};
 use crate::arch::{apic, inb};
+use crate::cmdline;
 use crate::input::{self, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, EV_KEY, EV_REL, REL_WHEEL, REL_X, REL_Y};
 use crate::keyboard::{READ_CONFIG, STATUS_FROM_MOUSE, STATUS_OUTPUT_FULL, WRITE_CONFIG, send_command, write_data};
 use crate::task::{self, WaitQueue};
+
+mod synaptics;
 use crate::time;
 
 const DATA: u16 = 0x60;
@@ -125,6 +130,20 @@ pub fn init() -> Result<(), &'static str> {
     let _ = read_mouse_byte(100); // its ID, 0
     command(SET_DEFAULTS)?;
     let synaptics = synaptics_identity();
+    if let Some([minor, major_model]) = synaptics
+        && cmdline::get("mouse") != Some("basic")
+    {
+        match synaptics::start(major_model & 0x0F) {
+            Ok((touchpad, description)) => return start_touchpad(touchpad, [minor, major_model], description),
+            Err(error) => {
+                warn!("mouse: Synaptics absolute mode: {error}; using the basic protocol");
+                command(RESET)?;
+                let _ = read_mouse_byte(1000);
+                let _ = read_mouse_byte(100);
+                command(SET_DEFAULTS)?;
+            }
+        }
+    }
     for rate in [200, 100, 80] {
         command(SET_SAMPLE_RATE)?;
         command(rate)?;
@@ -161,10 +180,55 @@ pub fn init() -> Result<(), &'static str> {
     };
     let device = input::register("PS/2 Generic Mouse", [input::BUS_I8042, 2, 1, 0], capabilities);
 
+    let mut decoder = Decoder::new(if wheel { 4 } else { 3 });
+    start_decoding(device, move |byte, nanos| decoder.feed(byte, nanos))
+}
+
+/// Registers a Synaptics touchpad in absolute mode (the TrackPoint's
+/// packets come through it) and starts decoding its packets.
+fn start_touchpad(touchpad: synaptics::Touchpad, identity: [u8; 2], description: String) -> Result<(), &'static str> {
+    let [minor, major_model] = identity;
+    let info = alloc::format!(
+        "id: synaptics absolute
+packet bytes: 6
+synaptics: version {}.{minor}, model {:#x}
+{description}",
+        major_model & 0x0F,
+        major_model >> 4
+    );
+    info!("mouse: {}", info.trim_end().replace('\n', ", "));
+    *INFO.lock() = info;
+    command(ENABLE_REPORTING)?;
+    let capabilities = input::Capabilities {
+        keys: alloc::vec![BTN_LEFT, BTN_RIGHT, BTN_MIDDLE],
+        relative: alloc::vec![REL_X, REL_Y, REL_WHEEL, input::REL_HWHEEL],
+        leds: Vec::new(),
+        properties: input::PROP_POINTER,
+    };
+    // Programs see a mouse: the pad's positions arrive as movement.
+    let device = input::register("SynPS/2 Synaptics TouchPad", [input::BUS_I8042, 2, 7, 0], capabilities);
+    let mut decoder = synaptics::Decoder::new(touchpad);
+    start_decoding(device, move |byte, nanos| decoder.feed(byte, nanos))
+}
+
+/// Takes the mouse's interrupt and starts the thread that turns its bytes
+/// into events with `decode`.
+fn start_decoding(
+    device: Arc<input::Device>,
+    mut decode: impl FnMut(u8, u64) -> Vec<(u16, u16, i32)> + Send + 'static,
+) -> Result<(), &'static str> {
     interrupts::set_handler(MOUSE_VECTOR, on_interrupt);
     apic::route_isa_irq(MOUSE_IRQ, MOUSE_VECTOR)?;
     set_config(|config| config | CONFIG_SECOND_PORT_INTERRUPT)?;
-    task::spawn("mouse", move || decode_forever(&device, if wheel { 4 } else { 3 }));
+    task::spawn("mouse", move || {
+        loop {
+            let (byte, nanos) = INPUT.wait_until(|| BYTES.pop());
+            let events = decode(byte, nanos);
+            if !events.is_empty() {
+                device.report(&events);
+            }
+        }
+    });
     Ok(())
 }
 
@@ -227,6 +291,14 @@ pub fn status_text() -> String {
     {
         text += &alloc::format!("{name}: {}\n", count.load(Ordering::Relaxed));
     }
+    for (name, count) in [
+        ("touch packets", &synaptics::TOUCH_PACKETS),
+        ("trackpoint packets", &synaptics::STICK_PACKETS),
+        ("button packets", &synaptics::BUTTON_PACKETS),
+        ("pad clicks", &synaptics::PAD_CLICKS),
+    ] {
+        text += &alloc::format!("{name}: {}\n", count.load(Ordering::Relaxed));
+    }
     text
 }
 
@@ -270,18 +342,6 @@ fn on_interrupt(_frame: &mut InterruptFrame) {
         }
     }
     INPUT.wake_all();
-}
-
-/// Assembles packets from the mouse's bytes and reports them.
-fn decode_forever(device: &Arc<input::Device>, packet_size: usize) -> ! {
-    let mut decoder = Decoder::new(packet_size);
-    loop {
-        let (byte, nanos) = INPUT.wait_until(|| BYTES.pop());
-        let events = decoder.feed(byte, nanos);
-        if !events.is_empty() {
-            device.report(&events);
-        }
-    }
 }
 
 struct Decoder {
