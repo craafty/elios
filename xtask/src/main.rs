@@ -370,7 +370,7 @@ fn build_initrd() -> Result<PathBuf, String> {
     }
     let eliauth = eliutils.with_file_name("eliauth");
     fs::copy(&eliauth, bin.join("eliauth")).map_err(|e| format!("copying eliauth: {e}"))?;
-    for program in ["desktop", "uidemo", "term", "files"] {
+    for program in ["desktop", "uidemo", "term", "files", "camera"] {
         let path = eliutils.with_file_name(program);
         fs::copy(&path, bin.join(program)).map_err(|e| format!("copying {program}: {e}"))?;
     }

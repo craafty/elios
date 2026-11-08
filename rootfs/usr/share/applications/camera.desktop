@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Camera
+Comment=See what the webcam sees
+Exec=camera
+Categories=AudioVideo;Video;

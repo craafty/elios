@@ -2189,6 +2189,15 @@ to take it, and closing the file stops the stream. There are no controls
 `/proc/video` lists each camera, its formats, and whether it's
 streaming.
 
+**The camera app** (`user/ui/src/bin/camera.rs`, Camera in the app menu)
+is the simplest V4L2 client: it picks YUYV at the size nearest 640x480,
+maps four buffers, converts each frame to RGB (BT.601's limited-range
+formula, in integers) and scales it to the window, mirrored by default
+as people expect of themselves (M flips it). It shows the frame rate,
+and if there's no camera, or it goes away mid-stream, it says so and
+looks again every second. It's for trying a webcam before a call,
+without Firefox.
+
 **Testing without a camera.** QEMU has no emulated webcam, but it can
 attach a USB device from elsewhere over **usbredir**, a protocol for
 forwarding USB devices across a socket. `xtask/src/camera.rs` is the

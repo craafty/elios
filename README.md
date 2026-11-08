@@ -374,6 +374,6 @@ eliOS's own rasterizer in `truetype/`.
 - [x] **Camera:** a USB video class driver (descriptors, probe and
       commit, isochronous xHCI transfers, frame assembly) behind Linux's
       V4L2 interface (`/dev/video0`), tested against a pretend camera
-      xtask attaches to QEMU over usbredir (`videotest`); to try on the
-      T440p's webcam
+      xtask attaches to QEMU over usbredir (`videotest`), and a Camera
+      app on the desktop to see it; to try on the T440p's webcam
 - [ ] **Next:** Wi-Fi working on the T440p, Bluetooth
