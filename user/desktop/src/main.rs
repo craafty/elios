@@ -17,6 +17,7 @@ extern crate alloc;
 
 mod apps;
 mod keymap;
+mod pointer;
 mod render;
 mod server;
 mod shell;
@@ -52,6 +53,8 @@ const BTN_MOUSE: u16 = 0x110;
 const BTN_TASK: u16 = 0x117;
 /// `EVIOCGRAB`: only this reader gets the device's events.
 const EVIOCGRAB: usize = 0x4004_4590;
+/// `EVIOCGID`: the device's bus, vendor, product and version.
+const EVIOCGID: usize = 0x8008_4502;
 
 struct InputDevice {
     fd: i32,
@@ -59,6 +62,7 @@ struct InputDevice {
     /// Motion gathered until the next SYN_REPORT.
     dx: i32,
     dy: i32,
+    acceleration: pointer::Acceleration,
 }
 
 fn main() -> i32 {
@@ -237,7 +241,11 @@ fn scan_devices(devices: &mut Vec<InputDevice>, epoll: &sys::Epoll) {
         let _ = unsafe { sys::ioctl(fd, EVIOCGRAB, 1) };
         let index = devices.len();
         let _ = epoll.add(fd, TOKEN_INPUT + index as u64);
-        devices.push(InputDevice { fd, path, dx: 0, dy: 0 });
+        let mut id = [0u16; 4];
+        // SAFETY: EVIOCGID writes a `struct input_id` (four u16s).
+        let _ = unsafe { sys::ioctl(fd, EVIOCGID, id.as_mut_ptr() as usize) };
+        let acceleration = pointer::Acceleration::new(id[0]);
+        devices.push(InputDevice { fd, path, dx: 0, dy: 0, acceleration });
     }
 }
 
@@ -269,7 +277,11 @@ fn read_input(desktop: &mut Desktop, devices: &mut [InputDevice], index: usize) 
                     let (dx, dy) = (device.dx, device.dy);
                     device.dx = 0;
                     device.dy = 0;
-                    desktop.pointer_motion(f64::from(dx), f64::from(dy));
+                    let seconds = u64::from_le_bytes(event[0..8].try_into().unwrap());
+                    let micros = u64::from_le_bytes(event[8..16].try_into().unwrap());
+                    let nanos = seconds * 1_000_000_000 + micros * 1000;
+                    let (dx, dy) = device.acceleration.apply(f64::from(dx), f64::from(dy), nanos);
+                    desktop.pointer_motion(dx, dy);
                 }
                 _ => {}
             }

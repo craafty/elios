@@ -218,7 +218,8 @@ may work too, but QEMU is the one eliOS is tested on.
   setuid programs, all with Linux's rules.
 - **Devices:** framebuffer console (with ANSI escape codes and its own 8x16
   font), USB (an xHCI driver, with keyboards, mice, storage and hubs), PS/2
-  keyboards and mice (laptop touchpads and TrackPoints), Linux-style input
+  keyboards and mice (laptop touchpads and TrackPoints; `/proc/mouse` shows
+  what the touchpad reported), Linux-style input
   devices (`/dev/input/event*`), serial port, Local and
   I/O APICs, PIT/TSC/APIC timers, CMOS clock, PCI with MSI/MSI-X, AHCI and
   NVMe, Intel e1000 network cards (including the I217/I218 built into
@@ -355,8 +356,9 @@ eliOS's own rasterizer in `truetype/`.
       choice (done), a TrueType rasterizer and bundled font (done), a
       widget library (`user/ui`, done), a terminal (`term`, done), a file
       explorer (`files`, done), a shared clipboard, an app menu (Firefox
-      appears once it's added) and a status area (done); next, a better
-      touchpad and TrackPoint on the laptop
+      appears once it's added) and a status area (done), smoother touchpad
+      and TrackPoint movement (resynchronizing packets, speed-based
+      acceleration; to try on the laptop); next, the desktop preinstalled
 - [x] **Firefox:** Alpine's Firefox browses HTTPS sites in the desktop
       (package triggers, `mremap`, `statx`, `prctl` and `arch_prctl`
       additions, `/proc/sys`, namespaces refused so sandboxes fall back),

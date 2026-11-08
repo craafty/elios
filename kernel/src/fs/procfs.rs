@@ -172,6 +172,8 @@ pub fn create() -> Arc<dyn Inode> {
             ("net".into(), net_directory()),
             ("sys".into(), sys_directory()),
             ("asound".into(), directory(|| alloc::vec![("cards".into(), generated(crate::sound::cards_text))])),
+            // What the PS/2 mouse (a laptop's touchpad) said and its packet counts.
+            ("mouse".into(), generated(crate::mouse::status_text)),
         ];
         if crate::drivers::intel_wifi::present() {
             // Status, and requests ("scan", "connect\nSSID\nPASSWORD",

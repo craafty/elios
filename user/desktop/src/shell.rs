@@ -1012,11 +1012,10 @@ impl Desktop {
         self.damage_cursor();
     }
 
-    /// Moves the pointer by (dx, dy), with some acceleration.
+    /// Moves the pointer by (dx, dy) pixels (already accelerated: see
+    /// `pointer.rs`).
     pub fn pointer_motion(&mut self, dx: f64, dy: f64) {
-        let speed = libm_hypot(dx, dy);
-        let gain = (1.0 + speed / 8.0).min(3.0);
-        self.pointer_to(self.pointer.0 + dx * gain, self.pointer.1 + dy * gain);
+        self.pointer_to(self.pointer.0 + dx, self.pointer.1 + dy);
     }
 
     /// Moves the pointer to a place on screen.
@@ -1284,18 +1283,4 @@ const BROWSERS: [&str; 2] = ["firefox", "firefox-esr"];
 
 fn browser_path() -> Option<String> {
     BROWSERS.iter().find_map(|name| eli::process::find_program(name))
-}
-
-/// sqrt(x² + y²), without a maths library.
-fn libm_hypot(x: f64, y: f64) -> f64 {
-    let square = x * x + y * y;
-    if square == 0.0 {
-        return 0.0;
-    }
-    // Newton's method from a rough start.
-    let mut root = square.max(1.0);
-    for _ in 0..20 {
-        root = (root + square / root) / 2.0;
-    }
-    root
 }

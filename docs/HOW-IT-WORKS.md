@@ -1697,11 +1697,27 @@ came from, and each port has its own interrupt (1 and 12), so each handler
 takes only its own bytes. Setup is done by polling, with the mouse's
 interrupt off: reset (the self-test answers `AA 00`, after up to a second),
 defaults, then the IntelliMouse "knock" (sample rates 200, 100, 80), after
-which a wheel mouse reports ID 3 and sends 4-byte packets. Packets are
-three bytes (buttons and sign bits, X, Y) plus the wheel; bit 3 of the
-first byte is always set, which is how the decoder resynchronizes after a
-lost byte. Y counts upward in PS/2 and downward in Linux, and the wheel
-the other way round, so both are flipped.
+which a wheel mouse reports ID 3 and sends 4-byte packets; then 100
+reports a second and 8 counts per millimetre (the default 4 makes slow
+movements coarse once accelerated). Reporting is switched on before the
+mouse's interrupt, so reading the controller's configuration byte sets
+aside any mouse bytes that arrive first instead of taking one for the
+answer. Packets are three bytes (buttons and sign bits, X, Y) plus the
+wheel. A lost byte would shift every later packet, so the decoder
+resynchronizes two ways: bit 3 of a first byte is always set, and a
+packet's bytes come within a millisecond or two of each other, so a
+partial packet followed by a 30 ms pause is thrown away (the interrupt
+handler timestamps each byte, since the decoding thread may run later).
+Y counts upward in PS/2 and downward in Linux, and the wheel the other
+way round, so both are flipped.
+
+`/proc/mouse` (and the boot log) says what the device answered: its ID,
+a Synaptics touchpad's identity (the "special command": four resolution
+settings spell an argument, then a status request whose middle byte is
+0x47 on a Synaptics), the status (resolution, rate), and counts of
+packets, resynchronizations, overflowed packets and bytes dropped
+because the queue was full: the numbers to look at when a laptop's
+pointer misbehaves.
 
 Touchpads have richer protocols of their own (absolute positions, several
 fingers, gestures); those are for later. In plain mouse mode the touchpad
@@ -2615,9 +2631,17 @@ It's one event loop around `epoll`, with a 60 Hz timer for redrawing.
 - **Input**: keyboards and mice are read from `/dev/input` (grabbed, so
   the text console stops seeing keys). Clients get a keymap, a US layout
   in XKB's text format (`keymap.rs`), which they compile with
-  libxkbcommon, plus key codes and modifier states. Mice move a pointer
-  with a little acceleration; the arrow is the desktop's own, unless the
-  client under it sets one.
+  libxkbcommon, plus key codes and modifier states. The arrow is the
+  desktop's own, unless the client under it sets one.
+- **Pointer acceleration** (`pointer.rs`), in physical units like
+  libinput's: a report's speed is millimetres per second (PS/2 devices
+  are set to 8 counts per millimetre; others are taken as 1000 dpi
+  mice), from the events' timestamps averaged over the last three
+  reports, not from the size of one report (which depends on the sample
+  rate). Below 30 mm/s the pointer moves a fixed 2 pixels per count for
+  PS/2 touchpads and 1 for mice, for precise pointing; faster, the gain
+  grows linearly to 3x at about 300 mm/s, so a flick crosses the screen.
+  The first report after a 50 ms pause isn't accelerated.
 - **Drawing** (`render.rs`, with the toolkit's `Canvas`): into a back
   buffer, blending surfaces with alpha, and only the damaged part is copied to the screen (video memory is
   slow to read, so it's only written). Text is the system's TrueType
