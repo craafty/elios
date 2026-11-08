@@ -7,13 +7,20 @@
 //! as control requests, events from the interrupt endpoint, ACL data over
 //! the bulk endpoints. It hands them to an [`Adapter`], and this module's
 //! thread runs everything else: loading the controller's firmware patch
-//! (Intel's, in `intel.rs`), setting it up, and finding devices nearby.
+//! (Intel's, in `intel.rs`) and setting it up; then the stack
+//! (`stack.rs`): finding devices nearby, connecting and pairing, keeping
+//! link keys (`keys.rs`), L2CAP channels (`l2cap.rs`) and keyboards and
+//! mice (`hid.rs`).
 //!
-//! `/proc/bluetooth` shows the adapter (address, firmware, devices found)
-//! and takes requests ("scan") for the `bluetooth` command, as
-//! `/proc/wifi` does for Wi-Fi.
+//! `/proc/bluetooth` shows the adapter (address, firmware, devices found,
+//! paired devices) and takes requests ("scan", "pair ADDRESS", ...) for
+//! the `bluetooth` command, as `/proc/wifi` does for Wi-Fi.
 
+mod hid;
 mod intel;
+mod keys;
+mod l2cap;
+mod stack;
 
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -39,6 +46,13 @@ pub enum Packet {
 /// What the stack asks of the adapter's thread.
 enum Request {
     Scan,
+    /// Pair with a device afresh, or connect to one paired before.
+    Pair {
+        address: [u8; 6],
+        fresh: bool,
+    },
+    Disconnect([u8; 6]),
+    Forget([u8; 6]),
 }
 
 /// A controller, as its transport (the USB driver) and the stack share it.
@@ -98,6 +112,11 @@ impl Adapter {
         self.arrived.wake_all();
     }
 
+    fn send_acl(&self, packet: Vec<u8>) {
+        self.acl_out.lock().push_back(packet);
+        (self.wake_transport)();
+    }
+
     fn send_command(&self, opcode: u16, parameters: &[u8]) {
         let mut packet = Vec::with_capacity(3 + parameters.len());
         packet.extend_from_slice(&opcode.to_le_bytes());
@@ -133,6 +152,23 @@ struct Status {
     /// ACL packet size and how many the controller buffers.
     acl_buffers: (u16, u16),
     devices: Vec<Found>,
+    paired: Vec<PairedView>,
+    pairing: Option<PairingView>,
+}
+
+/// A paired device, and how its connection is.
+struct PairedView {
+    address: [u8; 6],
+    name: String,
+    state: String,
+}
+
+/// Pairing (or connecting) under way.
+struct PairingView {
+    address: [u8; 6],
+    step: &'static str,
+    /// The number to type on a keyboard being paired.
+    passkey: Option<u32>,
 }
 
 static STATUS: SpinLock<Status> = SpinLock::new(Status {
@@ -145,6 +181,8 @@ static STATUS: SpinLock<Status> = SpinLock::new(Status {
     firmware: None,
     acl_buffers: (0, 0),
     devices: Vec::new(),
+    paired: Vec::new(),
+    pairing: None,
 });
 
 /// The adapter in use (the first one found).
@@ -191,43 +229,7 @@ fn run(adapter: Arc<Adapter>) {
         return;
     }
     set_state("ready");
-    loop {
-        let request = adapter.arrived.wait_until(|| {
-            if adapter.removed.load(Ordering::Acquire) {
-                return Some(None);
-            }
-            if let Some(request) = adapter.requests.lock().pop_front() {
-                return Some(Some(request));
-            }
-            (!adapter.incoming.lock().is_empty() || !hci.stash.is_empty()).then_some(None)
-        });
-        if adapter.removed.load(Ordering::Acquire) {
-            info!("bluetooth: adapter removed");
-            let mut status = STATUS.lock();
-            status.present = false;
-            status.state = "absent";
-            status.devices.clear();
-            return;
-        }
-        match request {
-            Some(Request::Scan) => {
-                set_state("scanning");
-                let result = scan(&mut hci);
-                let mut status = STATUS.lock();
-                status.state = "ready";
-                status.error = result.err();
-            }
-            None => {
-                while let Some(packet) = hci.next(0) {
-                    match packet {
-                        Packet::Event(event) => unexpected_event(&event),
-                        // No connections yet.
-                        Packet::Acl(data) => debug!("bluetooth: ACL data {:02x?}", &data[..data.len().min(16)]),
-                    }
-                }
-            }
-        }
-    }
+    stack::Stack::new(hci).run();
 }
 
 /// Logs an event nobody waited for.
@@ -306,62 +308,6 @@ fn core_version(version: u8) -> &'static str {
     }
 }
 
-/// Inquiry: asks devices nearby that are discoverable to answer, for about
-/// ten seconds, then asks for the names of those that didn't send one.
-fn scan(hci: &mut Hci) -> Result<(), String> {
-    STATUS.lock().devices.clear();
-    // The general inquiry access code (0x9E8B33), 8 x 1.28 s, any number
-    // of answers.
-    hci.command_status(INQUIRY, &[0x33, 0x8B, 0x9E, 8, 0])?;
-    let deadline = time::ticks() + 15_000;
-    loop {
-        let event = hci
-            .wait_event(deadline.saturating_sub(time::ticks()), |event| {
-                matches!(event[0], EVENT_INQUIRY_COMPLETE | EVENT_INQUIRY_RESULT_RSSI | EVENT_EXTENDED_INQUIRY_RESULT)
-            })
-            .ok_or("the scan didn't finish")?;
-        match event[0] {
-            EVENT_INQUIRY_COMPLETE => break,
-            code => {
-                for found in parse_inquiry_result(code, &event[2..]) {
-                    debug!("bluetooth: found {} class {:#08x}", format_address(&found.address), found.class);
-                    let mut status = STATUS.lock();
-                    match status.devices.iter_mut().find(|d| d.address == found.address) {
-                        Some(known) => {
-                            known.rssi = found.rssi.or(known.rssi);
-                            known.name = found.name.or(known.name.take());
-                        }
-                        None => status.devices.push(found),
-                    }
-                }
-            }
-        }
-    }
-    let nameless: Vec<Found> = STATUS.lock().devices.iter().filter(|d| d.name.is_none()).cloned().collect();
-    for device in nameless {
-        let mut parameters = Vec::from(device.address);
-        parameters.extend_from_slice(&[device.scan_mode, 0]);
-        parameters.extend_from_slice(&(device.clock_offset | 0x8000).to_le_bytes());
-        if hci.command_status(REMOTE_NAME_REQUEST, &parameters).is_err() {
-            continue;
-        }
-        let reply = hci.wait_event(15_000, |event| {
-            event[0] == EVENT_REMOTE_NAME_REQUEST_COMPLETE && event.get(3..9) == Some(&device.address[..])
-        });
-        let Some(reply) = reply else { continue };
-        if reply[2] != 0 {
-            debug!("bluetooth: no name from {} (status {:#04x})", format_address(&device.address), reply[2]);
-            continue;
-        }
-        let name = text(&reply[9..]);
-        if let Some(known) = STATUS.lock().devices.iter_mut().find(|d| d.address == device.address) {
-            known.name = Some(name);
-        }
-    }
-    info!("bluetooth: scan found {} devices", STATUS.lock().devices.len());
-    Ok(())
-}
-
 /// The devices in an inquiry result event's parameters (after the event
 /// header).
 fn parse_inquiry_result(code: u8, parameters: &[u8]) -> Vec<Found> {
@@ -380,6 +326,19 @@ fn parse_inquiry_result(code: u8, parameters: &[u8]) -> Vec<Found> {
                     class: class(&entry[8..11]),
                     clock_offset: u16::from_le_bytes([entry[11], entry[12]]),
                     rssi: Some(entry[13] as i8),
+                    name: None,
+                });
+            }
+        }
+        // The same without RSSI, and two reserved bytes.
+        EVENT_INQUIRY_RESULT => {
+            for entry in parameters[1..].as_chunks::<14>().0.iter().take(count) {
+                found.push(Found {
+                    address: address(entry),
+                    scan_mode: entry[6],
+                    class: class(&entry[9..12]),
+                    clock_offset: u16::from_le_bytes([entry[12], entry[13]]),
+                    rssi: None,
                     name: None,
                 });
             }
@@ -434,6 +393,20 @@ fn format_address(address: &[u8; 6]) -> String {
     parts.join(":")
 }
 
+/// An address as written (`11:22:33:44:55:66`), in the order it travels.
+fn parse_address(text: &str) -> Option<[u8; 6]> {
+    let mut address = [0u8; 6];
+    let mut parts = text.split(':');
+    for byte in address.iter_mut().rev() {
+        let part = parts.next()?;
+        if part.len() != 2 {
+            return None;
+        }
+        *byte = u8::from_str_radix(part, 16).ok()?;
+    }
+    parts.next().is_none().then_some(address)
+}
+
 /// The text of `/proc/bluetooth`.
 pub fn status_text() -> String {
     let status = STATUS.lock();
@@ -465,6 +438,17 @@ pub fn status_text() -> String {
         }
         let _ = writeln!(text, "  {}", device.name.as_deref().unwrap_or("(no name)"));
     }
+    let _ = writeln!(text, "paired:");
+    for paired in &status.paired {
+        let _ = writeln!(text, "{}  {}  {}", format_address(&paired.address), paired.name, paired.state);
+    }
+    if let Some(pairing) = &status.pairing {
+        let _ = write!(text, "pairing: {} {}", format_address(&pairing.address), pairing.step);
+        if let Some(passkey) = pairing.passkey {
+            let _ = write!(text, " passkey {passkey:06}");
+        }
+        let _ = writeln!(text);
+    }
     text
 }
 
@@ -472,22 +456,33 @@ pub fn status_text() -> String {
 pub fn control(request: &[u8]) -> Result<(), Errno> {
     let request = core::str::from_utf8(request).map_err(|_| Errno::EINVAL)?.trim();
     let adapter = ADAPTER.lock().clone().ok_or(Errno::ENODEV)?;
-    match request {
-        "scan" => {
-            {
-                let mut status = STATUS.lock();
-                if status.state != "ready" {
-                    return Err(Errno::EBUSY);
-                }
+    let (verb, argument) = request.split_once(' ').unwrap_or((request, ""));
+    let address = || parse_address(argument.trim()).ok_or(Errno::EINVAL);
+    let request = {
+        let mut status = STATUS.lock();
+        let idle = status.state == "ready" && status.pairing.is_none();
+        let request = match verb {
+            "scan" if idle => {
                 // Set now, so a reader right after the write sees it.
                 status.state = "scanning";
+                Request::Scan
             }
-            adapter.requests.lock().push_back(Request::Scan);
-            adapter.arrived.wake_all();
-            Ok(())
-        }
-        _ => Err(Errno::EINVAL),
-    }
+            "pair" | "connect" if idle => {
+                let address = address()?;
+                status.pairing = Some(PairingView { address, step: "starting", passkey: None });
+                Request::Pair { address, fresh: verb == "pair" }
+            }
+            "scan" | "pair" | "connect" => return Err(Errno::EBUSY),
+            "disconnect" => Request::Disconnect(address()?),
+            "forget" => Request::Forget(address()?),
+            _ => return Err(Errno::EINVAL),
+        };
+        status.error = None;
+        request
+    };
+    adapter.requests.lock().push_back(request);
+    adapter.arrived.wake_all();
+    Ok(())
 }
 
 // Commands (opcode group << 10 | command).
@@ -504,6 +499,7 @@ const READ_BUFFER_SIZE: u16 = 0x1005;
 const READ_BD_ADDR: u16 = 0x1009;
 
 // Events.
+const EVENT_INQUIRY_RESULT: u8 = 0x02;
 const EVENT_INQUIRY_COMPLETE: u8 = 0x01;
 const EVENT_REMOTE_NAME_REQUEST_COMPLETE: u8 = 0x07;
 const EVENT_COMMAND_COMPLETE: u8 = 0x0E;
@@ -685,26 +681,88 @@ mod tests {
         }
     }
 
+    /// Waits up to 15 s for `/proc/bluetooth` to satisfy `wanted`;
+    /// returns its text.
+    fn wait_for(what: &str, wanted: impl Fn(&str) -> bool) -> String {
+        let deadline = time::ticks() + 15_000;
+        loop {
+            let text = status_text();
+            if wanted(&text) {
+                return text;
+            }
+            assert!(time::ticks() < deadline, "waiting for {what}:\n{text}");
+            task::sleep_ms(20);
+        }
+    }
+
     crate::ktest! {
         fn the_pretend_controller_is_patched_and_scans() {
             // QEMU gets xtask's pretend Intel controller: it checks each
-            // patch command against the same file, and knows two devices.
-            let deadline = time::ticks() + 30_000;
-            while !matches!(STATUS.lock().state, "ready" | "failed") && time::ticks() < deadline {
-                task::sleep_ms(50);
-            }
-            let text = status_text();
+            // patch command against the same file, and knows three devices.
+            let text = wait_for("the controller", |t| t.contains("state: ready") || t.contains("state: failed"));
             assert!(text.contains("state: ready"), "{text}");
             // Switched on only if every command matched the file.
             assert!(text.contains("patch 0x42 (intel/ibt-hw-37.7.10-fw-1.80.2.3.d.bseq)"), "{text}");
             control(b"scan").unwrap();
-            while STATUS.lock().state == "scanning" && time::ticks() < deadline {
-                task::sleep_ms(50);
-            }
-            let text = status_text();
-            assert!(text.contains("state: ready"), "{text}");
+            assert_eq!(control(b"scan"), Err(Errno::EBUSY));
+            let text = wait_for("the scan", |t| t.contains("state: ready"));
+            assert!(!text.contains("error:"), "{text}");
             assert!(text.contains("Test keyboard"), "{text}");
+            // Its name had to be asked for.
             assert!(text.contains("Test headset"), "{text}");
+            assert!(text.contains("Test mouse"), "{text}");
+        }
+    }
+
+    crate::ktest! {
+        fn bluetooth_keyboards_and_mice_pair_and_come_back() {
+            let keyboard = "11:22:33:44:55:01";
+            let mouse = "11:22:33:44:55:03";
+            wait_for("the controller", |t| t.contains("state: ready"));
+            // Found by a scan first (the tests run in any order), which
+            // tells what each device is.
+            if !status_text().contains("Test mouse") {
+                control(b"scan").unwrap();
+                wait_for("the scan", |t| t.contains("state: ready"));
+            }
+            // A device that wasn't scanned for (or isn't there) can't be
+            // reached.
+            control(b"pair 11:22:33:44:55:99").unwrap();
+            let text = wait_for("a failed pairing", |t| !t.contains("pairing:"));
+            assert!(text.contains("error: can't connect: page timeout"), "{text}");
+            // The keyboard: it gets a passkey to type, then is a keyboard.
+            control(format!("pair {keyboard}").as_bytes()).unwrap();
+            assert_eq!(control(b"scan"), Err(Errno::EBUSY));
+            wait_for("the passkey", |t| t.contains("passkey 123456") || !t.contains("pairing:"));
+            let text = wait_for("pairing", |t| !t.contains("pairing:"));
+            assert!(!text.contains("error:"), "{text}");
+            let line = format!("{keyboard}  Test keyboard  connected, keyboard, ");
+            wait_for("keyboard reports", |t| t.contains(&line) && !t.contains(&format!("{line}0 reports")));
+            assert!(crate::input::find("Test keyboard").is_some());
+            // The mouse: just works.
+            control(format!("pair {mouse}").as_bytes()).unwrap();
+            let text = wait_for("pairing the mouse", |t| !t.contains("pairing:"));
+            assert!(!text.contains("error:"), "{text}");
+            wait_for("the mouse", |t| t.contains(&format!("{mouse}  Test mouse  connected, mouse, ")));
+            assert!(crate::input::find("Test mouse").is_some());
+            // Disconnected, the keyboard comes back by itself, with the key
+            // kept from pairing.
+            control(format!("disconnect {keyboard}").as_bytes()).unwrap();
+            wait_for("the keyboard to go", |t| t.contains(&format!("{keyboard}  Test keyboard  not connected")));
+            wait_for("the keyboard to come back", |t| t.contains(&line));
+            // Forgotten devices are gone, input devices and all.
+            control(format!("forget {mouse}").as_bytes()).unwrap();
+            control(format!("forget {keyboard}").as_bytes()).unwrap();
+            wait_for("forgetting", |t| !t.contains("Test mouse  ") && !t.contains("Test keyboard  "));
+            let deadline = time::ticks() + 5000;
+            while (crate::input::find("Test mouse").is_some() || crate::input::find("Test keyboard").is_some()) && time::ticks() < deadline {
+                task::sleep_ms(20);
+            }
+            assert!(crate::input::find("Test mouse").is_none() && crate::input::find("Test keyboard").is_none());
+            // The mouse tries to come back a second after it was
+            // disconnected (and is refused): let that pass before other
+            // tests count memory.
+            task::sleep_ms(1500);
         }
     }
 }

@@ -9,7 +9,7 @@
 //! (what the device does: a keyboard, a disk...) and their endpoints (the
 //! channels data flows through).
 
-mod hid;
+pub mod hid;
 mod storage;
 mod video;
 mod xhci;

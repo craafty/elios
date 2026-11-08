@@ -228,7 +228,8 @@ may work too, but QEMU is the one eliOS is tested on.
   WPA2-Personal and WPA2-Enterprise (PEAP with MS-CHAPv2, as eduroam and
   campus networks use) networks, with the `wifi` command; written for the
   T440p and still being tried there), the 7260's Bluetooth (Intel's
-  firmware patch, scanning, with the `bluetooth` command; pairing to
+  firmware patch, scanning, Secure Simple Pairing with kept link keys,
+  L2CAP, and keyboards and mice, with the `bluetooth` command; audio to
   come), ACPI power management.
 - **Networking:** eliOS's own TCP/IP stack (Ethernet, ARP, IPv4, ICMP, UDP,
   TCP), DHCP, loopback, and the Linux socket API, so programs like
@@ -347,8 +348,9 @@ eliOS's own rasterizer in `truetype/`.
       (works: `speaker-test` plays), the Intel 7260 Wi-Fi driver (works:
       scanning, and joining Purdue's WPA2-Enterprise PAL3.0 with DHCP;
       open and WPA2 networks use the same path) and Bluetooth (the
-      Intel firmware patch loads and scans find devices, checked against
-      a pretend controller in QEMU; next, pairing, L2CAP and HID)
+      Intel firmware patch loads and scans find devices; pairing, L2CAP
+      and HID keyboards and mice, checked against a pretend controller
+      in QEMU; next, trying them on the laptop, then audio)
 - [x] **Desktop groundwork:** copy-on-write `fork`, shared memory
       (`memfd`, `MAP_SHARED`, a page cache), `epoll`, `eventfd`,
       `timerfd`, Unix domain sockets with descriptor passing,

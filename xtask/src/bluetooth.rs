@@ -8,10 +8,21 @@
 //! file too and checks every patch command the kernel sends against it,
 //! answering with the events the file lists; only if all of them matched
 //! and the kernel then asks for the patch to be switched on does it report
-//! a patch loaded. A scan finds two devices: one that sends its name with
-//! its inquiry answer and one that has to be asked for it.
+//! a patch loaded. A scan finds three devices: a keyboard and a mouse
+//! that send their names with their inquiry answers, and a headset that
+//! has to be asked for its name.
+//!
+//! The devices can be paired with and connected to as real ones are:
+//! the keyboard pairs by passkey (it "types" the number the host shows),
+//! the mouse and the headset "just work". Link keys are derived from the
+//! address, so a device paired before accepts the host's stored key. The
+//! keyboard and mouse then speak L2CAP and HID: once the host asks for
+//! the boot protocol, the keyboard types `echo bluetooth keyboard works`
+//! and Enter, and the mouse moves. When the host disconnects one, it
+//! connects back by itself once, a second later, as a paired keyboard
+//! does when a key is pressed.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -56,9 +67,82 @@ const PATCH_FILE: &str = "rootfs/lib/firmware/intel/ibt-hw-37.7.10-fw-1.80.2.3.d
 const PATCHED: u8 = 0x42;
 const ADDRESS: [u8; 6] = [0xCC, 0xBB, 0xAA, 0x22, 0x11, 0x00];
 
-/// The devices a scan finds: address, class, RSSI, name.
-const KEYBOARD: ([u8; 6], u32, i8, &str) = ([0x01, 0x55, 0x44, 0x33, 0x22, 0x11], 0x002540, -50, "Test keyboard");
-const HEADSET: ([u8; 6], u32, i8, &str) = ([0x02, 0x55, 0x44, 0x33, 0x22, 0x11], 0x240404, -65, "Test headset");
+/// A device a scan finds.
+struct Device {
+    address: [u8; 6],
+    class: u32,
+    rssi: i8,
+    name: &'static str,
+    /// Input/output capabilities: 2 a keyboard only, 3 nothing.
+    capability: u8,
+    hid: Hid,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Hid {
+    None,
+    Keyboard,
+    Mouse,
+}
+
+const KEYBOARD: usize = 0;
+const HEADSET: usize = 1;
+const MOUSE: usize = 2;
+const DEVICES: [Device; 3] = [
+    Device {
+        address: [0x01, 0x55, 0x44, 0x33, 0x22, 0x11],
+        class: 0x002540,
+        rssi: -50,
+        name: "Test keyboard",
+        capability: 2,
+        hid: Hid::Keyboard,
+    },
+    Device {
+        address: [0x02, 0x55, 0x44, 0x33, 0x22, 0x11],
+        class: 0x240404,
+        rssi: -65,
+        name: "Test headset",
+        capability: 3,
+        hid: Hid::None,
+    },
+    Device {
+        address: [0x03, 0x55, 0x44, 0x33, 0x22, 0x11],
+        class: 0x002580,
+        rssi: -55,
+        name: "Test mouse",
+        capability: 3,
+        hid: Hid::Mouse,
+    },
+];
+
+/// The passkey the keyboard "types".
+const PASSKEY: u32 = 123456;
+/// What the keyboard types once connected.
+const TYPED: &str = "echo bluetooth keyboard works\n";
+
+/// HID's L2CAP channels.
+const PSM_CONTROL: u16 = 0x11;
+const PSM_INTERRUPT: u16 = 0x13;
+
+/// A connection to one of the devices.
+struct Link {
+    handle: u16,
+    device: usize,
+    /// Whether the device connected to the host (it then opens the HID
+    /// channels).
+    incoming: bool,
+    channels: Vec<Channel>,
+    next_cid: u16,
+    next_ident: u8,
+    typing: bool,
+}
+
+/// An L2CAP channel on the device's side: our CID and the host's.
+struct Channel {
+    psm: u16,
+    ours: u16,
+    theirs: u16,
+}
 
 /// A patch file step: the command's bytes (opcode, length, parameters)
 /// and the events that answer it.
@@ -79,10 +163,18 @@ struct State {
     /// Whether a command didn't match the patch file.
     mismatch: bool,
     patch: u8,
-    /// Bulk IN requests from QEMU, by id (answered when there's data,
-    /// which there isn't without connections), so cancels find them.
-    bulk_requests: HashMap<u64, u8>,
+    /// Bulk IN requests from QEMU, answered when there's ACL data, and
+    /// ACL data waiting for one.
+    acl_requests: VecDeque<u64>,
+    acl_waiting: VecDeque<Vec<u8>>,
+    links: Vec<Link>,
+    next_handle: u16,
+    /// Devices that have connected back by themselves already (they do it
+    /// once).
+    reconnected: Vec<usize>,
 }
+
+type Shared = Arc<Mutex<State>>;
 
 /// Listens on `path` for QEMU's `usb-redir` device and serves the
 /// controller on a thread. Returns the QEMU arguments that attach it.
@@ -152,7 +244,11 @@ fn serve(stream: UnixStream, steps: Vec<Step>) -> io::Result<()> {
         step: 0,
         mismatch: false,
         patch: 0,
-        bulk_requests: HashMap::new(),
+        acl_requests: VecDeque::new(),
+        acl_waiting: VecDeque::new(),
+        links: Vec::new(),
+        next_handle: 0x0B,
+        reconnected: Vec::new(),
     }));
     loop {
         let mut header = [0u8; 16];
@@ -191,20 +287,31 @@ fn serve(stream: UnixStream, steps: Vec<Step>) -> io::Result<()> {
             }
             BULK_PACKET if body.len() >= 10 => {
                 let endpoint = body[0];
+                let mut locked = state.lock().unwrap();
                 if endpoint & 0x80 != 0 {
-                    state.lock().unwrap().bulk_requests.insert(id, endpoint);
+                    match locked.acl_waiting.pop_front() {
+                        Some(packet) => send_bulk_in(&writer, id, &packet)?,
+                        None => locked.acl_requests.push_back(id),
+                    }
                 } else {
-                    // ACL data sent to us: taken (and dropped; nothing's
-                    // connected).
+                    // ACL data for a device, which the controller reports
+                    // sent at once.
                     let mut reply = body[..10].to_vec();
                     reply[1] = STATUS_SUCCESS;
                     send(&writer, BULK_PACKET, id, &reply, &[])?;
+                    let data = &body[10..];
+                    if data.len() >= 4 {
+                        let [low, high] = [data[0], data[1] & 0x0F];
+                        queue_event(&mut locked, &writer, vec![0x13, 5, 1, low, high, 1, 0])?;
+                        acl_from_host(&mut locked, &state, &writer, data)?;
+                    }
                 }
             }
             CANCEL_DATA_PACKET => {
-                let endpoint = state.lock().unwrap().bulk_requests.remove(&id);
-                if let Some(endpoint) = endpoint {
-                    send(&writer, BULK_PACKET, id, &[endpoint, STATUS_CANCELLED, 0, 0, 0, 0, 0, 0, 0, 0], &[])?;
+                let mut locked = state.lock().unwrap();
+                if let Some(index) = locked.acl_requests.iter().position(|&request| request == id) {
+                    locked.acl_requests.remove(index);
+                    send(&writer, BULK_PACKET, id, &[ACL_IN, STATUS_CANCELLED, 0, 0, 0, 0, 0, 0, 0, 0], &[])?;
                 }
             }
             CONTROL_PACKET if body.len() >= 10 => {
@@ -331,37 +438,439 @@ fn command(state: &Arc<Mutex<State>>, writer: &Writer, packet: &[u8]) -> io::Res
             let mut event = vec![0x07, 255, 0];
             event.extend_from_slice(&parameters[..6]);
             let mut name = [0u8; 248];
-            let known = [KEYBOARD, HEADSET].into_iter().find(|device| device.0 == parameters[..6]);
-            match known {
-                Some(device) => name[..device.3.len()].copy_from_slice(device.3.as_bytes()),
+            match device_at(parameters) {
+                Some(device) => name[..DEVICES[device].name.len()].copy_from_slice(DEVICES[device].name.as_bytes()),
                 // Page timeout: nobody answered.
                 None => event[2] = 0x04,
             }
             event.extend_from_slice(&name);
             event
         }
+        0x0405..=0x0434 => {
+            return link_command(&mut locked, state, writer, opcode, parameters, &complete, &status_event);
+        }
         _ => complete(0, &[]),
     };
     queue_event(&mut locked, writer, event)
 }
 
-/// Inquiry results, a little later: the keyboard with its name (extended
-/// inquiry result), the headset without (inquiry result with RSSI).
-fn inquiry(state: &Mutex<State>, writer: &Writer) -> io::Result<()> {
-    thread::sleep(Duration::from_millis(300));
-    let (address, class, rssi, name) = KEYBOARD;
-    let mut event = vec![0x2F, 255, 1];
-    event.extend_from_slice(&address);
+/// The device at the start of `parameters` (an address), if it's one of
+/// ours.
+fn device_at(parameters: &[u8]) -> Option<usize> {
+    DEVICES.iter().position(|device| parameters.get(..6) == Some(&device.address[..]))
+}
+
+/// The link key pairing with a device makes: made up, but always the same
+/// for the same device.
+fn link_key(device: usize) -> [u8; 16] {
+    let address = DEVICES[device].address;
+    std::array::from_fn(|index| address[index % 6].wrapping_mul(7).wrapping_add(index as u8 * 13))
+}
+
+fn connection_complete(status: u8, handle: u16, address: &[u8]) -> Vec<u8> {
+    let mut event = vec![0x03, 11, status];
+    event.extend_from_slice(&handle.to_le_bytes());
+    event.extend_from_slice(&address[..6]);
+    // ACL, not encrypted.
     event.extend_from_slice(&[1, 0]);
-    event.extend_from_slice(&class.to_le_bytes()[..3]);
-    event.extend_from_slice(&[0x34, 0x12, rssi as u8]);
-    let mut eir = vec![2, 0x01, 0x06, name.len() as u8 + 1, 0x09];
-    eir.extend_from_slice(name.as_bytes());
-    eir.resize(240, 0);
-    event.extend_from_slice(&eir);
-    queue_event(&mut state.lock().unwrap(), writer, event)?;
+    event
+}
+
+fn with_address(code: u8, address: &[u8], rest: &[u8]) -> Vec<u8> {
+    let mut event = vec![code, (6 + rest.len()) as u8];
+    event.extend_from_slice(&address[..6]);
+    event.extend_from_slice(rest);
+    event
+}
+
+fn authentication_complete(status: u8, handle: u16) -> Vec<u8> {
+    let [low, high] = handle.to_le_bytes();
+    vec![0x06, 3, status, low, high]
+}
+
+/// Simple Pairing Complete, the link key, and Authentication Complete:
+/// the end of pairing.
+fn paired(state: &mut State, writer: &Writer, device: usize, key_type: u8) -> io::Result<()> {
+    let address = DEVICES[device].address;
+    let mut complete = vec![0x36, 7, 0];
+    complete.extend_from_slice(&address);
+    queue_event(state, writer, complete)?;
+    let mut key = link_key(device).to_vec();
+    key.push(key_type);
+    queue_event(state, writer, with_address(0x18, &address, &key))?;
+    let handle = state.links.iter().find(|link| link.device == device).map_or(0, |link| link.handle);
+    queue_event(state, writer, authentication_complete(0, handle))
+}
+
+/// Pairing failed: Simple Pairing Complete and Authentication Complete
+/// with `status`.
+fn not_paired(state: &mut State, writer: &Writer, device: usize, status: u8) -> io::Result<()> {
+    let address = DEVICES[device].address;
+    let mut event = vec![0x36, 7, status];
+    event.extend_from_slice(&address);
+    queue_event(state, writer, event)?;
+    let handle = state.links.iter().find(|link| link.device == device).map_or(0, |link| link.handle);
+    queue_event(state, writer, authentication_complete(status, handle))
+}
+
+/// Runs `then` on the state `ms` milliseconds from now (on a thread).
+fn later(
+    state: &Shared,
+    writer: &Writer,
+    ms: u64,
+    then: impl FnOnce(&mut State, &Shared, &Writer) -> io::Result<()> + Send + 'static,
+) {
+    let (state, writer) = (state.clone(), writer.clone());
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(ms));
+        let mut locked = state.lock().unwrap();
+        let _ = then(&mut locked, &state, &writer);
+    });
+}
+
+/// Commands about connections and pairing.
+fn link_command(
+    locked: &mut State,
+    state: &Shared,
+    writer: &Writer,
+    opcode: u16,
+    parameters: &[u8],
+    complete: &dyn Fn(u8, &[u8]) -> Vec<u8>,
+    status_event: &dyn Fn(u8) -> Vec<u8>,
+) -> io::Result<()> {
+    let handle =
+        u16::from_le_bytes([parameters.first().copied().unwrap_or(0), parameters.get(1).copied().unwrap_or(0)]);
+    let by_handle = locked.links.iter().position(|link| link.handle == handle);
+    let device = device_at(parameters);
+    match opcode {
+        // Create Connection, Accept Connection Request.
+        0x0405 | 0x0409 if parameters.len() >= 6 => {
+            queue_event(locked, writer, status_event(0))?;
+            let Some(device) = device else {
+                // Page timeout.
+                return queue_event(locked, writer, connection_complete(0x04, 0, parameters));
+            };
+            let handle = locked.next_handle;
+            locked.next_handle += 1;
+            locked.links.push(Link {
+                handle,
+                device,
+                incoming: opcode == 0x0409,
+                channels: Vec::new(),
+                next_cid: 0x0050,
+                next_ident: 1,
+                typing: false,
+            });
+            queue_event(locked, writer, connection_complete(0, handle, parameters))
+        }
+        // Reject Connection Request: the reason becomes the status.
+        0x040A if parameters.len() >= 7 => {
+            queue_event(locked, writer, status_event(0))?;
+            queue_event(locked, writer, connection_complete(parameters[6], 0, parameters))
+        }
+        // Authentication Requested: the controller asks for a key.
+        0x0411 => {
+            let Some(index) = by_handle else { return queue_event(locked, writer, status_event(0x02)) };
+            queue_event(locked, writer, status_event(0))?;
+            let address = DEVICES[locked.links[index].device].address;
+            queue_event(locked, writer, with_address(0x17, &address, &[]))
+        }
+        // Link Key Request Reply: the device checks it has the same key.
+        0x040B if parameters.len() >= 22 => {
+            queue_event(locked, writer, complete(0, &parameters[..6]))?;
+            let Some(device) = device else { return Ok(()) };
+            let handle = locked.links.iter().find(|link| link.device == device).map_or(0, |link| link.handle);
+            let status = if parameters[6..22] == link_key(device) { 0 } else { 0x06 };
+            queue_event(locked, writer, authentication_complete(status, handle))
+        }
+        // Link Key Request Negative Reply: pairing, starting with the
+        // host's input/output capabilities.
+        0x040C if parameters.len() >= 6 => {
+            queue_event(locked, writer, complete(0, &parameters[..6]))?;
+            queue_event(locked, writer, with_address(0x31, parameters, &[]))
+        }
+        // IO Capability Request Reply: ours in return, then the pairing
+        // the two make possible.
+        0x042B if parameters.len() >= 9 => {
+            queue_event(locked, writer, complete(0, &parameters[..6]))?;
+            let Some(device) = device else { return Ok(()) };
+            let capability = DEVICES[device].capability;
+            queue_event(locked, writer, with_address(0x32, parameters, &[capability, 0, 0x05]))?;
+            if capability == 2 {
+                // A keyboard and a host with a display: the host shows a
+                // passkey, the user types it on the keyboard (here, in a
+                // second and a half).
+                queue_event(locked, writer, with_address(0x3B, parameters, &PASSKEY.to_le_bytes()))?;
+                later(state, writer, 1500, move |locked, _, writer| paired(locked, writer, device, 5));
+                Ok(())
+            } else {
+                // Just works: the host is asked to confirm.
+                queue_event(locked, writer, with_address(0x33, parameters, &654321u32.to_le_bytes()))
+            }
+        }
+        // IO Capability Request Negative Reply.
+        0x0434 if parameters.len() >= 7 => {
+            queue_event(locked, writer, complete(0, &parameters[..6]))?;
+            match device {
+                Some(device) => not_paired(locked, writer, device, parameters[6]),
+                None => Ok(()),
+            }
+        }
+        // User Confirmation Request (Negative) Reply.
+        0x042C | 0x042D if parameters.len() >= 6 => {
+            queue_event(locked, writer, complete(0, &parameters[..6]))?;
+            match device {
+                Some(device) if opcode == 0x042C => paired(locked, writer, device, 4),
+                Some(device) => not_paired(locked, writer, device, 0x05),
+                None => Ok(()),
+            }
+        }
+        // Set Connection Encryption. A device that connected back then
+        // opens its HID channels.
+        0x0413 => {
+            let Some(index) = by_handle else { return queue_event(locked, writer, status_event(0x02)) };
+            queue_event(locked, writer, status_event(0))?;
+            let [low, high] = handle.to_le_bytes();
+            queue_event(locked, writer, vec![0x08, 4, 0, low, high, 1])?;
+            let link = &locked.links[index];
+            if link.incoming && DEVICES[link.device].hid != Hid::None {
+                later(state, writer, 100, move |locked, _, writer| {
+                    let Some(link) = locked.links.iter_mut().find(|link| link.handle == handle) else { return Ok(()) };
+                    let request = open_channel(link, PSM_CONTROL);
+                    send_signal(locked, writer, handle, request)
+                });
+            }
+            Ok(())
+        }
+        // Disconnect. A keyboard or mouse comes back once, a second later.
+        0x0406 => {
+            let Some(index) = by_handle else { return queue_event(locked, writer, status_event(0x02)) };
+            queue_event(locked, writer, status_event(0))?;
+            let link = locked.links.remove(index);
+            let [low, high] = handle.to_le_bytes();
+            queue_event(locked, writer, vec![0x05, 4, 0, low, high, 0x16])?;
+            let device = link.device;
+            if DEVICES[device].hid != Hid::None && !locked.reconnected.contains(&device) {
+                locked.reconnected.push(device);
+                later(state, writer, 1000, move |locked, _, writer| {
+                    let class = DEVICES[device].class.to_le_bytes();
+                    queue_event(
+                        locked,
+                        writer,
+                        with_address(0x04, &DEVICES[device].address, &[class[0], class[1], class[2], 1]),
+                    )
+                });
+            }
+            Ok(())
+        }
+        _ => queue_event(locked, writer, complete(0, &[])),
+    }
+}
+
+/// Starts opening a channel to `psm` from the device's side: returns the
+/// signal to send.
+fn open_channel(link: &mut Link, psm: u16) -> Vec<u8> {
+    let ours = link.next_cid;
+    link.next_cid += 1;
+    link.channels.push(Channel { psm, ours, theirs: 0 });
+    signal(link, 0x02, &[psm.to_le_bytes(), ours.to_le_bytes()].concat())
+}
+
+/// An L2CAP signaling command with the link's next identifier.
+fn signal(link: &mut Link, code: u8, body: &[u8]) -> Vec<u8> {
+    let ident = link.next_ident;
+    link.next_ident = link.next_ident.wrapping_add(1).max(1);
+    response(code, ident, body)
+}
+
+fn response(code: u8, ident: u8, body: &[u8]) -> Vec<u8> {
+    let mut command = vec![code, ident];
+    command.extend_from_slice(&(body.len() as u16).to_le_bytes());
+    command.extend_from_slice(body);
+    command
+}
+
+/// Our configuration request for a channel: nothing but the default MTU.
+fn configure(link: &mut Link, theirs: u16) -> Vec<u8> {
+    signal(link, 0x04, &[&theirs.to_le_bytes()[..], &[0, 0, 1, 2], &672u16.to_le_bytes()].concat())
+}
+
+fn send_signal(state: &mut State, writer: &Writer, handle: u16, command: Vec<u8>) -> io::Result<()> {
+    send_l2cap(state, writer, handle, 0x0001, &command)
+}
+
+/// Sends an L2CAP frame to the host in one ACL packet.
+fn send_l2cap(state: &mut State, writer: &Writer, handle: u16, cid: u16, payload: &[u8]) -> io::Result<()> {
+    let mut packet = Vec::with_capacity(8 + payload.len());
+    // A whole frame, flushable.
+    packet.extend_from_slice(&(handle | 0x2000).to_le_bytes());
+    packet.extend_from_slice(&(4 + payload.len() as u16).to_le_bytes());
+    packet.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    packet.extend_from_slice(&cid.to_le_bytes());
+    packet.extend_from_slice(payload);
+    match state.acl_requests.pop_front() {
+        Some(id) => send_bulk_in(writer, id, &packet),
+        None => {
+            state.acl_waiting.push_back(packet);
+            Ok(())
+        }
+    }
+}
+
+/// Answers QEMU's bulk IN request `id` with an ACL packet.
+fn send_bulk_in(writer: &Writer, id: u64, packet: &[u8]) -> io::Result<()> {
+    let mut header = [ACL_IN, STATUS_SUCCESS, 0, 0, 0, 0, 0, 0, 0, 0];
+    header[2..4].copy_from_slice(&(packet.len() as u16).to_le_bytes());
+    send(writer, BULK_PACKET, id, &header, packet)
+}
+
+/// ACL data from the host: an L2CAP frame (the host's are small enough to
+/// come whole) for one of the devices.
+fn acl_from_host(locked: &mut State, state: &Shared, writer: &Writer, data: &[u8]) -> io::Result<()> {
+    let handle = u16::from_le_bytes([data[0], data[1]]) & 0x0FFF;
+    let Some(frame) = data.get(4..) else { return Ok(()) };
+    let [low, high, cid_low, cid_high, payload @ ..] = frame else { return Ok(()) };
+    let length = usize::from(u16::from_le_bytes([*low, *high]));
+    let payload = &payload[..length.min(payload.len())];
+    let cid = u16::from_le_bytes([*cid_low, *cid_high]);
+    let Some(link) = locked.links.iter_mut().find(|link| link.handle == handle) else { return Ok(()) };
+    if cid != 0x0001 {
+        let psm = link.channels.iter().find(|channel| channel.ours == cid).map(|channel| channel.psm);
+        // SET_PROTOCOL (boot): handshake "successful", then input.
+        if psm == Some(PSM_CONTROL) && payload.first() == Some(&0x70) {
+            let control = link.channels.iter().find(|channel| channel.psm == PSM_CONTROL).map_or(0, |c| c.theirs);
+            let start = !link.typing;
+            link.typing = true;
+            send_l2cap(locked, writer, handle, control, &[0x00])?;
+            if start {
+                type_input(state, writer, handle);
+            }
+        }
+        return Ok(());
+    }
+    let mut commands = payload;
+    let mut replies = Vec::new();
+    while let [code, ident, low, high, rest @ ..] = commands {
+        let length = usize::from(u16::from_le_bytes([*low, *high])).min(rest.len());
+        let body = &rest[..length];
+        commands = &rest[length..];
+        let word = |at: usize| body.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+        match code {
+            // Connection request: accepted, and our configuration.
+            0x02 => {
+                let (psm, theirs) = (word(0), word(2));
+                let ours = link.next_cid;
+                link.next_cid += 1;
+                link.channels.push(Channel { psm, ours, theirs });
+                replies.push(response(
+                    0x03,
+                    *ident,
+                    &[ours.to_le_bytes(), theirs.to_le_bytes(), [0, 0], [0, 0]].concat(),
+                ));
+                replies.push(configure(link, theirs));
+            }
+            // Connection response to ours: configure it; after the
+            // control channel, open the interrupt one.
+            0x03 => {
+                let (theirs, ours, result) = (word(0), word(2), word(4));
+                if result != 0 {
+                    continue;
+                }
+                let Some(channel) = link.channels.iter_mut().find(|channel| channel.ours == ours) else { continue };
+                channel.theirs = theirs;
+                let psm = channel.psm;
+                replies.push(configure(link, theirs));
+                if psm == PSM_CONTROL {
+                    replies.push(open_channel(link, PSM_INTERRUPT));
+                }
+            }
+            // Configuration request: fine.
+            0x04 => {
+                let ours = word(0);
+                let theirs = link.channels.iter().find(|channel| channel.ours == ours).map_or(0, |c| c.theirs);
+                replies.push(response(0x05, *ident, &[theirs.to_le_bytes(), [0, 0], [0, 0]].concat()));
+            }
+            // Disconnection request.
+            0x06 => {
+                let ours = word(0);
+                link.channels.retain(|channel| channel.ours != ours);
+                replies.push(response(0x07, *ident, &body[..4.min(body.len())]));
+            }
+            // Information request: not supported.
+            0x0A => replies.push(response(0x0B, *ident, &[&body[..2.min(body.len())], &[1, 0][..]].concat())),
+            // Responses, and command rejects.
+            _ => {}
+        }
+    }
+    for reply in replies {
+        send_signal(locked, writer, handle, reply)?;
+    }
+    Ok(())
+}
+
+/// What a device sends once it's set up: the keyboard types a command,
+/// the mouse moves right and down and clicks.
+fn type_input(state: &Shared, writer: &Writer, handle: u16) {
+    let (state, writer) = (state.clone(), writer.clone());
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        let reports: Vec<Vec<u8>> = {
+            let locked = state.lock().unwrap();
+            let Some(link) = locked.links.iter().find(|link| link.handle == handle) else { return };
+            match DEVICES[link.device].hid {
+                Hid::Keyboard => TYPED
+                    .bytes()
+                    .flat_map(|byte| {
+                        let usage = match byte {
+                            b'a'..=b'z' => 0x04 + byte - b'a',
+                            b' ' => 0x2C,
+                            _ => 0x28,
+                        };
+                        [vec![0xA1, 1, 0, 0, usage, 0, 0, 0, 0, 0], vec![0xA1, 1, 0, 0, 0, 0, 0, 0, 0, 0]]
+                    })
+                    .collect(),
+                Hid::Mouse => {
+                    let mut moves = vec![vec![0xA1, 2, 0, 10, 5, 0]; 5];
+                    moves.push(vec![0xA1, 2, 1, 0, 0, 0]);
+                    moves.push(vec![0xA1, 2, 0, 0, 0, 0]);
+                    moves
+                }
+                Hid::None => Vec::new(),
+            }
+        };
+        for report in reports {
+            thread::sleep(Duration::from_millis(15));
+            let mut locked = state.lock().unwrap();
+            let Some(link) = locked.links.iter().find(|link| link.handle == handle) else { return };
+            let Some(interrupt) = link.channels.iter().find(|channel| channel.psm == PSM_INTERRUPT) else { return };
+            let theirs = interrupt.theirs;
+            if send_l2cap(&mut locked, &writer, handle, theirs, &report).is_err() {
+                return;
+            }
+        }
+    });
+}
+
+/// Inquiry results, a little later: the keyboard and the mouse with
+/// their names (extended inquiry results), the headset without (inquiry
+/// result with RSSI).
+fn inquiry(state: &Mutex<State>, writer: &Writer) -> io::Result<()> {
+    for device in [KEYBOARD, MOUSE] {
+        thread::sleep(Duration::from_millis(300));
+        let Device { address, class, rssi, name, .. } = DEVICES[device];
+        let mut event = vec![0x2F, 255, 1];
+        event.extend_from_slice(&address);
+        event.extend_from_slice(&[1, 0]);
+        event.extend_from_slice(&class.to_le_bytes()[..3]);
+        event.extend_from_slice(&[0x34, 0x12, rssi as u8]);
+        let mut eir = vec![2, 0x01, 0x06, name.len() as u8 + 1, 0x09];
+        eir.extend_from_slice(name.as_bytes());
+        eir.resize(240, 0);
+        event.extend_from_slice(&eir);
+        queue_event(&mut state.lock().unwrap(), writer, event)?;
+    }
     thread::sleep(Duration::from_millis(300));
-    let (address, class, rssi, _) = HEADSET;
+    let Device { address, class, rssi, .. } = DEVICES[HEADSET];
     let mut event = vec![0x22, 15, 1];
     event.extend_from_slice(&address);
     event.extend_from_slice(&[1, 0]);

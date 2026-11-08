@@ -356,14 +356,25 @@ mod tests {
         }
 
         fn large_allocations_give_their_memory_back() {
-            // The first round may build page tables, which stay.
+            // The first round may build page tables, which stay. Other
+            // threads (drivers) allocate too, so a round they disturbed is
+            // tried again.
             drop(Vec::<u8>::with_capacity(1 << 20));
-            let free_before = frames::stats().free_bytes;
-            let big = alloc::vec![7u8; 1 << 20];
-            assert!(frames::stats().free_bytes <= free_before - (1 << 20));
-            assert!(big.iter().all(|&b| b == 7));
-            drop(big);
-            assert_eq!(frames::stats().free_bytes, free_before);
+            let mut rounds = 0;
+            loop {
+                let free_before = frames::stats().free_bytes;
+                let big = alloc::vec![7u8; 1 << 20];
+                assert!(frames::stats().free_bytes <= free_before - (1 << 20));
+                assert!(big.iter().all(|&b| b == 7));
+                drop(big);
+                let free_after = frames::stats().free_bytes;
+                rounds += 1;
+                if free_after == free_before || rounds == 5 {
+                    assert_eq!(free_after, free_before);
+                    break;
+                }
+                crate::task::sleep_ms(100);
+            }
         }
 
         fn random_allocations_keep_their_contents() {

@@ -46,6 +46,7 @@ pub const BTN_MIDDLE: u16 = 0x112;
 pub const PROP_POINTER: u32 = 1 << 0;
 
 pub const BUS_USB: u16 = 0x03;
+pub const BUS_BLUETOOTH: u16 = 0x05;
 pub const BUS_I8042: u16 = 0x11;
 
 /// The highest key code (`KEY_MAX`).

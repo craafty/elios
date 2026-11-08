@@ -2538,8 +2538,12 @@ Each controller the USB driver finds becomes an `Adapter`: queues of
 packets both ways behind spinlocks, so the USB driver (which runs with
 its controller's lock held) never waits for the stack, and a `bluetooth`
 kernel thread that runs everything else. Its `Hci` sends a command and
-waits for the event that answers it, keeping any other event for later,
-in order; one command is in flight at a time, which is all setup needs.
+waits for the Command Complete or Command Status that answers it (a few
+milliseconds), keeping any other event for later, in order; one command
+is in flight at a time. Everything a command starts (an inquiry, a
+connection, pairing) finishes in later events, which the stack
+(`bluetooth/stack.rs`) handles as they come, so nothing waits for a
+device: a keyboard keeps typing while another device pairs.
 
 **Intel's patches** (`bluetooth/intel.rs`). The 7260 and its relatives
 run firmware from ROM, with bugs, and want a patch loaded at every power
@@ -2571,12 +2575,65 @@ one carrying their name in its EIR data (length, type, data fields; type
 9 is the full name, 8 a shortened one). Afterwards a Remote Name Request
 asks each device that didn't send its name.
 
+**Connecting and pairing** (`stack.rs`). Create Connection pages the
+device; Connection Complete gives the link a handle. The host then asks
+for authentication, and the controller asks the host for the link key
+it keeps for the device (`Link Key Request`). With one (and not pairing
+afresh) the two controllers prove they share it and the link is
+authenticated. Without one, Secure Simple Pairing: the controller asks
+for our input/output capabilities (we say a display and yes/no buttons,
+and general bonding with protection against an attacker in the middle),
+and the two sides' capabilities decide how the user takes part: a
+keyboard gets a six-digit passkey the host shows (User Passkey
+Notification, shown in `/proc/bluetooth` and by `bluetooth pair`) for
+the user to type on it; a device with nothing to show or press (most
+mice, headsets) "just works" and the host is only asked to confirm,
+which it does for the device it was asked to pair with and refuses for
+any other. The controllers do the elliptic-curve work; the host gets the
+new link key (`Link Key Notification`) and keeps it. Older devices
+asking for a PIN get `0000`. Then encryption (`Set Connection
+Encryption`). Devices paired before may connect to us (a keyboard does
+when a key is pressed): their Connection Request is accepted only if
+we have a key for them, and they're authenticated with it.
+
+**Link keys** (`keys.rs`) are kept in `bluetooth/keys` (mode 0600) on the
+data partition, or on the boot partition of a live USB stick: one line a
+device, `ADDRESS KEY TYPE CLASS NAME`. The thread starts before file
+systems are mounted, so it looks every two seconds until one is.
+
+**ACL data and L2CAP** (`l2cap.rs`). A connection carries ACL packets,
+up to the controller's buffer size (1021 bytes for the 7260), and the
+controller takes only as many as it has buffers (8); Number of Completed
+Packets events give the credits back. ACL packets carry L2CAP frames
+(length, channel ID, payload), split over several packets when they're
+bigger; incoming pieces are joined per connection. L2CAP divides a
+connection into channels: channel 1 is signaling, where a connection
+request names a service by PSM (HID's control channel is 0x11, its
+interrupt channel 0x13), the response names the other side's channel
+ID, and each side then configures the direction it receives (we ask for
+nothing but the default MTU, 672, and agree to whatever the device
+asks). A device asking for a channel before the link is encrypted is
+told "pending" until it is.
+
+**Keyboards and mice** (`hid.rs`). Bluetooth HID uses two channels: the
+host opens control, then interrupt (a device that connected to us opens
+them itself). The host asks for the boot protocol (`SET_PROTOCOL` 0x70
+on control), which every keyboard and mouse supports, so no report
+descriptor (an SDP query) is needed; boot reports arrive on interrupt as
+`A1`, a report ID (1 keyboard, 2 mouse) and the same bytes as USB boot
+reports, so USB's decoding (`drivers/usb/hid.rs`) is reused: keys go to
+the terminal and to an evdev device (`/dev/input/eventN`, bus
+Bluetooth), the mouse to another. Keyboard LEDs go back as `A2 01 LEDS`.
+A device asking to be unplugged (virtual cable unplug) is forgotten.
+Disconnecting removes its input devices.
+
 **Using it**: `bluetooth` shows `/proc/bluetooth` (state, address,
-version, firmware, devices found); `bluetooth scan` writes `scan` to it
-and waits. Not yet: pairing (Secure Simple Pairing: the controller does
-the elliptic-curve work, the host answers its questions and keeps the
-link keys), L2CAP, and the HID (keyboards, mice) and audio (A2DP, HFP)
-profiles; Bluetooth Low Energy.
+version, firmware, devices found, paired devices and their connections,
+pairing under way); `bluetooth scan` writes `scan` to it and waits;
+`bluetooth pair DEVICE` (an address or a name the scan showed) writes
+`pair ADDRESS` and follows the pairing, showing the passkey;
+`connect`, `disconnect` and `forget` the same way. Not yet: audio
+(A2DP, HFP), SDP, Bluetooth Low Energy.
 
 **Testing without the hardware**: QEMU has no Bluetooth device, so
 `xtask/src/bluetooth.rs` is one, attached over usbredir like the
@@ -2584,9 +2641,17 @@ pretend camera: a full-speed 8087:07dc reporting the T440p's ROM
 version. It reads the same patch file and checks every patch command
 the kernel sends against it, answering with the file's events; only if
 all of them matched, in order, does leaving manufacturer mode switch its
-patch on (patch number 0x42). A scan finds two pretend devices, one
-naming itself in its inquiry answer and one that has to be asked. The
-kernel test `the_pretend_controller_is_patched_and_scans` checks both.
+patch on (patch number 0x42). A scan finds three pretend devices: a
+keyboard and a mouse naming themselves in their inquiry answers, and a
+headset that has to be asked. They pair as real ones do (the keyboard
+by passkey, the others "just work"), with link keys derived from their
+addresses, so a stored key is checked; the keyboard and mouse then do
+L2CAP and HID, and after `SET_PROTOCOL` the keyboard types `echo
+bluetooth keyboard works` and Enter (in a session, the shell runs it)
+and the mouse moves and clicks. Disconnected by the host, a keyboard
+or mouse connects back by itself once, a second later. Kernel tests
+check scanning, and pairing both devices, typing, reconnecting with the
+stored key and forgetting (`bluetooth_keyboards_and_mice_pair_and_come_back`).
 
 ### The stack (`net/mod.rs`)
 

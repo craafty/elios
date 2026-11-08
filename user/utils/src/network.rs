@@ -106,31 +106,118 @@ pub fn ifconfig(_: &[String]) -> i32 {
 const WIFI: &str = "/proc/wifi";
 const BLUETOOTH: &str = "/proc/bluetooth";
 
-/// `bluetooth`: the adapter's state; `bluetooth scan`: devices nearby
-/// that can be found (about ten seconds).
+/// `bluetooth`: the adapter's state and paired devices; `scan`: devices
+/// nearby that can be found (ten seconds or more); `pair DEVICE`: pair
+/// with one (by address or name) and connect; `connect`, `disconnect`
+/// and `forget` one paired before.
 pub fn bluetooth(arguments: &[String]) -> i32 {
     if !fs::exists(BLUETOOTH) {
         eprintln!("bluetooth: no Bluetooth adapter");
         return 1;
     }
-    match arguments.get(1).map(String::as_str) {
+    let usage = || {
+        eprintln!(
+            "usage: bluetooth [status | scan | pair DEVICE | connect DEVICE | disconnect DEVICE | forget DEVICE]"
+        );
+        eprintln!("DEVICE is an address (11:22:33:44:55:66) or a name, as `bluetooth scan` shows it");
+        2
+    };
+    let verb = arguments.get(1).map(String::as_str);
+    let device = arguments[2.min(arguments.len())..].join(" ");
+    match verb {
         None | Some("status") => {
             print!("{}", fs::read_to_string(BLUETOOTH).unwrap_or_default());
-            return 0;
+            0
         }
-        Some("scan") => {}
-        _ => {
-            eprintln!("usage: bluetooth [status | scan]");
-            return 2;
+        Some("scan") if device.is_empty() => bluetooth_scan(),
+        Some(verb @ ("pair" | "connect" | "disconnect" | "forget")) if !device.is_empty() => {
+            let Some((address, name)) = bluetooth_device(&device) else {
+                eprintln!("bluetooth: no device {device:?} (try `bluetooth scan`)");
+                return 1;
+            };
+            if let Err(error) = bluetooth_request(&alloc::format!("{verb} {address}")) {
+                eprintln!("bluetooth: {error}");
+                return 1;
+            }
+            match verb {
+                "pair" | "connect" => bluetooth_pairing(&address, &name, verb == "pair"),
+                "forget" => {
+                    println!("forgot {name}");
+                    0
+                }
+                _ => 0,
+            }
+        }
+        _ => usage(),
+    }
+}
+
+fn bluetooth_request(request: &str) -> Result<(), String> {
+    // The adapter loads its firmware for a few seconds after starting.
+    let deadline = time::monotonic_nanos() + 20_000_000_000;
+    loop {
+        let text = fs::read_to_string(BLUETOOTH).unwrap_or_default();
+        let starting = text.lines().any(|line| matches!(line, "state: starting" | "state: patching"));
+        if !starting || time::monotonic_nanos() > deadline {
+            break;
+        }
+        time::sleep_ms(200);
+    }
+    fs::File::open_read_write(BLUETOOTH).and_then(|file| file.write_all(request.as_bytes())).map_err(|error| {
+        if error == eli::sys::Error::BUSY {
+            String::from("busy (scanning or pairing)")
+        } else {
+            alloc::format!("{error} (is the adapter still starting?)")
+        }
+    })
+}
+
+/// A section of /proc/bluetooth: the lines after `heading`, up to the
+/// next heading.
+fn bluetooth_section(text: &str, heading: &str) -> Vec<String> {
+    let Some((_, rest)) = text.split_once(heading) else { return Vec::new() };
+    rest.lines()
+        .skip(1)
+        .take_while(|line| !line.ends_with(':') && !line.starts_with("pairing:"))
+        .map(String::from)
+        .collect()
+}
+
+/// Finds a device by address or name among those scanned and paired:
+/// its address and a name to call it.
+fn bluetooth_device(wanted: &str) -> Option<(String, String)> {
+    let text = fs::read_to_string(BLUETOOTH).unwrap_or_default();
+    let mut known = Vec::new();
+    // Paired: `ADDRESS  NAME  STATE`. Found: `ADDRESS  class C  [R dBm  ]NAME`.
+    for line in bluetooth_section(&text, "\npaired:") {
+        let mut fields = line.split("  ");
+        if let (Some(address), Some(name)) = (fields.next(), fields.next()) {
+            known.push((address.to_string(), name.to_string()));
         }
     }
-    let written = fs::File::open_read_write(BLUETOOTH).and_then(|file| file.write_all(b"scan"));
-    if let Err(error) = written {
-        eprintln!("bluetooth: {error} (is the adapter still starting?)");
+    for line in bluetooth_section(&text, "\ndevices:") {
+        let fields: Vec<&str> = line.split("  ").collect();
+        if let (Some(address), Some(name)) = (fields.first(), fields.last()) {
+            known.push((address.to_string(), name.to_string()));
+        }
+    }
+    let address_like = wanted.len() == 17 && wanted.bytes().filter(|&b| b == b':').count() == 5;
+    known
+        .iter()
+        .find(|(address, _)| address.eq_ignore_ascii_case(wanted))
+        .or_else(|| known.iter().find(|(_, name)| name == wanted))
+        .or_else(|| known.iter().find(|(_, name)| name.eq_ignore_ascii_case(wanted)))
+        .cloned()
+        .or_else(|| address_like.then(|| (wanted.to_ascii_uppercase(), wanted.to_string())))
+}
+
+fn bluetooth_scan() -> i32 {
+    if let Err(error) = bluetooth_request("scan") {
+        eprintln!("bluetooth: {error}");
         return 1;
     }
     println!("scanning...");
-    let deadline = time::monotonic_nanos() + 30_000_000_000;
+    let deadline = time::monotonic_nanos() + 100_000_000_000;
     let text = loop {
         time::sleep_ms(200);
         let text = fs::read_to_string(BLUETOOTH).unwrap_or_default();
@@ -146,11 +233,45 @@ pub fn bluetooth(arguments: &[String]) -> i32 {
         eprintln!("bluetooth: {error}");
         return 1;
     }
-    match text.split_once("devices:\n") {
-        Some((_, "")) | None => println!("no devices found"),
-        Some((_, devices)) => print!("{devices}"),
+    let devices = bluetooth_section(&text, "\ndevices:");
+    if devices.is_empty() {
+        println!("no devices found");
+    }
+    for device in devices {
+        println!("{device}");
     }
     0
+}
+
+/// Follows pairing (or connecting) in /proc/bluetooth until it's done.
+fn bluetooth_pairing(address: &str, name: &str, pairing: bool) -> i32 {
+    println!("{} {name}...", if pairing { "pairing with" } else { "connecting to" });
+    let deadline = time::monotonic_nanos() + 90_000_000_000;
+    let mut last_step = String::new();
+    loop {
+        time::sleep_ms(200);
+        let text = fs::read_to_string(BLUETOOTH).unwrap_or_default();
+        let Some(step) = text.lines().find_map(|line| line.strip_prefix("pairing: ")) else {
+            if let Some(error) = text.lines().find_map(|line| line.strip_prefix("error: ")) {
+                eprintln!("bluetooth: {error}");
+                return 1;
+            }
+            println!("{} {name}", if pairing { "paired with" } else { "connected to" });
+            return 0;
+        };
+        let step = step.strip_prefix(address).unwrap_or(step).trim();
+        if step != last_step {
+            match step.rsplit_once(" passkey ") {
+                Some((_, passkey)) => println!("Type {passkey} on {name}, then press Enter."),
+                None => println!("  {step}"),
+            }
+            last_step = step.to_string();
+        }
+        if time::monotonic_nanos() > deadline {
+            eprintln!("bluetooth: it's taking too long");
+            return 1;
+        }
+    }
 }
 
 /// The `state:` line of /proc/wifi, and the `error:` line if there is one.

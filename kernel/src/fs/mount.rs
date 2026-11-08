@@ -184,6 +184,11 @@ pub fn shut_down() {
     }
 }
 
+/// Whether a file system is mounted at `path` (exactly).
+pub fn is_mounted(path: &str) -> bool {
+    MOUNTS.lock().iter().any(|mount| mount.path == path)
+}
+
 /// Whether any partition of disk `name` is mounted.
 pub fn disk_in_use(name: &str) -> bool {
     MOUNTS.lock().iter().any(|mount| mount.disk.as_deref() == Some(name))
