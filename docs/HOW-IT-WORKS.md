@@ -1958,12 +1958,17 @@ interface isn't boot-capable need HID report descriptors parsed, which is
 for later.
 
 **Bluetooth** controllers are USB devices too (class `E0`), including the
-one on Intel's 7260 Wi-Fi card. So far eliOS only identifies them: it
-sends HCI commands (a class request on endpoint 0) and reads the
-answering events from the interrupt endpoint, logging the controller's
-address and version, and for Intel's, which firmware patch it needs. The
-Bluetooth stack proper (patching, pairing, L2CAP, HID and audio profiles)
-is to come.
+one on Intel's 7260 Wi-Fi card. The USB driver only carries their HCI
+packets (see "Bluetooth" below): commands go out as class requests on
+endpoint 0, events arrive on the interrupt endpoint and ACL data on the
+bulk ones. Eight event transfers of one USB packet each and four
+1 KiB ACL transfers stay queued, each in a slot of one page, and pieces
+are put back together by the lengths in the HCI headers (a packet that's
+an exact multiple of the endpoint's size ends without a short packet, so
+a transfer bigger than one packet could sit waiting for the next event;
+one packet per event transfer avoids that). Complete packets go to the
+stack's `Adapter`; what it queues to send, the controller's thread sends
+when the adapter wakes it.
 
 **Storage** (`storage.rs`): USB sticks, card readers and external disks
 nearly all speak the *Bulk-Only Transport*: each command is a 31-byte
@@ -2523,6 +2528,65 @@ while connected, roaming, WPA3, EAP methods other than PEAP/MS-CHAPv2,
 802.11n aggregation (so throughput is well below the card's best; the
 access point's Block Ack requests are declined with status 37, as the
 standard asks, so it stops asking and sends frames one at a time).
+
+### Bluetooth (`bluetooth/`)
+
+A Bluetooth controller runs the radio and the link layer itself; the
+host speaks the Host Controller Interface to it: commands, events, and
+ACL data (what connections carry). `bluetooth/mod.rs` is the host side.
+Each controller the USB driver finds becomes an `Adapter`: queues of
+packets both ways behind spinlocks, so the USB driver (which runs with
+its controller's lock held) never waits for the stack, and a `bluetooth`
+kernel thread that runs everything else. Its `Hci` sends a command and
+waits for the event that answers it, keeping any other event for later,
+in order; one command is in flight at a time, which is all setup needs.
+
+**Intel's patches** (`bluetooth/intel.rs`). The 7260 and its relatives
+run firmware from ROM, with bugs, and want a patch loaded at every power
+up. Intel's "read version" (`FC05`) names the ROM (hardware 37.7.10,
+firmware 1.80.2.3.d on the T440p) and says whether a patch is running
+already (a warm reboot keeps it). The patch file
+`intel/ibt-hw-37.7.10-fw-1.80.2.3.d.bseq` is a script: records `01` with
+an HCI command, each followed by records `02` with the events the
+controller answers it with. The host enters manufacturer mode
+(`FC11 01 00`), sends each command and compares the answer with the last
+event listed byte for byte (a command answered with Command Status and
+then a vendor event lists both), then leaves manufacturer mode with
+`FC11 00 02`: reset and switch the patch on (`00 01` switches it off
+after a failure; a file with no `FC8E` patch writes needs no reset).
+Last, Intel's vendor events are switched on (`FC52`). This follows
+Linux's `btintel` legacy ROM code, the only description of the procedure
+there is; the T440p's patch is 107 commands. Without a patch file the
+controller runs unpatched.
+
+**Then** the controller is reset again and set up the way a BR/EDR host
+uses it: its address, version and ACL buffers (`Read BD_ADDR`,
+`Read Local Version`, `Read Buffer Size`), every event wanted (Linux's
+mask), Secure Simple Pairing on, inquiry results with RSSI and extended
+data, a laptop's class of device and the name "eliOS".
+
+**Scanning** is inquiry: the general inquiry access code for about ten
+seconds. Devices answer with an inquiry result with RSSI, or an extended
+one carrying their name in its EIR data (length, type, data fields; type
+9 is the full name, 8 a shortened one). Afterwards a Remote Name Request
+asks each device that didn't send its name.
+
+**Using it**: `bluetooth` shows `/proc/bluetooth` (state, address,
+version, firmware, devices found); `bluetooth scan` writes `scan` to it
+and waits. Not yet: pairing (Secure Simple Pairing: the controller does
+the elliptic-curve work, the host answers its questions and keeps the
+link keys), L2CAP, and the HID (keyboards, mice) and audio (A2DP, HFP)
+profiles; Bluetooth Low Energy.
+
+**Testing without the hardware**: QEMU has no Bluetooth device, so
+`xtask/src/bluetooth.rs` is one, attached over usbredir like the
+pretend camera: a full-speed 8087:07dc reporting the T440p's ROM
+version. It reads the same patch file and checks every patch command
+the kernel sends against it, answering with the file's events; only if
+all of them matched, in order, does leaving manufacturer mode switch its
+patch on (patch number 0x42). A scan finds two pretend devices, one
+naming itself in its inquiry answer and one that has to be asked. The
+kernel test `the_pretend_controller_is_patched_and_scans` checks both.
 
 ### The stack (`net/mod.rs`)
 
@@ -3396,7 +3460,7 @@ Current limits, roughly in order of how much they'd matter to a user:
   partial count for `read` and `write`).
 - **USB:** keyboards, mice (boot protocol only), storage and hubs; no UAS,
   the faster USB 3 storage protocol (USB 3 disks also speak Bulk-Only,
-  which eliOS uses), and Bluetooth controllers are only identified. USB 3
+  which eliOS uses). USB 3
   hubs and transaction translators are untested outside the
   specifications.
 - **Wi-Fi** (Intel 7260/3160 only) joins open, WPA2-Personal and

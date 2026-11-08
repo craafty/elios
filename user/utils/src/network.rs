@@ -104,6 +104,54 @@ pub fn ifconfig(_: &[String]) -> i32 {
 
 /// The Wi-Fi driver's status and control file.
 const WIFI: &str = "/proc/wifi";
+const BLUETOOTH: &str = "/proc/bluetooth";
+
+/// `bluetooth`: the adapter's state; `bluetooth scan`: devices nearby
+/// that can be found (about ten seconds).
+pub fn bluetooth(arguments: &[String]) -> i32 {
+    if !fs::exists(BLUETOOTH) {
+        eprintln!("bluetooth: no Bluetooth adapter");
+        return 1;
+    }
+    match arguments.get(1).map(String::as_str) {
+        None | Some("status") => {
+            print!("{}", fs::read_to_string(BLUETOOTH).unwrap_or_default());
+            return 0;
+        }
+        Some("scan") => {}
+        _ => {
+            eprintln!("usage: bluetooth [status | scan]");
+            return 2;
+        }
+    }
+    let written = fs::File::open_read_write(BLUETOOTH).and_then(|file| file.write_all(b"scan"));
+    if let Err(error) = written {
+        eprintln!("bluetooth: {error} (is the adapter still starting?)");
+        return 1;
+    }
+    println!("scanning...");
+    let deadline = time::monotonic_nanos() + 30_000_000_000;
+    let text = loop {
+        time::sleep_ms(200);
+        let text = fs::read_to_string(BLUETOOTH).unwrap_or_default();
+        if !text.contains("state: scanning") {
+            break text;
+        }
+        if time::monotonic_nanos() > deadline {
+            eprintln!("bluetooth: the scan didn't finish");
+            return 1;
+        }
+    };
+    if let Some(error) = text.lines().find_map(|line| line.strip_prefix("error: ")) {
+        eprintln!("bluetooth: {error}");
+        return 1;
+    }
+    match text.split_once("devices:\n") {
+        Some((_, "")) | None => println!("no devices found"),
+        Some((_, devices)) => print!("{devices}"),
+    }
+    0
+}
 
 /// The `state:` line of /proc/wifi, and the `error:` line if there is one.
 fn wifi_state() -> (String, Option<String>) {

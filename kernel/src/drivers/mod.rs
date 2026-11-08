@@ -10,7 +10,11 @@ pub mod nvme;
 pub mod pci;
 pub mod usb;
 
+use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use crate::{fs, task, time};
 
 use self::block::Disk;
 
@@ -48,4 +52,33 @@ pub fn init() {
     hda::probe(&devices);
     intel_wifi::probe(&devices);
     usb::probe(&devices);
+}
+
+/// How long to wait for the root file system (and the firmware file).
+const FIRMWARE_WAIT_MS: u64 = 60_000;
+
+/// Reads /lib/firmware/<name>, waiting for the root file system if it
+/// isn't mounted yet (drivers start before it is).
+pub fn read_firmware(name: &str) -> Result<Vec<u8>, String> {
+    let path = alloc::format!("/lib/firmware/{name}");
+    let deadline = time::uptime_nanos() + FIRMWARE_WAIT_MS * 1_000_000;
+    let inode = loop {
+        match fs::lookup("/", &path, true) {
+            Ok(inode) => break inode,
+            Err(_) if time::uptime_nanos() < deadline => task::sleep_ms(250),
+            Err(error) => return Err(alloc::format!("can't open {path}: {error:?}")),
+        }
+    };
+    let size = inode.metadata().size as usize;
+    let mut data = alloc::vec![0; size];
+    let mut done = 0;
+    while done < size {
+        match inode.read_at(done as u64, &mut data[done..]) {
+            Ok(0) => break,
+            Ok(count) => done += count,
+            Err(error) => return Err(alloc::format!("reading {path}: {error:?}")),
+        }
+    }
+    data.truncate(done);
+    Ok(data)
 }

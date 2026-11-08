@@ -96,7 +96,7 @@ struct State {
 }
 
 /// Packets go out whole from two threads (replies, and the stream).
-type Writer = Arc<Mutex<UnixStream>>;
+pub(crate) type Writer = Arc<Mutex<UnixStream>>;
 
 /// Listens on `path` for QEMU's `usb-redir` device and serves the camera
 /// to it on a thread. Returns the QEMU arguments that attach it.
@@ -125,25 +125,7 @@ pub fn start(path: &Path) -> Result<Vec<String>, String> {
 fn serve(stream: UnixStream) -> io::Result<()> {
     let mut reader = stream.try_clone()?;
     let writer: Writer = Arc::new(Mutex::new(stream));
-    let mut hello = [0u8; 68];
-    hello[..12].copy_from_slice(b"eliOS camera");
-    hello[64..].copy_from_slice(&CAPABILITIES.to_le_bytes());
-    // Hellos have 32-bit ids: neither side knows the other's capabilities
-    // yet.
-    let mut packet = Vec::new();
-    packet.extend_from_slice(&HELLO.to_le_bytes());
-    packet.extend_from_slice(&(hello.len() as u32).to_le_bytes());
-    packet.extend_from_slice(&0u32.to_le_bytes());
-    packet.extend_from_slice(&hello);
-    writer.lock().unwrap().write_all(&packet)?;
-    let mut header = [0u8; 12];
-    reader.read_exact(&mut header)?;
-    let mut theirs = vec![0u8; u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize];
-    reader.read_exact(&mut theirs)?;
-    let capabilities = theirs.get(64..68).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
-    if u32::from_le_bytes(header[0..4].try_into().unwrap()) != HELLO || capabilities & CAPABILITIES != CAPABILITIES {
-        return Err(io::Error::other("QEMU's usb-redir lacks the capabilities needed"));
-    }
+    hello(&writer, &mut reader, "eliOS camera")?;
     send(&writer, INTERFACE_INFO, 0, &interface_info(), &[])?;
     send(&writer, EP_INFO, 0, &ep_info(0), &[])?;
     // High speed, class 0xEF/2/1 (interface association), the vendor and
@@ -378,7 +360,31 @@ fn picture(width: u16, height: u16, number: u32) -> Vec<u8> {
     bytes
 }
 
-fn send(writer: &Writer, kind: u32, id: u64, header: &[u8], data: &[u8]) -> io::Result<()> {
+/// Exchanges usbredir hellos and checks QEMU has the capabilities we need.
+pub(crate) fn hello(writer: &Writer, reader: &mut UnixStream, name: &str) -> io::Result<()> {
+    let mut hello = [0u8; 68];
+    hello[..name.len()].copy_from_slice(name.as_bytes());
+    hello[64..].copy_from_slice(&CAPABILITIES.to_le_bytes());
+    // Hellos have 32-bit ids: neither side knows the other's capabilities
+    // yet.
+    let mut packet = Vec::new();
+    packet.extend_from_slice(&HELLO.to_le_bytes());
+    packet.extend_from_slice(&(hello.len() as u32).to_le_bytes());
+    packet.extend_from_slice(&0u32.to_le_bytes());
+    packet.extend_from_slice(&hello);
+    writer.lock().unwrap().write_all(&packet)?;
+    let mut header = [0u8; 12];
+    reader.read_exact(&mut header)?;
+    let mut theirs = vec![0u8; u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize];
+    reader.read_exact(&mut theirs)?;
+    let capabilities = theirs.get(64..68).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+    if u32::from_le_bytes(header[0..4].try_into().unwrap()) != HELLO || capabilities & CAPABILITIES != CAPABILITIES {
+        return Err(io::Error::other("QEMU's usb-redir lacks the capabilities needed"));
+    }
+    Ok(())
+}
+
+pub(crate) fn send(writer: &Writer, kind: u32, id: u64, header: &[u8], data: &[u8]) -> io::Result<()> {
     let mut packet = Vec::with_capacity(16 + header.len() + data.len());
     packet.extend_from_slice(&kind.to_le_bytes());
     packet.extend_from_slice(&((header.len() + data.len()) as u32).to_le_bytes());
@@ -443,7 +449,7 @@ fn device_descriptor() -> Vec<u8> {
     d
 }
 
-fn string_descriptor(text: &str) -> Vec<u8> {
+pub(crate) fn string_descriptor(text: &str) -> Vec<u8> {
     let mut d = vec![0, 3];
     text.encode_utf16().for_each(|unit| d.extend_from_slice(&unit.to_le_bytes()));
     d[0] = d.len() as u8;

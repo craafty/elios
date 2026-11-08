@@ -13,6 +13,7 @@ mod test;
 
 mod acpi;
 mod arch;
+mod bluetooth;
 mod cmdline;
 mod collections;
 mod console;

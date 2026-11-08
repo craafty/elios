@@ -114,6 +114,16 @@ pub struct StorageInterface {
     pub output_packet_size: u16,
 }
 
+/// A Bluetooth controller's HCI interface: events on an interrupt
+/// endpoint, ACL data on bulk ones.
+pub struct BluetoothInterface {
+    pub events: InterruptInterface,
+    pub input_address: u8,
+    pub input_packet_size: u16,
+    pub output_address: u8,
+    pub output_packet_size: u16,
+}
+
 /// An interface's interrupt IN endpoint (a keyboard's reports, a hub's
 /// port changes).
 pub struct InterruptInterface {
@@ -207,9 +217,23 @@ impl Descriptors {
     }
 
     /// A Bluetooth controller's interface (class 0xE0, "wireless
-    /// controller", subclass 1, protocol 1) and its event endpoint.
-    pub fn bluetooth(&self) -> Option<InterruptInterface> {
-        self.interrupt_interface(|i| i.class == 0xE0 && i.subclass == 1 && i.protocol == 1)
+    /// controller", subclass 1, protocol 1): its event endpoint and the
+    /// bulk endpoints ACL data moves over.
+    pub fn bluetooth(&self) -> Option<BluetoothInterface> {
+        let wanted = |i: &Interface| i.class == 0xE0 && i.subclass == 1 && i.protocol == 1;
+        let events = self.interrupt_interface(wanted)?;
+        let interface = self.interfaces.iter().find(|i| i.number == events.interface && wanted(i))?;
+        let bulk = |input: bool| {
+            interface.endpoints.iter().find(|e| e.attributes & 0x3 == 2 && (e.address & 0x80 != 0) == input)
+        };
+        let (input, output) = (bulk(true)?, bulk(false)?);
+        Some(BluetoothInterface {
+            events,
+            input_address: input.address,
+            input_packet_size: input.packet_size,
+            output_address: output.address,
+            output_packet_size: output.packet_size,
+        })
     }
 
     /// A hub's interface (class 9) and its status change endpoint.

@@ -1,5 +1,6 @@
 //! Build and run eliOS. Invoked as `cargo xtask <command>`.
 
+mod bluetooth;
 mod camera;
 mod image;
 mod mirror;
@@ -666,7 +667,10 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
     qemu.args(["-chardev", "stdio,id=console,signal=off", "-serial", "chardev:console"])
         // A USB controller with a keyboard and mouse. QEMU types into the
         // keyboard added last, so the window's keystrokes arrive over USB.
-        .args(["-device", "qemu-xhci,id=xhci"]);
+        // Eight ports of each kind: a keyboard, a mouse, the camera, the
+        // Bluetooth controller and USB sticks need more than the four QEMU
+        // gives by default.
+        .args(["-device", "qemu-xhci,id=xhci,p2=8,p3=8"]);
     // Behind a hub (on root port 1) when asked: QEMU names hub ports 1.1,
     // 1.2 and so on.
     let place = |port: u32| if options.usb_hub { format!(",port=1.{port}") } else { String::new() };
@@ -686,6 +690,9 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
     // A pretend webcam (see camera.rs), so the video driver gets tested.
     let socket = workspace_root().join(format!("target/camera-{}.sock", std::process::id()));
     qemu.args(camera::start(&socket)?);
+    // And a pretend Intel Bluetooth controller (see bluetooth.rs).
+    let socket = workspace_root().join(format!("target/bluetooth-{}.sock", std::process::id()));
+    qemu.args(bluetooth::start(&socket)?);
     // A USB mouse, so mice get tested; the window's pointer goes to it.
     qemu.arg("-device").arg(format!("usb-mouse,bus=xhci.0{}", place(3)));
     qemu.arg("-device")

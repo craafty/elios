@@ -42,6 +42,7 @@ pub fn find(name: &str) -> Option<Command> {
         "id" => crate::accounts::id,
         "ifconfig" => crate::network::ifconfig,
         "wifi" => crate::network::wifi,
+        "bluetooth" => crate::network::bluetooth,
         "kill" => kill,
         "ln" => ln,
         "greeter" => crate::greeter::greeter,

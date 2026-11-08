@@ -31,7 +31,7 @@ use self::firmware::{Firmware, Image};
 use self::runtime::InitResults;
 use self::transport::{Error, Packet, Transport};
 use super::pci;
-use crate::{fs, task, time};
+use crate::task;
 
 /// A card model: its PCI device IDs, name and firmware file.
 struct Model {
@@ -60,9 +60,6 @@ const NVM_SECTION_HARDWARE: u16 = 0;
 const NVM_SECTION_SOFTWARE: u16 = 1;
 const NVM_CHUNK: u16 = 2048;
 
-/// How long to wait for the root file system (and the firmware file).
-const FIRMWARE_WAIT_MS: u64 = 60_000;
-
 /// Starts a thread for each supported card.
 pub fn probe(devices: &[pci::Device]) {
     for device in devices.iter().filter(|d| d.vendor == 0x8086) {
@@ -85,7 +82,7 @@ pub fn probe(devices: &[pci::Device]) {
 }
 
 fn start(bar: u64, model: &Model) -> Result<(), String> {
-    let file = read_firmware(model.firmware)?;
+    let file = crate::drivers::read_firmware(model.firmware)?;
     let firmware = Firmware::parse(&file).map_err(String::from)?;
     drop(file);
     info!(
@@ -128,32 +125,6 @@ fn start(bar: u64, model: &Model) -> Result<(), String> {
         }
     }
     Err(String::from("giving up after three tries"))
-}
-
-/// Reads /lib/firmware/<name>, waiting for the root file system if it
-/// isn't mounted yet (drivers start before it is).
-fn read_firmware(name: &str) -> Result<Vec<u8>, String> {
-    let path = alloc::format!("/lib/firmware/{name}");
-    let deadline = time::uptime_nanos() + FIRMWARE_WAIT_MS * 1_000_000;
-    let inode = loop {
-        match fs::lookup("/", &path, true) {
-            Ok(inode) => break inode,
-            Err(_) if time::uptime_nanos() < deadline => task::sleep_ms(250),
-            Err(error) => return Err(alloc::format!("can't open {path}: {error:?}")),
-        }
-    };
-    let size = inode.metadata().size as usize;
-    let mut data = alloc::vec![0; size];
-    let mut done = 0;
-    while done < size {
-        match inode.read_at(done as u64, &mut data[done..]) {
-            Ok(0) => break,
-            Ok(count) => done += count,
-            Err(error) => return Err(alloc::format!("reading {path}: {error:?}")),
-        }
-    }
-    data.truncate(done);
-    Ok(data)
 }
 
 /// Runs the init image: reads the card's settings and calibrates the

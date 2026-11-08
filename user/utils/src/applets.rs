@@ -45,6 +45,7 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("nproc", "show how many CPUs there are"),
     ("ifconfig", "show network interfaces"),
     ("wifi", "scan for and join Wi-Fi networks"),
+    ("bluetooth", "show the Bluetooth adapter and find devices"),
     ("ping", "check that a host answers"),
     ("host", "look up a host name"),
     ("wget", "download a file over HTTP"),

@@ -185,6 +185,11 @@ pub fn create() -> Arc<dyn Inode> {
                 control(crate::drivers::intel_wifi::status_text, crate::drivers::intel_wifi::control),
             ));
         }
+        if crate::bluetooth::present() {
+            // Status, devices found, and requests ("scan") for the
+            // `bluetooth` command.
+            entries.push(("bluetooth".into(), control(crate::bluetooth::status_text, crate::bluetooth::control)));
+        }
         for info in process::list() {
             entries.push((info.pid.to_string(), process_directory(info.pid)));
         }
