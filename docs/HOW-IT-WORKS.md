@@ -1514,6 +1514,17 @@ Alpine's Firefox runs unmodified. What it needed, in the order it asked:
   report the source address routing chose, not `0.0.0.0`. With that, a
   STUN server (Google's) returns the public address as a server-reflexive
   candidate, which is what calls across the internet need.
+- **H.264** for calls (Teams and most meeting services want it) is
+  Cisco's OpenH264 plugin, which Firefox downloads into the profile on
+  first start. The plugin is built against glibc, but musl's loader
+  treats `libc.so.6`, `libm.so.6` and `libpthread.so.0` as itself and
+  ignores symbol versions, and every glibc symbol it uses exists in musl,
+  so it runs as is. Firefox refuses to load media plugins on Linux
+  without a seccomp-bpf sandbox, which eliOS doesn't have yet: the
+  parent's check is the `media.gmp.insecure.allow` preference, set for
+  every profile by `/etc/firefox/policies/policies.json`, and the plugin
+  process's own check is `MOZ_DISABLE_GMP_SANDBOX`, which the desktop
+  sets. A loopback call forced to H.264 (`setCodecPreferences`) plays.
 - `/proc/PID/stat` with all 52 of Linux's fields: BusyBox's `ps`,
   `pidof` and `killall` parse it with a number reader that runs off the
   end of a shorter line.
@@ -2711,6 +2722,9 @@ the links). One binary keeps the initrd small: the whole userland is about
   *runs*, not when the line is read. Expanding everything up front was the
   first design and was wrong: `false; echo $?` printed a stale status, and
   `touch x.txt; ls *.txt` didn't see the new file.
+- Wildcards work in any path component (`/proc/*/status`): each
+  component with `*` or `?` is matched against the directories found for
+  the components before it, and only paths that exist are kept.
 - Each pipeline gets its own process group, which becomes the terminal's
   foreground group while it runs, then the shell takes the terminal back.
   The shell ignores SIGINT; children reset it to default before `exec`.

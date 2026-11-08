@@ -785,21 +785,45 @@ fn matches(pattern: &[char], name: &[char]) -> bool {
     }
 }
 
-/// Expands a wildcard in the last path component, sorted. Files starting
+/// Expands wildcards in any path component (`/proc/*/status`), sorted.
+/// Components without wildcards are kept as written; a component with
+/// one matches entries of the directories found so far. Files starting
 /// with a dot only match patterns that do too.
 fn expand_wildcard(word: &str) -> Vec<String> {
-    let (directory, pattern) = match word.rfind('/') {
-        Some(slash) => (&word[..=slash], &word[slash + 1..]),
-        None => ("", word),
-    };
-    let pattern: Vec<char> = pattern.chars().collect();
-    let listing = fs::read_dir(if directory.is_empty() { "." } else { directory }).unwrap_or_default();
-    listing
-        .into_iter()
-        .filter(|entry| !entry.name.starts_with('.') || pattern.first() == Some(&'.'))
-        .filter(|entry| matches(&pattern, &entry.name.chars().collect::<Vec<_>>()))
-        .map(|entry| format!("{directory}{}", entry.name))
-        .collect()
+    let absolute = word.starts_with('/');
+    let mut paths = Vec::from([if absolute { "/".to_string() } else { String::new() }]);
+    let components: Vec<&str> = word.split('/').filter(|c| !c.is_empty()).collect();
+    for (index, component) in components.iter().enumerate() {
+        let last = index + 1 == components.len();
+        let separator = if last && word.ends_with('/') { "/" } else { "" };
+        let mut next = Vec::new();
+        for path in &paths {
+            if !component.contains(['*', '?']) {
+                next.push(format!("{path}{component}{}", if last { separator } else { "/" }));
+                continue;
+            }
+            let pattern: Vec<char> = component.chars().collect();
+            let mut found: Vec<String> = fs::read_dir(if path.is_empty() { "." } else { path })
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|entry| !entry.name.starts_with('.') || pattern.first() == Some(&'.'))
+                .filter(|entry| matches(&pattern, &entry.name.chars().collect::<Vec<_>>()))
+                .map(|entry| entry.name)
+                .collect();
+            found.sort();
+            for name in found {
+                let candidate = format!("{path}{name}");
+                if !last && fs::metadata(&candidate).map_or(true, |m| m.kind != FileType::Directory) {
+                    continue;
+                }
+                next.push(if last { format!("{candidate}{separator}") } else { format!("{candidate}/") });
+            }
+        }
+        paths = next;
+    }
+    // Only paths that exist: a literal component after a wildcard may not.
+    paths.retain(|path| fs::metadata(path).is_ok());
+    paths
 }
 
 /// Tab completion: command names for the first word, paths after that.

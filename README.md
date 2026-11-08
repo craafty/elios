@@ -381,6 +381,7 @@ eliOS's own rasterizer in `truetype/`.
       is; to try on the T440p's webcam
 - [x] **Video calls:** WebRTC in Firefox connects (route netlink for
       `getifaddrs` and `ip`, interface ioctls on every socket, `waitid`);
-      a loopback call with the camera and microphone plays; next, a real
-      Teams meeting
+      a loopback call with the camera and microphone plays, in VP8 or
+      H.264 (Cisco's OpenH264 plugin, which Firefox downloads); next, a
+      real Teams meeting
 - [ ] **Next:** Wi-Fi working on the T440p, Bluetooth
