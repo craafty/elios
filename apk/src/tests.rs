@@ -201,6 +201,23 @@ fn dependencies_resolve_in_order() {
     assert_eq!(index::split_id("py3-foo-bar-1.2.3-r0"), Some(("py3-foo-bar", "1.2.3-r0")));
 }
 
+/// `install_if`: GTK's image loaders come with libglycin (Firefox aborts
+/// without them), and a package wanting two things comes only with both.
+#[test]
+fn install_if_brings_plugins() {
+    let text = "P:gtk\nV:3-r0\nD:so:libglycin-2.so.0\nC:Q1AAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\n\
+                P:libglycin\nV:2.1.5-r0\np:so:libglycin-2.so.0=0\nC:Q1AAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\n\
+                P:glycin-image-rs\nV:2.1.5-r0\nD:libgcc\ni:libglycin~2.1.5\nC:Q1AAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\n\
+                P:glycin-old\nV:1.0-r0\ni:libglycin~1.0\nC:Q1AAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\n\
+                P:libgcc\nV:15-r0\nC:Q1AAAAAAAAAAAAAAAAAAAAAAAAAAA=\n\n\
+                P:gtk-lang\nV:3-r0\ni:gtk=3-r0 lang\nC:Q1AAAAAAAAAAAAAAAAAAAAAAAAAAA=\n";
+    let index = Index::new(index::parse(text, 0));
+    let resolved = index.resolve(&["gtk".into()]).unwrap();
+    let mut names: Vec<&str> = resolved.iter().map(|package| package.name.as_str()).collect();
+    names.sort();
+    assert_eq!(names, ["glycin-image-rs", "gtk", "libgcc", "libglycin"]);
+}
+
 /// A signed index made the way Alpine makes them, read and checked.
 #[test]
 fn signed_indexes_are_checked() {

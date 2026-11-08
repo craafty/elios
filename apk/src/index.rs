@@ -28,6 +28,9 @@ pub struct Package {
     pub installed_size: u64,
     pub depends: Vec<String>,
     pub provides: Vec<String>,
+    /// `i:`: installed automatically once all of these are (a library's
+    /// plugins come with it this way: GTK's image loaders with libglycin).
+    pub install_if: Vec<String>,
     /// The SHA-1 of the package's control section (from `C:Q1<base64>`).
     pub checksum: [u8; 20],
     /// Preference among packages providing the same thing (`k:`).
@@ -62,6 +65,7 @@ pub fn parse(text: &str, repository: usize) -> Vec<Package> {
                 installed_size: 0,
                 depends: Vec::new(),
                 provides: Vec::new(),
+                install_if: Vec::new(),
                 checksum: [0; 20],
                 priority: 0,
                 repository,
@@ -78,6 +82,7 @@ pub fn parse(text: &str, repository: usize) -> Vec<Package> {
                     "I" => package.installed_size = value.parse().unwrap_or(0),
                     "D" => package.depends = value.split_whitespace().map(String::from).collect(),
                     "p" => package.provides = value.split_whitespace().map(String::from).collect(),
+                    "i" => package.install_if = value.split_whitespace().map(String::from).collect(),
                     "k" => package.priority = value.parse().unwrap_or(0),
                     "C" => {
                         let digest = value.strip_prefix("Q1").and_then(hash::base64_decode).unwrap_or_default();
@@ -226,6 +231,8 @@ pub struct Index {
     /// Package indexes by name, and by what they provide.
     by_name: BTreeMap<String, Vec<usize>>,
     providers: BTreeMap<String, Vec<(usize, String)>>,
+    /// The newest version of each package that has an `install_if`.
+    automatic: Vec<usize>,
 }
 
 impl Index {
@@ -239,7 +246,19 @@ impl Index {
                 providers.entry(name.into()).or_default().push((index, version.into()));
             }
         }
-        Self { packages, by_name, providers }
+        let mut index = Self { packages, by_name, providers, automatic: Vec::new() };
+        index.automatic = index
+            .by_name
+            .values()
+            .filter_map(|versions| {
+                versions
+                    .iter()
+                    .copied()
+                    .max_by(|&a, &b| compare_versions(&index.packages[a].version, &index.packages[b].version))
+            })
+            .filter(|&newest| !index.packages[newest].install_if.is_empty())
+            .collect();
+        index
     }
 
     /// The newest package called `name`.
@@ -294,11 +313,43 @@ impl Index {
     }
 
     /// Everything needed to install `wanted` (names, possibly with
-    /// versions), dependencies first. An error names what can't be found.
+    /// versions), dependencies first, plus whatever their `install_if`s
+    /// bring along, as apk does. An error names what can't be found.
     pub fn resolve(&self, wanted: &[String]) -> Result<Vec<&Package>, String> {
         let mut chosen: Vec<usize> = Vec::new();
         let mut queue: VecDeque<(Dependency, String)> =
             wanted.iter().map(|text| (Dependency::parse(text), String::from("you"))).collect();
+        loop {
+            self.choose(&mut chosen, &mut queue)?;
+            // Packages that come automatically with what was chosen; their
+            // dependencies may in turn bring more.
+            for &index in &self.automatic {
+                let package = &self.packages[index];
+                let wanted = package
+                    .install_if
+                    .iter()
+                    .map(|text| Dependency::parse(text))
+                    .all(|dependency| chosen.iter().any(|&other| self.satisfies(other, &dependency)));
+                if wanted && !chosen.iter().any(|&other| self.packages[other].name == package.name) {
+                    queue.push_back((Dependency::parse(&package.name), package.name.clone()));
+                }
+            }
+            if queue.is_empty() {
+                break;
+            }
+        }
+        // Dependencies before what needs them: reverse discovery order is
+        // close, then any package is moved after the ones it depends on.
+        let mut order: Vec<usize> = Vec::new();
+        let mut visiting = Vec::new();
+        for &index in &chosen {
+            self.visit(index, &chosen, &mut order, &mut visiting);
+        }
+        Ok(order.into_iter().map(|index| &self.packages[index]).collect())
+    }
+
+    /// Chooses packages for the queued dependencies and theirs.
+    fn choose(&self, chosen: &mut Vec<usize>, queue: &mut VecDeque<(Dependency, String)>) -> Result<(), String> {
         while let Some((dependency, needed_by)) = queue.pop_front() {
             if dependency.conflict || chosen.iter().any(|&index| self.satisfies(index, &dependency)) {
                 continue;
@@ -317,14 +368,7 @@ impl Index {
                 queue.push_back((Dependency::parse(text), package.name.clone()));
             }
         }
-        // Dependencies before what needs them: reverse discovery order is
-        // close, then any package is moved after the ones it depends on.
-        let mut order: Vec<usize> = Vec::new();
-        let mut visiting = Vec::new();
-        for &index in &chosen {
-            self.visit(index, &chosen, &mut order, &mut visiting);
-        }
-        Ok(order.into_iter().map(|index| &self.packages[index]).collect())
+        Ok(())
     }
 
     fn visit(&self, index: usize, chosen: &[usize], order: &mut Vec<usize>, visiting: &mut Vec<usize>) {

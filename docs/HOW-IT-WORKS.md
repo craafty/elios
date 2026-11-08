@@ -1860,9 +1860,38 @@ packets, resynchronizations, overflowed packets and bytes dropped
 because the queue was full: the numbers to look at when a laptop's
 pointer misbehaves.
 
-Touchpads have richer protocols of their own (absolute positions, several
-fingers, gestures); those are for later. In plain mouse mode the touchpad
-moves the pointer and taps or clicks are the left button.
+Plain mouse mode isn't enough for a ClickPad, a touchpad that is itself
+the button (the T440p's): it never reports the pad being pressed, and it
+can't tell one finger from two. So a Synaptics touchpad is switched to
+its absolute mode (`mouse/synaptics.rs`): queries (capabilities, model,
+extended capabilities, resolution) and the mode byte go as special
+commands, and from then on each packet is six bytes with the finger's
+position, its pressure and "W", which says what touched (one finger and
+its width, two, three, or a packet passed through from the TrackPoint).
+The decoder turns that back into what programs expect of a mouse, so
+nothing above the driver changes:
+
+- one finger's movement becomes relative movement, scaled from the pad's
+  units (about 40 per millimetre) to the 8 counts per millimetre of the
+  basic protocol so the desktop's acceleration feels the same; landing,
+  lifting, changing the finger count and implausible jumps (over 15 mm
+  in a packet) reset the position instead of moving the pointer;
+- pressing the pad is the left button, or the right with two fingers
+  down; the four packets after a press or release don't move the
+  pointer, since the finger rolls as it presses;
+- two fingers scroll, content following the fingers, one wheel step per
+  2.5 mm (`REL_WHEEL`, and `REL_HWHEEL` sideways);
+- TrackPoint packets (W = 3) are ordinary mouse packets inside the six
+  bytes. Its buttons are wired to the touchpad and arrive in packets of
+  their own (the two R bits differ, and the low bits of X and Y are the
+  buttons), which some firmware sends only on a change, so their state
+  is kept in between.
+
+Start-up logs every answer and the mode read back, and the first
+button-changing packets are logged raw, since none of it can be tried in
+QEMU. If absolute mode can't be set the mouse is reset and the basic
+protocol used; `mouse=basic` on the kernel command line
+(`\EFI\eliOS\cmdline.txt`) forces that.
 
 ### Input devices (`input.rs`)
 

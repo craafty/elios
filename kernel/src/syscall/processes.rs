@@ -516,6 +516,27 @@ pub fn madvise(address: u64, len: u64, advice: u64) -> Result<u64> {
     Ok(0)
 }
 
+/// `mincore`: which pages of a range are in memory, one byte each. Every
+/// mapped page is reported resident (pages not touched yet would come in
+/// on first access anyway); the answer that matters is `ENOMEM` for a
+/// range that isn't all mapped. Mesa's EGL relies on exactly that to check
+/// a display pointer is safe to read before peeking at it to tell a
+/// Wayland display from others; without it, it guesses X11 and crashes.
+pub fn mincore(address: u64, len: u64, vector: u64) -> Result<u64> {
+    if !address.is_multiple_of(PAGE_SIZE) {
+        return Err(Errno::EINVAL);
+    }
+    let end =
+        address.checked_add(len.next_multiple_of(PAGE_SIZE)).filter(|&end| end <= USER_END).ok_or(Errno::ENOMEM)?;
+    let covered = process::current().space.lock().as_ref().is_some_and(|space| space.covers(address, end));
+    if !covered {
+        return Err(Errno::ENOMEM);
+    }
+    let pages = ((end - address) / PAGE_SIZE) as usize;
+    user::write_bytes(vector, &alloc::vec![1u8; pages])?;
+    Ok(0)
+}
+
 /// `mremap`: grows or shrinks a mapping, moving it if allowed
 /// (`MREMAP_MAYMOVE`). Moving to a chosen place (`MREMAP_FIXED`) isn't
 /// supported.

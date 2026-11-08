@@ -302,6 +302,18 @@ impl AddressSpace {
         freed.into_iter().for_each(frames::free);
     }
 
+    /// Whether every page of `start..end` belongs to some area.
+    pub fn covers(&self, start: u64, end: u64) -> bool {
+        let mut address = start;
+        while address < end {
+            match self.area_at(address) {
+                Some((_, area)) => address = area.end,
+                None => return false,
+            }
+        }
+        true
+    }
+
     /// `madvise(MADV_DONTNEED)`: drops the pages of `start..end`, keeping
     /// the areas. The next access gets a fresh page: zeros for private
     /// memory, the file's contents for a file mapping (shared memory keeps
