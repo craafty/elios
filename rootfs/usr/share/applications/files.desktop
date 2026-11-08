@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Files
+Comment=Browse, copy and move files
+Exec=files
+Categories=System;FileManager;

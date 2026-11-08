@@ -15,6 +15,7 @@
 
 extern crate alloc;
 
+mod apps;
 mod keymap;
 mod render;
 mod server;

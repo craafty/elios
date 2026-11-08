@@ -1,13 +1,15 @@
 //! The desktop's shell: how windows are arranged, drawn and given input.
 //!
-//! It's deliberately simple. A bar along the top has buttons to start a
-//! terminal, the file explorer and Firefox, a tab per window, and a clock. Every window fills
+//! It's deliberately simple. A bar along the top has the app menu (every
+//! installed program with a `.desktop` file, see `apps.rs`), buttons to
+//! start a terminal, the file explorer and (once it's added) Firefox, a
+//! tab per window, and a clock. Every window fills
 //! the rest of the screen (maximized, so toolkits leave out their shadows
 //! and rounded corners), and the focused one is on top; dialogs (windows
 //! with a parent) float, centered, at the size they choose. Popup menus go
 //! where their positioner says, moved to stay on screen.
 //!
-//! Shortcuts: Super+Enter a terminal, Super+E files, Super+F Firefox, Super+Tab the next
+//! Shortcuts: Super alone opens the app menu, Super+Enter a terminal, Super+E files, Super+F Firefox, Super+Tab the next
 //! window, Super+Q closes a window, Ctrl+Alt+Backspace quits the desktop.
 
 use alloc::collections::BTreeMap;
@@ -15,6 +17,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use crate::apps::{self, App};
 use crate::keymap;
 use crate::render::{self, Font, Rect, Screen};
 use crate::server::{Action, Client, Kind, SurfaceRef};
@@ -45,6 +48,7 @@ enum Launcher {
 /// Something clickable on the bar.
 #[derive(Clone, Copy)]
 enum BarItem {
+    Apps,
     Launch(Launcher),
     Window(SurfaceRef),
     Close(SurfaceRef),
@@ -80,7 +84,30 @@ pub struct Desktop {
     pub running: bool,
     children: Vec<u32>,
     clock: String,
+    /// The data source on the clipboard: (client, source id).
+    selection: Option<(u32, u32)>,
+    menu: Option<AppMenu>,
+    /// Super is down and nothing else was pressed with it (releasing it
+    /// then opens the menu).
+    super_alone: bool,
+    /// Whether Firefox is installed (it gets a bar button), checked every
+    /// few seconds.
+    browser_installed: bool,
+    ticks: u32,
+    /// The status area left of the clock (the network, for now).
+    status: String,
 }
+
+/// The open app menu, below its bar button.
+struct AppMenu {
+    apps: Vec<App>,
+    rect: Rect,
+    /// The row under the pointer or chosen with the arrow keys.
+    selected: Option<usize>,
+}
+
+const MENU_ROW: i32 = 30;
+const MENU_PADDING: i32 = 6;
 
 impl Desktop {
     pub fn new(screen: Screen, font: Font) -> Self {
@@ -93,6 +120,12 @@ impl Desktop {
             popups: Vec::new(),
             awaiting_configure: Vec::new(),
             focus: None,
+            selection: None,
+            menu: None,
+            super_alone: false,
+            browser_installed: browser_path().is_some(),
+            ticks: 0,
+            status: apps::network_status(),
             pointer,
             pointer_focus: None,
             cursor: None,
@@ -165,6 +198,69 @@ impl Desktop {
             Action::NewKeyboard(keyboard) => self.new_keyboard(client, keyboard),
             Action::NewPointer => self.update_pointer_focus(),
             Action::NewOutput(output, version) => self.describe_output(client, output, version),
+            Action::SetSelection(source) => self.set_selection(source.map(|source| (client, source))),
+            Action::SourceDestroyed(source) => {
+                if self.selection == Some((client, source)) {
+                    self.set_selection(None);
+                }
+            }
+            Action::Receive(mime, fd) => self.receive(&mime, fd),
+            Action::NewDataDevice => {
+                if self.focus.is_some_and(|(owner, _)| owner == client) {
+                    self.offer_selection(client);
+                }
+            }
+        }
+    }
+
+    // ----- The clipboard -----
+
+    /// Puts a data source on the clipboard (the old one is told it was
+    /// replaced) and tells the focused client.
+    fn set_selection(&mut self, selection: Option<(u32, u32)>) {
+        if self.selection == selection {
+            return;
+        }
+        if let Some((client, source)) = self.selection {
+            // cancelled
+            self.send(client, Outgoing::new(source, 2));
+        }
+        self.selection = selection;
+        if let Some((client, _)) = self.focus {
+            self.offer_selection(client);
+        }
+    }
+
+    /// Tells a client what the clipboard holds: a fresh data offer for each
+    /// of its data devices, listing the MIME types, then `selection`.
+    fn offer_selection(&mut self, client: u32) {
+        let mimes = self.selection.and_then(|(owner, source)| self.clients.get(&owner)?.sources.get(&source).cloned());
+        let Some(target) = self.clients.get_mut(&client) else { return };
+        for (device, version) in target.objects_of(Kind::DataDevice) {
+            let Some(mimes) = &mimes else {
+                target.send(Outgoing::new(device, 5).uint(0));
+                continue;
+            };
+            let offer = target.new_server_object(Kind::DataOffer, version);
+            // data_offer(id), then the offer's MIME types, then selection.
+            target.send(Outgoing::new(device, 0).uint(offer));
+            for mime in mimes {
+                target.send(Outgoing::new(offer, 0).string(mime));
+            }
+            target.send(Outgoing::new(device, 5).uint(offer));
+        }
+    }
+
+    /// Asks the clipboard's owner to write its data into `fd`.
+    fn receive(&mut self, mime: &str, fd: i32) {
+        match self.selection {
+            // send(mime type, fd); the descriptor is closed once it's sent.
+            Some((client, source)) if self.clients.contains_key(&client) => {
+                self.send(client, Outgoing::new(source, 1).string(mime).fd(fd));
+            }
+            _ => {
+                let _ = eli::io::close(fd);
+            }
         }
     }
 
@@ -311,6 +407,15 @@ impl Desktop {
 
     /// Everything of a client that disconnected.
     pub fn client_gone(&mut self, client: u32) {
+        if self.selection.is_some_and(|(owner, _)| owner == client) {
+            // Nobody to tell it was cancelled.
+            self.selection = None;
+            if let Some((focused, _)) = self.focus
+                && focused != client
+            {
+                self.offer_selection(focused);
+            }
+        }
         self.windows.retain(|&(owner, _)| owner != client);
         self.popups.retain(|&(owner, _)| owner != client);
         self.awaiting_configure.retain(|&(owner, _)| owner != client);
@@ -499,6 +604,10 @@ impl Desktop {
             }
         }
         if let Some((client, surface)) = focus {
+            // A client that gets the keyboard learns what the clipboard holds.
+            if old.is_none_or(|(old_client, _)| old_client != client) {
+                self.offer_selection(client);
+            }
             // A window that gets the keyboard comes to the front.
             if let Some(index) = self.windows.iter().position(|&window| window == (client, surface)) {
                 let window = self.windows.remove(index);
@@ -554,6 +663,7 @@ impl Desktop {
         if !fullscreen_top {
             self.draw_bar(area);
         }
+        self.draw_menu(area);
         self.draw_cursor(area);
         self.screen.present();
     }
@@ -583,11 +693,16 @@ impl Desktop {
         self.screen.fill(Rect::new(0, BAR_HEIGHT - 1, width, 1), BAR_LINE);
         self.bar.clear();
         let text_y = (BAR_HEIGHT - self.font.line_height) / 2;
-        self.screen.text(&mut self.font, 10, text_y, "eliOS", TEXT, clip);
-        let mut x = 10 + self.font.width("eliOS") + 12;
-        for (label, launcher) in
-            [("Terminal", Launcher::Terminal), ("Files", Launcher::Files), ("Firefox", Launcher::Browser)]
-        {
+        let apps = Rect::new(4, 4, self.font.width("eliOS") + 16, BAR_HEIGHT - 8);
+        self.screen.fill(apps, if self.menu.is_some() { HIGHLIGHT } else { BAR_COLOR });
+        self.screen.text(&mut self.font, apps.x + 8, text_y, "eliOS", TEXT, clip);
+        self.bar.push((apps, BarItem::Apps));
+        let mut x = apps.x + apps.width + 8;
+        let mut launchers = alloc::vec![("Terminal", Launcher::Terminal), ("Files", Launcher::Files)];
+        if self.browser_installed {
+            launchers.push(("Firefox", Launcher::Browser));
+        }
+        for (label, launcher) in launchers {
             let rect = Rect::new(x, 4, self.font.width(label) + 16, BAR_HEIGHT - 8);
             self.screen.fill(rect, BUTTON);
             self.screen.text(&mut self.font, x + 8, text_y, label, TEXT, clip);
@@ -598,7 +713,12 @@ impl Desktop {
         // A tab per window (dialogs belong to their parents).
         let windows: Vec<SurfaceRef> = self.windows.iter().copied().filter(|&w| !self.is_dialog(w)).collect();
         let clock_width = self.font.width("00:00") + 24;
-        let space = (width - x - clock_width).max(0);
+        let mut status = self.status.clone();
+        while self.font.width(&status) > 240 {
+            status.pop();
+        }
+        let status_width = if status.is_empty() { 0 } else { self.font.width(&status) + 24 };
+        let space = (width - x - clock_width - status_width).max(0);
         let tab_width = if windows.is_empty() { 0 } else { (space / windows.len() as i32).min(240) };
         for window in windows {
             let title = self
@@ -621,8 +741,112 @@ impl Desktop {
             self.bar.push((rect, BarItem::Window(window)));
             x += tab_width;
         }
+        let status_x = width - clock_width - status_width + 8;
+        self.screen.text(&mut self.font, status_x, text_y, &status, DIM_TEXT, clip);
         let clock = self.clock.clone();
         self.screen.text(&mut self.font, width - clock_width + 8, text_y, &clock, TEXT, clip);
+    }
+
+    fn draw_menu(&mut self, clip: Rect) {
+        let Some(menu) = &self.menu else { return };
+        let rect = menu.rect;
+        if rect.intersect(&clip).is_empty() {
+            return;
+        }
+        self.screen.fill(rect, BAR_LINE);
+        let inside = Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2);
+        self.screen.fill(inside, BAR_COLOR);
+        let names: Vec<String> = menu.apps.iter().map(|app| app.name.clone()).collect();
+        let selected = menu.selected;
+        if names.is_empty() {
+            let y = rect.y + MENU_PADDING + (MENU_ROW - self.font.line_height) / 2;
+            self.screen.text(&mut self.font, rect.x + 14, y, "No apps installed", DIM_TEXT, clip);
+        }
+        for (index, name) in names.iter().enumerate() {
+            let row = Rect::new(rect.x + 4, rect.y + MENU_PADDING + index as i32 * MENU_ROW, rect.width - 8, MENU_ROW);
+            if selected == Some(index) {
+                self.screen.fill(row, HIGHLIGHT);
+            }
+            let y = row.y + (MENU_ROW - self.font.line_height) / 2;
+            self.screen.text(&mut self.font, row.x + 10, y, name, TEXT, clip);
+        }
+    }
+
+    /// Opens the app menu (or closes it if it's open).
+    fn toggle_menu(&mut self) {
+        if let Some(menu) = self.menu.take() {
+            self.screen.damage(menu.rect);
+            self.screen.damage(Rect::new(0, 0, self.screen.width, BAR_HEIGHT));
+            return;
+        }
+        let apps = apps::list();
+        let widest = apps.iter().map(|app| self.font.width(&app.name)).max().unwrap_or(0);
+        let width = (widest + 40).max(self.font.width("No apps installed") + 28).max(220);
+        let rows = apps.len().max(1) as i32;
+        let height = (rows * MENU_ROW + 2 * MENU_PADDING).min(self.screen.height - BAR_HEIGHT - 8);
+        let rect = Rect::new(4, BAR_HEIGHT, width, height);
+        self.menu = Some(AppMenu { apps, rect, selected: None });
+        self.screen.damage(rect);
+        self.screen.damage(Rect::new(0, 0, self.screen.width, BAR_HEIGHT));
+        self.browser_installed = browser_path().is_some();
+    }
+
+    /// The menu row at a point on screen.
+    fn menu_row(&self, x: i32, y: i32) -> Option<usize> {
+        let menu = self.menu.as_ref()?;
+        if !menu.rect.contains(x, y) || y < menu.rect.y + MENU_PADDING {
+            return None;
+        }
+        let index = ((y - menu.rect.y - MENU_PADDING) / MENU_ROW) as usize;
+        (index < menu.apps.len()).then_some(index)
+    }
+
+    fn select_in_menu(&mut self, selected: Option<usize>) {
+        if let Some(menu) = &mut self.menu
+            && menu.selected != selected
+        {
+            menu.selected = selected;
+            let rect = menu.rect;
+            self.screen.damage(rect);
+        }
+    }
+
+    /// Starts the menu's chosen app and closes the menu.
+    fn choose_in_menu(&mut self, index: usize) {
+        let Some(menu) = self.menu.as_ref() else { return };
+        let Some(app) = menu.apps.get(index) else { return };
+        let (command, terminal) = (app.command.clone(), app.terminal);
+        self.toggle_menu();
+        let (program, arguments) = if terminal {
+            let mut arguments = alloc::vec![String::from("-e")];
+            arguments.extend(command);
+            (String::from("term"), arguments)
+        } else {
+            (command[0].clone(), command[1..].to_vec())
+        };
+        match eli::process::find_program(&program) {
+            Some(path) => self.run(&path, &arguments),
+            None => eli::eprintln!("desktop: {program} isn't installed"),
+        }
+    }
+
+    /// Keys while the menu is open: arrows choose, Enter starts, Escape
+    /// closes; others are swallowed.
+    fn menu_key(&mut self, code: u32) {
+        let Some(menu) = &self.menu else { return };
+        let count = menu.apps.len();
+        let selected = menu.selected;
+        match code {
+            1 => self.toggle_menu(),
+            28 | 96 => {
+                if let Some(index) = selected {
+                    self.choose_in_menu(index);
+                }
+            }
+            103 if count > 0 => self.select_in_menu(Some(selected.map_or(count - 1, |i| (i + count - 1) % count))),
+            108 if count > 0 => self.select_in_menu(Some(selected.map_or(0, |i| (i + 1) % count))),
+            _ => {}
+        }
     }
 
     fn cursor_rect(&self) -> Rect {
@@ -692,6 +916,16 @@ impl Desktop {
             self.clock = clock;
             self.screen.damage(Rect::new(self.screen.width - 80, 0, 80, BAR_HEIGHT));
         }
+        self.ticks = self.ticks.wrapping_add(1);
+        if self.ticks.is_multiple_of(120) {
+            let installed = browser_path().is_some();
+            let status = apps::network_status();
+            if installed != self.browser_installed || status != self.status {
+                self.browser_installed = installed;
+                self.status = status;
+                self.screen.damage(Rect::new(0, 0, self.screen.width, BAR_HEIGHT));
+            }
+        }
         self.repaint();
         self.frame_done();
         // Programs that ended.
@@ -708,6 +942,9 @@ impl Desktop {
         let fullscreen_top =
             self.windows.last().and_then(|&w| self.surface(w)).and_then(|s| s.toplevel()).is_some_and(|t| t.fullscreen);
         if y < BAR_HEIGHT && !fullscreen_top && self.popups.is_empty() {
+            return None;
+        }
+        if self.menu.as_ref().is_some_and(|menu| menu.rect.contains(x, y)) {
             return None;
         }
         let stack: Vec<SurfaceRef> = self.windows.iter().chain(self.popups.iter()).copied().collect();
@@ -791,6 +1028,10 @@ impl Desktop {
         self.damage_cursor();
         self.update_pointer_focus();
         let (px, py) = (self.pointer.0 as i32, self.pointer.1 as i32);
+        if self.menu.is_some() {
+            let row = self.menu_row(px, py);
+            self.select_in_menu(row);
+        }
         if let Some(((client, _), local_x, local_y)) = self.surface_at(px, py)
             && self.pointer_focus.is_some_and(|(owner, _)| owner == client)
         {
@@ -806,6 +1047,24 @@ impl Desktop {
             self.buttons_down = self.buttons_down.saturating_sub(1);
         }
         let (x, y) = (self.pointer.0 as i32, self.pointer.1 as i32);
+        self.super_alone = false;
+        if pressed && self.buttons_down == 1 && self.menu.is_some() {
+            let in_menu = self.menu.as_ref().is_some_and(|menu| menu.rect.contains(x, y));
+            if in_menu {
+                if let Some(index) = self.menu_row(x, y) {
+                    self.choose_in_menu(index);
+                }
+                return;
+            }
+            // A click elsewhere closes it (and on the eliOS button, only that).
+            self.toggle_menu();
+            if self.bar.iter().any(|(rect, item)| matches!(item, BarItem::Apps) && rect.contains(x, y)) {
+                return;
+            }
+        }
+        if !pressed && self.menu.as_ref().is_some_and(|menu| menu.rect.contains(x, y)) {
+            return;
+        }
         if pressed && self.buttons_down == 1 {
             // A click outside a client's popups closes them.
             if !self.popups.is_empty() {
@@ -885,6 +1144,7 @@ impl Desktop {
     fn click_bar(&mut self, x: i32, y: i32) {
         let item = self.bar.iter().find(|(rect, _)| rect.contains(x, y)).map(|&(_, item)| item);
         match item {
+            Some(BarItem::Apps) => self.toggle_menu(),
             Some(BarItem::Launch(launcher)) => self.launch(launcher),
             Some(BarItem::Window(window)) => self.set_keyboard_focus(Some(window)),
             Some(BarItem::Close(window)) => self.close(window),
@@ -917,6 +1177,20 @@ impl Desktop {
         }
         if code == 58 && pressed {
             self.locked ^= keymap::LOCK;
+        }
+        if code == 125 || code == 126 {
+            if pressed {
+                self.super_alone = true;
+            } else if core::mem::take(&mut self.super_alone) {
+                self.toggle_menu();
+            }
+        } else if pressed {
+            self.super_alone = false;
+        }
+        if pressed && bit == 0 && self.menu.is_some() {
+            self.menu_key(code);
+            self.swallowed.push(code);
+            return;
         }
         if pressed {
             if !self.keys_down.contains(&code) {
@@ -980,7 +1254,7 @@ impl Desktop {
         let candidates: &[&str] = match launcher {
             Launcher::Terminal => &["term", "foot"],
             Launcher::Files => &["files"],
-            Launcher::Browser => &["firefox", "firefox-esr"],
+            Launcher::Browser => &BROWSERS,
         };
         let Some(path) = candidates.iter().find_map(|name| eli::process::find_program(name)) else {
             eli::eprintln!("desktop: none of {} is installed (try: eli add {})", candidates.join(", "), candidates[0]);
@@ -1004,6 +1278,12 @@ impl Desktop {
             Err(error) => eli::eprintln!("desktop: can't start {path}: {error}"),
         }
     }
+}
+
+const BROWSERS: [&str; 2] = ["firefox", "firefox-esr"];
+
+fn browser_path() -> Option<String> {
+    BROWSERS.iter().find_map(|name| eli::process::find_program(name))
 }
 
 /// sqrt(x² + y²), without a maths library.

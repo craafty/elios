@@ -110,13 +110,18 @@ desktop term                  # the desktop, with a terminal in it
 
 `term` is eliOS's own terminal (xterm-compatible: 256 colours and true
 colour, mouse reporting, an alternate screen for `vi` and `top`, a 5000-line
-scrollback on Shift+PgUp, Ctrl+Shift+C/V to copy and paste, Ctrl+= and
+scrollback on Shift+PgUp, Ctrl+Shift+C/V to copy and paste through the
+desktop's clipboard, which Firefox and other programs share, Ctrl+= and
 Ctrl+- for the font size). `files` is the file explorer: places (home,
 the root, every disk and USB stick) in a sidebar, sortable columns, a path
 bar you can type into, and rename, new folder, copy, cut, paste and delete
 from the right-click menu or the keyboard (F2, Delete, Ctrl+C/X/V);
-programs and text files open in a terminal. The bar's buttons start a
-terminal, the file explorer or Firefox; Super+Enter opens a terminal,
+programs and text files open in a terminal; copying a file also puts its
+path on the clipboard. The eliOS button (or the Super key on its own) opens
+the app menu: every installed program with a `.desktop` file, so Firefox
+appears there, and gets its own bar button, once it's added. The bar also
+shows the network (the Wi-Fi network's name, Wired or Offline) and the
+time. Super+Enter opens a terminal,
 Super+E the file explorer, Super+Tab switches windows, Super+Q closes one, and
 Ctrl+Alt+Backspace goes back to the text console.
 
@@ -348,8 +353,10 @@ eliOS's own rasterizer in `truetype/`.
       Alpine's Wayland programs
 - [ ] **Our own desktop programs:** a login screen with a Text/Desktop
       choice (done), a TrueType rasterizer and bundled font (done), a
-      widget library (`user/ui`, done), a terminal (`term`, done), a file explorer (`files`, done), then a
-      clipboard and an app menu (Firefox appears once it's added)
+      widget library (`user/ui`, done), a terminal (`term`, done), a file
+      explorer (`files`, done), a shared clipboard, an app menu (Firefox
+      appears once it's added) and a status area (done); next, a better
+      touchpad and TrackPoint on the laptop
 - [x] **Firefox:** Alpine's Firefox browses HTTPS sites in the desktop
       (package triggers, `mremap`, `statx`, `prctl` and `arch_prctl`
       additions, `/proc/sys`, namespaces refused so sandboxes fall back),

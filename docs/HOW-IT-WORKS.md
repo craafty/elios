@@ -2583,9 +2583,21 @@ It's one event loop around `epoll`, with a 60 Hz timer for redrawing.
   them as `SCM_RIGHTS`, in the order messages use them.
 - **Objects** (`server.rs`): each client has a table of objects by id. The
   globals offered are `wl_compositor`, `wl_subcompositor`, `wl_shm`,
-  `wl_seat`, `wl_output`, `xdg_wm_base` and a stub
-  `wl_data_device_manager`. A client's shared memory pools are mapped
-  (and remapped when they grow); buffers are views into them.
+  `wl_seat`, `wl_output`, `xdg_wm_base` and `wl_data_device_manager`.
+  A client's shared memory pools are mapped (and remapped when they
+  grow); buffers are views into them.
+- **The clipboard** (Wayland's data devices; copying and pasting, no
+  dragging yet): a program that copies makes a data source listing the
+  MIME types it can give and sets it as the selection. The desktop keeps
+  only *which* source holds the clipboard, never the data: whenever a
+  client gets the keyboard (and when the selection changes) it is sent a
+  fresh data offer with those MIME types. Pasting is `receive(type, fd)`
+  with the write end of a pipe; the desktop passes the descriptor on to
+  the source's owner as `send(type, fd)`, which writes the data and
+  closes it, so the bytes go from program to program without passing
+  through the desktop. Copying again cancels the old source. This is the
+  protocol GTK, Firefox and `wl-copy` speak, so they share the clipboard
+  with our programs.
 - **Surfaces** (`surface.rs`): changes are pending until a commit applies
   them all at once. A committed buffer is *copied* into the surface and
   released straight away, so clients can reuse it and the desktop never
@@ -2594,8 +2606,9 @@ It's one event loop around `epoll`, with a 60 Hz timer for redrawing.
   unchanged), and only that part of the screen is redrawn: Firefox
   scrolling a page redraws a strip, not the window. Subsurfaces (Firefox draws its
   content into one) follow the parent's commits when synchronized.
-- **The shell** (`shell.rs`): a bar along the top (buttons for a terminal
-  and Firefox, a tab per window, a clock); every window maximized below
+- **The shell** (`shell.rs`): a bar along the top (the app menu, buttons
+  for a terminal, the file explorer and, once it's installed, Firefox, a
+  tab per window, the network status and a clock); every window maximized below
   it, so toolkits leave out shadows and rounded corners; dialogs centered;
   popup menus where their positioner says, slid to stay on screen; the
   focused window on top. Frame callbacks are answered after each redraw.
@@ -2611,7 +2624,21 @@ It's one event loop around `epoll`, with a 60 Hz timer for redrawing.
   font (below), each character rasterized once and kept, and blended onto
   the background by its coverage.
 
-Shortcuts: Super+Enter a terminal, Super+F Firefox, Super+Tab the next
+- **The app menu** (`apps.rs`): the eliOS button, or Super pressed and
+  released alone, lists every `.desktop` file in `/usr/share/applications`
+  (freedesktop.org's format: `Name=`, `Exec=` without its `%U`-style field
+  codes, `Terminal=` apps run in `term -e`, `NoDisplay`/`Hidden` ones and
+  ones whose program isn't installed are left out). It's read again each
+  time the menu opens, so a package added with `eli add` (whose files are
+  linked into `/usr`) shows up straight away. Our own programs install
+  `.desktop` files too. The arrows and Enter choose, Escape closes.
+- **The status area**: the Wi-Fi network's name, "Wired" or "Offline",
+  from the default route in `/proc/net/route` and `/proc/wifi`, checked
+  every two seconds (as is whether Firefox is installed, for its button).
+  There's no battery yet: reading one needs ACPI's AML interpreter.
+
+Shortcuts: Super alone the app menu, Super+Enter a terminal, Super+E the
+file explorer, Super+F Firefox, Super+Tab the next
 window, Super+Q closes the front one, Ctrl+Alt+Backspace quits back to the
 text console. `desktop PROGRAM` starts a program once it's up.
 
@@ -2638,6 +2665,10 @@ memory fills and cached glyphs.
   events: resize, close, focus, keys, pointer moves, button presses with
   a click count (double clicks: within 400 ms and 4 px), scroll lines.
   Key repeat happens on the client side, at the rate the compositor gives.
+  `set_clipboard(text)` offers text on the desktop's clipboard (under
+  the usual text MIME types, written to whoever pastes); `clipboard()`
+  returns what's on it, reading the pasting pipe with a 2-second limit so
+  a stuck source can't freeze the program.
 - **Keys** (`keys.rs`): evdev key codes are turned into characters with
   a US layout table of eliOS's own, rather than compiling the XKB
   keymap the compositor sends; modifiers arrive as XKB's bit masks.
@@ -2701,8 +2732,11 @@ package and a font from the network before the desktop had a terminal.
   mouse selects (double click for words, triple for lines) unless the
   program asked for mouse reports; Shift overrides that. The wheel scrolls
   the scrollback, or sends arrow keys to full-screen programs.
-- **Not yet:** the copy and paste buffer is inside each `term`; a
-  clipboard shared between programs comes with the desktop's.
+- **Copying:** Ctrl+Shift+C puts the selection on the desktop's
+  clipboard and Ctrl+Shift+V (or Shift+Insert) pastes from it, whichever
+  program copied. The latest selection is also kept inside `term` and
+  pasted by the middle button, like X's primary selection, so selecting
+  text doesn't overwrite what's on the clipboard.
 
 ### The file explorer (`user/files`)
 

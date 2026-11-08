@@ -120,6 +120,9 @@ struct Files {
     forward: Vec<String>,
     /// Copied or cut (true) with Ctrl+C or Ctrl+X: a full path.
     clipboard: Option<(String, bool)>,
+    /// Text for the desktop's clipboard (a copied file's path, so it can be
+    /// pasted into a terminal).
+    to_clipboard: Option<String>,
     /// Said in the status line until the next folder change.
     message: Option<String>,
     /// What's been typed to select by name, and when the last letter came.
@@ -408,6 +411,7 @@ impl Files {
                         if cut { "cut" } else { "copied" },
                         folder::base_name(&path)
                     ));
+                    self.to_clipboard = Some(path.clone());
                     self.clipboard = Some((path, cut));
                 }
             }
@@ -1007,6 +1011,7 @@ fn main() -> i32 {
         back: Vec::new(),
         forward: Vec::new(),
         clipboard: None,
+        to_clipboard: None,
         message: None,
         typed: String::new(),
         typed_at: 0,
@@ -1050,6 +1055,9 @@ fn main() -> i32 {
                 Event::Scroll { lines } => redraw = files.scroll(lines),
                 Event::Readable(_) => redraw = false,
             }
+        }
+        if let Some(text) = files.to_clipboard.take() {
+            window.set_clipboard(&text);
         }
         let wanted = format!("{} — Files", folder::base_name(&files.path));
         if wanted != title {

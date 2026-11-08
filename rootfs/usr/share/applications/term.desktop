@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Comment=A command line
+Exec=term
+Categories=System;TerminalEmulator;

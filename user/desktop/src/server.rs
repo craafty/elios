@@ -6,8 +6,8 @@
 //! and draws.
 //!
 //! Globals offered: wl_compositor, wl_subcompositor, wl_shm, wl_seat,
-//! wl_output, xdg_wm_base and wl_data_device_manager (a stub, enough for
-//! toolkits that insist on one).
+//! wl_output, xdg_wm_base and wl_data_device_manager (the clipboard:
+//! copying and pasting, not dragging).
 
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
@@ -48,6 +48,8 @@ pub enum Kind {
     DataDeviceManager,
     DataDevice,
     DataSource,
+    /// What the clipboard holds, as offered to one client (created by us).
+    DataOffer,
 }
 
 pub struct Object {
@@ -148,6 +150,11 @@ pub struct Client {
     pub applied: Vec<(u32, Option<Rect>)>,
     /// A subsurface moved: its old place needs redrawing too.
     pub moved: bool,
+    /// The kinds of data (MIME types) each data source offers.
+    pub sources: BTreeMap<u32, Vec<String>>,
+    /// The next id for an object we create (ids from 0xFF000000 are the
+    /// server's).
+    next_server_id: u32,
 }
 
 impl Client {
@@ -164,7 +171,17 @@ impl Client {
             positioners: BTreeMap::new(),
             applied: Vec::new(),
             moved: false,
+            sources: BTreeMap::new(),
+            next_server_id: 0xFF00_0000,
         }
+    }
+
+    /// Makes an object of ours in the client's table, returning its id.
+    pub fn new_server_object(&mut self, kind: Kind, version: u32) -> u32 {
+        let id = self.next_server_id;
+        self.next_server_id += 1;
+        self.objects.insert(id, Object { kind, version });
+        id
     }
 
     pub fn send(&mut self, event: Outgoing) {
@@ -231,6 +248,15 @@ pub enum Action {
     /// New output: describe the screen.
     NewOutput(u32, u32),
     NewPointer,
+    /// The client put a data source (or nothing) on the clipboard.
+    SetSelection(Option<u32>),
+    /// A data source was destroyed.
+    SourceDestroyed(u32),
+    /// The client wants the clipboard's data of a MIME type written to a
+    /// file (the write end of a pipe).
+    Receive(String, i32),
+    /// A new data device: tell it what the clipboard holds.
+    NewDataDevice,
 }
 
 impl Client {
@@ -473,29 +499,60 @@ impl Client {
                 _ => {}
             },
             Kind::DataDeviceManager => match opcode {
+                // create_data_source(id)
                 0 => {
                     let new = args.uint()?;
                     self.add(new, Kind::DataSource, version)?;
+                    self.sources.insert(new, Vec::new());
                 }
+                // get_data_device(id, seat)
                 1 => {
                     let new = args.uint()?;
                     self.add(new, Kind::DataDevice, version)?;
+                    return Ok(Action::NewDataDevice);
                 }
                 _ => self.remove(id),
             },
-            Kind::DataDevice => {
-                if opcode == 2 {
-                    self.remove(id);
+            Kind::DataDevice => match opcode {
+                // set_selection(source, serial)
+                1 => {
+                    let source = args.uint()?;
+                    return Ok(Action::SetSelection((source != 0).then_some(source)));
                 }
-            }
-            Kind::DataSource => {
-                if opcode == 1 {
-                    self.remove(id);
-                } else if opcode == 0 {
-                    // offer(mime type): nothing reads the clipboard yet.
-                    let _ = args.string()?;
+                // release (start_drag, 0, is ignored: no dragging yet)
+                2 => self.remove(id),
+                _ => {}
+            },
+            Kind::DataSource => match opcode {
+                // offer(mime type)
+                0 => {
+                    if let Some(mime) = args.string()?
+                        && let Some(mimes) = self.sources.get_mut(&id)
+                        && !mimes.contains(&mime)
+                    {
+                        mimes.push(mime);
+                    }
                 }
-            }
+                // destroy
+                1 => {
+                    self.sources.remove(&id);
+                    self.remove(id);
+                    return Ok(Action::SourceDestroyed(id));
+                }
+                _ => {}
+            },
+            Kind::DataOffer => match opcode {
+                // receive(mime type, fd)
+                1 => {
+                    let mime = args.string()?.unwrap_or_default();
+                    let fd = self.connection.take_fd().ok_or(Broken::Protocol("receive without a file"))?;
+                    return Ok(Action::Receive(mime, fd));
+                }
+                // destroy
+                2 => self.remove(id),
+                // accept, finish, set_actions: for dragging only.
+                _ => {}
+            },
         }
         Ok(Action::None)
     }

@@ -111,7 +111,9 @@ struct Terminal {
     selection: Option<Selection>,
     /// The left button is down, extending the selection.
     selecting: bool,
-    clipboard: String,
+    /// The latest selection, which the middle button pastes (like X's
+    /// primary selection; the desktop's clipboard is Ctrl+Shift+C).
+    primary: String,
     focused: bool,
     /// Each row as last drawn (`None`: has to be drawn).
     shown: Vec<Option<Row>>,
@@ -177,7 +179,7 @@ impl Terminal {
             view: 0,
             selection: None,
             selecting: false,
-            clipboard: String::new(),
+            primary: String::new(),
             focused: true,
             shown: Vec::new(),
             reported_button: None,
@@ -299,11 +301,13 @@ impl Terminal {
         let control_shift = modifiers.control && modifiers.shift;
         match key {
             Key::Char('C' | 'c') if control_shift => {
-                self.copy_selection();
+                if let Some(text) = self.selected_text() {
+                    self.window.set_clipboard(&text);
+                }
                 return;
             }
-            Key::Char('V' | 'v') if control_shift => return self.paste(),
-            Key::Insert if modifiers.shift => return self.paste(),
+            Key::Char('V' | 'v') if control_shift => return self.paste_clipboard(),
+            Key::Insert if modifiers.shift => return self.paste_clipboard(),
             Key::PageUp if modifiers.shift => return self.scroll_view(self.screen.rows as i32 - 1),
             Key::PageDown if modifiers.shift => return self.scroll_view(-(self.screen.rows as i32 - 1)),
             Key::Char('=' | '+') if modifiers.control => return self.set_font_size(self.font_size + 1.0),
@@ -320,14 +324,20 @@ impl Terminal {
         }
     }
 
-    fn paste(&mut self) {
-        if self.clipboard.is_empty() {
+    fn paste_clipboard(&mut self) {
+        if let Some(text) = self.window.clipboard() {
+            self.paste(&text);
+        }
+    }
+
+    fn paste(&mut self, clipboard: &str) {
+        if clipboard.is_empty() {
             return;
         }
         // Newlines go as Enter does; escapes are dropped so pasted text
         // can't end a bracketed paste early or drive the terminal.
         let text: Vec<u8> =
-            self.clipboard.replace("\r\n", "\r").replace('\n', "\r").bytes().filter(|&byte| byte != 0x1B).collect();
+            clipboard.replace("\r\n", "\r").replace('\n', "\r").bytes().filter(|&byte| byte != 0x1B).collect();
         self.view = 0;
         if self.screen.bracketed_paste {
             self.send(b"\x1b[200~");
@@ -488,9 +498,11 @@ impl Terminal {
                 {
                     self.selection = None;
                 }
-                self.copy_selection();
+                if let Some(text) = self.selected_text() {
+                    self.primary = text;
+                }
             }
-            (Button::Middle, true) => self.paste(),
+            (Button::Middle, true) => self.paste(&self.primary.clone()),
             _ => {}
         }
     }
@@ -541,8 +553,8 @@ impl Terminal {
         column
     }
 
-    fn copy_selection(&mut self) {
-        let Some((start, end)) = self.selected_range() else { return };
+    fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selected_range()?;
         let mut text = String::new();
         for number in start.0..=end.0 {
             let Some(line) = self.line(number) else { continue };
@@ -553,9 +565,7 @@ impl Terminal {
                 text.push('\n');
             }
         }
-        if !text.is_empty() {
-            self.clipboard = text;
-        }
+        (!text.is_empty()).then_some(text)
     }
 
     // Drawing.

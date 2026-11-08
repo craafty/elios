@@ -15,6 +15,9 @@
 //!   only sends what the screen can show.
 //! - Keys repeat here, at the rate the compositor asks for, as Wayland
 //!   leaves that to clients.
+//! - The clipboard is Wayland's: [`Window::set_clipboard`] offers text
+//!   to every program (ours and others, like Firefox), and
+//!   [`Window::clipboard`] reads whatever another program offers.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
@@ -92,6 +95,12 @@ enum Object {
     Seat,
     Pointer,
     Keyboard,
+    DataDeviceManager,
+    DataDevice,
+    /// The text we put on the clipboard.
+    DataSource,
+    /// What another program put there (made by the compositor).
+    DataOffer,
     /// Anything whose events are ignored (pools, outputs).
     Other,
 }
@@ -156,7 +165,24 @@ pub struct Window {
     last_press: Option<(Button, u64, i32, i32, u32)>,
     scroll_remainder: f64,
     closed: bool,
+    data_device_manager: u32,
+    data_device: u32,
+    /// The latest key or button press's serial: setting the clipboard
+    /// quotes it, to show it was asked for.
+    input_serial: u32,
+    /// What we put on the clipboard, while it's still there.
+    copied: Option<(u32, String)>,
+    /// The clipboard's offer (from another program, or our own), with its
+    /// MIME types; and offers still being described.
+    selection: Option<u32>,
+    offers: BTreeMap<u32, Vec<String>>,
 }
+
+/// The MIME types text is offered as (the last ones are X11's names, which
+/// some programs still ask for); pasting takes the first one offered.
+const TEXT_TYPES: [&str; 5] = ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "TEXT", "STRING"];
+/// How long to wait for a program to hand over what it copied.
+const PASTE_TIMEOUT_MS: u64 = 2000;
 
 /// How close in time and place presses must be to count as one click
 /// more.
@@ -211,6 +237,12 @@ impl Window {
             last_press: None,
             scroll_remainder: 0.0,
             closed: false,
+            data_device_manager: 0,
+            data_device: 0,
+            input_serial: 0,
+            copied: None,
+            selection: None,
+            offers: BTreeMap::new(),
         };
         let registry = window.new_object(Object::Registry);
         window.send(Outgoing::new(1, 1).uint(registry));
@@ -401,6 +433,7 @@ impl Window {
                     "wl_shm" if self.shm == 0 => (Object::Shm, 1),
                     "xdg_wm_base" if self.wm_base == 0 => (Object::WmBase, 2),
                     "wl_seat" if self.seat == 0 => (Object::Seat, 5),
+                    "wl_data_device_manager" if self.data_device_manager == 0 => (Object::DataDeviceManager, 3),
                     _ => return Ok(()),
                 };
                 let version = version.min(wanted);
@@ -410,8 +443,10 @@ impl Window {
                     Object::Compositor => self.compositor = id,
                     Object::Shm => self.shm = id,
                     Object::WmBase => self.wm_base = id,
+                    Object::DataDeviceManager => self.data_device_manager = id,
                     _ => self.seat = id,
                 }
+                self.get_data_device();
             }
             (Object::Sync, 0) => self.syncs_done += 1,
             (Object::Frame, 0) => {
@@ -469,6 +504,50 @@ impl Window {
                     self.keyboard = self.new_object(Object::Keyboard);
                     self.send(Outgoing::new(self.seat, 1).uint(self.keyboard));
                 }
+                self.get_data_device();
+            }
+            // data_offer(id): a new offer, described by the events after.
+            (Object::DataDevice, 0) => {
+                let offer = args.uint()?;
+                self.objects.insert(offer, Object::DataOffer);
+                self.offers.insert(offer, Vec::new());
+            }
+            // selection(offer or null): what the clipboard holds now.
+            (Object::DataDevice, 5) => {
+                let offer = args.uint()?;
+                if let Some(old) = self.selection.take()
+                    && old != offer
+                {
+                    self.destroy_offer(old);
+                }
+                self.selection = (offer != 0).then_some(offer);
+            }
+            // offer(mime type)
+            (Object::DataOffer, 0) => {
+                let mime = args.string()?.unwrap_or_default();
+                if let Some(mimes) = self.offers.get_mut(&message.object) {
+                    mimes.push(mime);
+                }
+            }
+            // send(mime type, fd): another program is pasting our text.
+            (Object::DataSource, 1) => {
+                let _ = args.string()?;
+                if let Some(fd) = self.connection.take_fd() {
+                    if let Some((_, text)) = &self.copied {
+                        // A reader that gives up mustn't kill us with SIGPIPE.
+                        eli::process::ignore_signal(13);
+                        let _ = eli::io::write_all(fd, text.as_bytes());
+                        eli::process::default_signal(13);
+                    }
+                    let _ = eli::io::close(fd);
+                }
+            }
+            // cancelled: something else was copied.
+            (Object::DataSource, 2) => {
+                self.send(Outgoing::new(message.object, 1));
+                if self.copied.as_ref().is_some_and(|(source, _)| *source == message.object) {
+                    self.copied = None;
+                }
             }
             (Object::Pointer, opcode) => self.pointer_event(opcode, &mut args)?,
             (Object::Keyboard, opcode) => self.keyboard_event(opcode, &mut args)?,
@@ -496,7 +575,8 @@ impl Window {
             1 => self.events.push_back(Event::PointerLeave),
             // button(serial, time, button, state)
             3 => {
-                let _ = (args.uint()?, args.uint()?);
+                self.input_serial = args.uint()?;
+                args.uint()?;
                 let (code, pressed) = (args.uint()?, args.uint()? == 1);
                 let button = match code {
                     0x110 => Button::Left,
@@ -554,7 +634,8 @@ impl Window {
             }
             // key(serial, time, key, state)
             3 => {
-                let _ = (args.uint()?, args.uint()?);
+                self.input_serial = args.uint()?;
+                args.uint()?;
                 let (code, pressed) = (args.uint()?, args.uint()? == 1);
                 if pressed {
                     let key = keys::translate(code, self.modifiers);
@@ -580,6 +661,76 @@ impl Window {
             _ => {}
         }
         Ok(())
+    }
+
+    /// The seat's data device, once there's a seat and a data device
+    /// manager (whichever the registry announces last).
+    fn get_data_device(&mut self) {
+        if self.data_device == 0 && self.seat != 0 && self.data_device_manager != 0 {
+            self.data_device = self.new_object(Object::DataDevice);
+            self.send(Outgoing::new(self.data_device_manager, 1).uint(self.data_device).uint(self.seat));
+        }
+    }
+
+    fn destroy_offer(&mut self, offer: u32) {
+        self.offers.remove(&offer);
+        if self.objects.remove(&offer).is_some() {
+            self.send(Outgoing::new(offer, 2));
+        }
+    }
+
+    /// Puts `text` on the clipboard, for every program to paste. Call it
+    /// while handling the key or click that asked for it.
+    pub fn set_clipboard(&mut self, text: &str) {
+        if self.data_device == 0 {
+            return;
+        }
+        let source = self.new_object(Object::DataSource);
+        self.send(Outgoing::new(self.data_device_manager, 0).uint(source));
+        for mime in TEXT_TYPES {
+            self.send(Outgoing::new(source, 0).string(mime));
+        }
+        self.send(Outgoing::new(self.data_device, 1).uint(source).uint(self.input_serial));
+        if let Some((old, _)) = self.copied.replace((source, String::from(text))) {
+            self.send(Outgoing::new(old, 1));
+        }
+        let _ = self.connection.flush();
+    }
+
+    /// The text on the clipboard, whichever program put it there (`None`
+    /// if it's empty or not text).
+    pub fn clipboard(&mut self) -> Option<String> {
+        // Ours: no need to ask ourselves through a pipe (which would
+        // deadlock on big texts).
+        if let Some((_, text)) = &self.copied {
+            return Some(text.clone());
+        }
+        let offer = self.selection?;
+        let mimes = self.offers.get(&offer)?;
+        let mime = TEXT_TYPES.iter().find(|mime| mimes.iter().any(|offered| offered == *mime))?;
+        let (read_end, write_end) = eli::io::pipe().ok()?;
+        // receive(mime type, fd); our copy of the write end is closed once
+        // it's sent, so the read sees the end when the other program closes.
+        self.send(Outgoing::new(offer, 1).string(mime).fd(write_end));
+        if self.connection.flush().is_err() {
+            let _ = eli::io::close(read_end);
+            return None;
+        }
+        let deadline = eli::time::monotonic_nanos() + PASTE_TIMEOUT_MS * 1_000_000;
+        let mut data = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let left = deadline.saturating_sub(eli::time::monotonic_nanos()) / 1_000_000;
+            if left == 0 || sys::poll(&[(read_end, sys::POLLIN)], left as i32)[0] == 0 {
+                break;
+            }
+            match eli::io::read(read_end, &mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(len) => data.extend_from_slice(&chunk[..len]),
+            }
+        }
+        let _ = eli::io::close(read_end);
+        Some(String::from_utf8_lossy(&data).into_owned())
     }
 
     fn resize(&mut self, width: i32, height: i32) {
