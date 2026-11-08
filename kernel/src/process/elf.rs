@@ -44,6 +44,8 @@ pub struct Program {
     /// Where the interpreter was loaded and where it starts, once loaded.
     pub interpreter_base: u64,
     pub interpreter_entry: Option<u64>,
+    /// Where the vDSO is mapped (for `AT_SYSINFO_EHDR`), or 0.
+    pub vdso: u64,
 }
 
 impl Program {
@@ -195,6 +197,7 @@ fn load_object(space: &mut AddressSpace, data: &[u8], base: Option<u64>) -> Resu
         interpreter,
         interpreter_base: 0,
         interpreter_entry: None,
+        vdso: 0,
     };
     Ok((program, end_of_image))
 }
@@ -218,6 +221,7 @@ const AT_CLKTCK: u64 = 17;
 const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
 const AT_EXECFN: u64 = 31;
+const AT_SYSINFO_EHDR: u64 = 33;
 
 /// The most argument and environment data a program can be given.
 const MAX_ARGUMENT_BYTES: usize = 128 * 1024;
@@ -267,6 +271,8 @@ pub fn build_stack(
         (AT_SECURE, u64::from(credentials.is_elevated())),
         (AT_RANDOM, random_address),
         (AT_EXECFN, execfn),
+        // Linux's vDSO entry; C libraries ignore a zero (no vDSO).
+        (AT_SYSINFO_EHDR, program.vdso),
         (AT_NULL, 0),
     ];
 

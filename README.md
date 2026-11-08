@@ -368,5 +368,8 @@ eliOS's own rasterizer in `truetype/`.
 - [x] **Sound:** an Intel HD Audio driver (codec routes found like
       Linux's generic driver, so no per-laptop tables) behind Linux's
       ALSA interface, so `libasound` programs play and record
-- [ ] **Next:** the camera (for video calls), faster
-      clocks (a vDSO), Wi-Fi working on the T440p, Bluetooth
+- [x] **Faster clocks:** a vDSO, so `clock_gettime`, `gettimeofday` and
+      `time` read the TSC in the program without a system call (glibc and
+      musl both use it)
+- [ ] **Next:** the camera (for video calls), Wi-Fi working on the T440p,
+      Bluetooth

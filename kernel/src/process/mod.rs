@@ -13,6 +13,7 @@ pub mod futex;
 pub mod signal;
 pub mod timers;
 pub mod user;
+pub mod vdso;
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -334,6 +335,7 @@ fn load_image(
         elf::load_interpreter(&mut space, &mut program, &interpreter_data)?;
         space.name_unnamed(&fs::normalize(cwd, &interpreter), program.interpreter_base);
     }
+    program.vdso = vdso::map(&mut space)?;
     let stack_pointer = elf::build_stack(&mut space, &program, &arguments, environment, path, &credentials)?;
     space.set_name(stack_pointer, "[stack]".into());
     let path = full_path;
@@ -1054,7 +1056,7 @@ mod tests {
         fn linux_c_programs_pass_their_self_tests() {
             // Built by the host's C compiler, if there was one.
             for program in [
-                "ctest", "sigtest", "threadtest", "nettest", "permtest", "timertest", "memtest", "eventtest", "unixtest", "ptytest",
+                "ctest", "sigtest", "threadtest", "nettest", "permtest", "timertest", "memtest", "eventtest", "unixtest", "ptytest", "vdsotest",
                 "hello-c",
                 "hello-dynamic",
             ] {

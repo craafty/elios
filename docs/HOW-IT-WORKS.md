@@ -608,6 +608,46 @@ reads agree, so a read can't straddle an update; BCD and 12-hour formats are
 handled). Wall-clock time is that plus uptime. The clock is assumed to hold
 UTC, as on most non-Windows systems.
 
+### The vDSO: the clock without a system call (`process/vdso.rs`)
+
+Uptime is `(TSC - TSC at boot) * mult >> 32`, where `mult` is nanoseconds
+per TSC count in 32.32 fixed point, worked out once at calibration (a
+multiply rather than the division the kernel used to do). Nothing in that
+formula needs the kernel, and programs ask for the time constantly
+(Firefox thousands of times a second while a video plays), so, as on
+Linux, every program gets the formula itself: a tiny shared library, the
+vDSO, mapped at a fixed address below the stack and announced by the
+`AT_SYSINFO_EHDR` auxiliary vector entry. glibc and musl look up
+`__vdso_clock_gettime`, `__vdso_gettimeofday` and `__vdso_time` in it and
+call those instead of making system calls; with no vDSO they'd make the
+calls, so it is purely an optimization.
+
+It's two pages of a memory object, made at the first `exec`:
+
+- **`[vdso]`** (read and execute): an ELF header, a `PT_LOAD` and a
+  `PT_DYNAMIC` program header, the dynamic section, symbols (each function
+  as `__vdso_NAME`, plus a weak plain `NAME`, as Linux exports them), a
+  SysV hash table with one bucket (musl reads the symbol count from it and
+  insists on it; glibc accepts it too), the strings, and at offset 0x400
+  the code.
+- **`[vvar]`** (read-only): the TSC at boot, `mult`, and the wall-clock time
+  at boot in nanoseconds.
+
+The code is a few dozen instructions of `global_asm!` in the kernel's
+read-only data, copied into the page; it reads the parameters
+`rip`-relative, at a fixed distance from itself, so it works wherever it's
+mapped. It handles the realtime, monotonic and boot-time clocks and their
+coarse and raw variants, and makes the real system call for anything else
+(the CPU-time clocks, unknown clocks, `clock_getres`, `getcpu`). The kernel's
+own `uptime_nanos` uses the identical formula, so the system call and the
+vDSO agree to the nanosecond, and a program mixing them never sees time go
+backward. The parameters never change after boot, so there's no sequence
+counter to retry on; one would be needed if `settimeofday` or clock
+adjustment (NTP) is added. The mapping is private (copy-on-write): a
+debugger setting a breakpoint in it changes only its own copy. `vdsotest`
+finds the vDSO the way musl does and checks each function against the
+system calls.
+
 ## 8. Memory
 
 ### Physical frames (`memory/frames.rs`)

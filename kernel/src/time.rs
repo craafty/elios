@@ -21,6 +21,11 @@ static TSC_AT_BOOT: AtomicU64 = AtomicU64::new(0);
 /// Wall-clock time at boot, in seconds since the Unix epoch.
 static BOOT_UNIX_TIME: AtomicU64 = AtomicU64::new(0);
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+/// Nanoseconds per TSC count, as a 32.32 fixed-point number: uptime is
+/// `(counts * TSC_MULT) >> 32`. A multiply instead of a division, and the
+/// exact formula the vDSO uses, so the system call and vDSO clocks agree to
+/// the nanosecond.
+static TSC_MULT: AtomicU64 = AtomicU64::new(0);
 /// Timer interrupts on the boot CPU (for checking the timer's rate).
 static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 /// The APIC timer count between ticks, for starting other CPUs' timers.
@@ -46,6 +51,7 @@ pub fn init() {
     let tsc_hz = per_second(tsc_end - tsc_start);
     let apic_hz = per_second(u64::from(apic_start - apic_end));
     TSC_HZ.store(tsc_hz, Ordering::Relaxed);
+    TSC_MULT.store(((1_000_000_000u128 << 32) / u128::from(tsc_hz)) as u64, Ordering::Relaxed);
 
     interrupts::set_handler(interrupts::TIMER, on_tick);
     TIMER_PERIOD.store(apic_hz / TICK_HZ, Ordering::Relaxed);
@@ -92,12 +98,19 @@ pub fn tsc_hz() -> u64 {
 
 /// Nanoseconds since boot, or 0 before the TSC has been measured.
 pub fn uptime_nanos() -> u64 {
-    let hz = TSC_HZ.load(Ordering::Relaxed);
-    if hz == 0 {
-        return 0;
-    }
-    let elapsed = rdtsc().saturating_sub(TSC_AT_BOOT.load(Ordering::Relaxed));
-    (u128::from(elapsed) * 1_000_000_000 / u128::from(hz)) as u64
+    let elapsed = rdtsc().wrapping_sub(TSC_AT_BOOT.load(Ordering::Relaxed));
+    ((u128::from(elapsed) * u128::from(TSC_MULT.load(Ordering::Relaxed))) >> 32) as u64
+}
+
+/// What the vDSO needs to tell the time without the kernel: the TSC value
+/// uptime counts from, [`TSC_MULT`], and the wall-clock time at boot in
+/// nanoseconds. None of them change after boot.
+pub fn clock_parameters() -> [u64; 3] {
+    [
+        TSC_AT_BOOT.load(Ordering::Relaxed),
+        TSC_MULT.load(Ordering::Relaxed),
+        BOOT_UNIX_TIME.load(Ordering::Relaxed) * 1_000_000_000,
+    ]
 }
 
 /// Waits `micros` microseconds without sleeping, for hardware that needs
