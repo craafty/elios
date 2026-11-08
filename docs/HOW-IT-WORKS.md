@@ -1046,10 +1046,30 @@ the same way as a program's own (copying the page), and the kernel retries
 the write; a test forks a hundred times while another thread `read`s into
 a buffer.
 
-The alternative, used by Linux, is to let the access fault and have an
-"exception table" turn faults at known instructions into `EFAULT` errors.
-That's faster (no up-front walk) but needs careful compiler cooperation;
-the check-first approach is simple and safe for now.
+The other change is worse: another thread can *unmap* the buffer (or
+shrink it with `mremap`, or move the heap's end) while a system call is
+using it, and then there's nothing to resolve. Linux lets such accesses
+fault and has an "exception table" turn faults at its few copying
+instructions into `EFAULT` errors. eliOS can't do that: system calls use
+user buffers in place, so the faulting instruction can be anywhere (a
+file system filling a buffer, a socket copying from one, `memcpy` in
+`core`). Instead `handle_kernel_fault` (`process/mod.rs`), finding a
+not-present user page during a system call, maps a *scratch page* there:
+one zeroed frame per system call, mapped at every page it trips over,
+without the `USER` bit (so the program's own accesses still fault) and
+marked as a device page (so `munmap` and `fork` neither free nor share
+it). The access completes against the scratch frame, and when the system
+call returns, `finish_system_call` unmaps the pages, flushes the TLB,
+frees the frame and replaces the result with `EFAULT`, as Linux would
+report it. If the program maps memory there again before then (`mmap`,
+`mprotect`, `mremap`, `brk`), the address space drops the scratch pages
+in that range first, so the program never sees a scratch frame. Tests in
+`threadtest` unmap a buffer under a blocked pipe `read`, and race
+`munmap`/`mmap` against reads from `/dev/zero`.
+
+Kernel faults outside a system call (none are expected) and protection
+faults (writing to a read-only page the kernel checked as writable) still
+panic.
 
 ### Loading programs (`process/elf.rs`)
 
@@ -3311,11 +3331,9 @@ Current limits, roughly in order of how much they'd matter to a user:
   affinity, so threads move between CPUs freely.
 - **eliOS's own Rust programs are single-threaded**: libeli has no thread
   API yet (C programs have pthreads).
-- **The kernel can fault on user memory another thread unmapped**: system
-  calls check user memory before using it, so a thread that unmaps a buffer
-  while another thread's system call is using it makes the kernel fault
-  (and panic). Linux avoids this with "exception tables" that turn such
-  faults into errors; eliOS will need the same.
+- **A system call whose buffer another thread unmaps fails whole**: it
+  returns `EFAULT` even if some bytes were copied (Linux returns the
+  partial count for `read` and `write`).
 - **USB:** keyboards, mice (boot protocol only), storage and hubs; no UAS,
   the faster USB 3 storage protocol (USB 3 disks also speak Bulk-Only,
   which eliOS uses), and Bluetooth controllers are only identified. USB 3

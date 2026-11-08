@@ -113,6 +113,8 @@ pub struct AddressSpace {
     pub brk: u64,
     /// Pages currently mapped.
     resident_pages: u64,
+    /// Where scratch pages (`map_scratch_page`) are mapped.
+    scratch_pages: Vec<u64>,
 }
 
 fn page_flags(protection: u32) -> u64 {
@@ -140,7 +142,7 @@ impl AddressSpace {
     pub fn new() -> Result<Self> {
         let mut table = PageTable::new().map_err(|_| Errno::ENOMEM)?;
         table.share_kernel_half(memory::kernel_page_table_root());
-        Ok(Self { table, areas: BTreeMap::new(), brk_start: 0, brk: 0, resident_pages: 0 })
+        Ok(Self { table, areas: BTreeMap::new(), brk_start: 0, brk: 0, resident_pages: 0, scratch_pages: Vec::new() })
     }
 
     /// Physical address of the page tables, for CR3.
@@ -268,6 +270,7 @@ impl AddressSpace {
         if self.overlaps(start, end) {
             return Err(Errno::EEXIST);
         }
+        self.drop_scratch_pages(start, end);
         self.areas.insert(start, Area { end, protection, backing, name, image_base: None });
         Ok(())
     }
@@ -338,6 +341,7 @@ impl AddressSpace {
         }
         self.split_at(start);
         self.split_at(end);
+        self.drop_scratch_pages(start, end);
         let starts: Vec<u64> = self.areas.range(start..end).map(|(&s, _)| s).collect();
         for area_start in starts {
             let area = self.areas.get_mut(&area_start).unwrap();
@@ -394,6 +398,7 @@ impl AddressSpace {
         self.split_at(old_end);
         let new_end = start.checked_add(new_len).filter(|&end| end <= USER_END).ok_or(Errno::ENOMEM)?;
         if !self.overlaps(old_end, new_end) {
+            self.drop_scratch_pages(old_end, new_end);
             self.areas.get_mut(&start).expect("split above").end = new_end;
             return Ok(start);
         }
@@ -401,6 +406,7 @@ impl AddressSpace {
             return Err(Errno::ENOMEM);
         }
         let target = self.find_free(new_len).ok_or(Errno::ENOMEM)?;
+        self.drop_scratch_pages(target, target + new_len);
         let mut area = self.areas.remove(&start).expect("split above");
         area.end = target + new_len;
         self.areas.insert(target, area);
@@ -450,7 +456,18 @@ impl AddressSpace {
         let page = address & !(PAGE_SIZE - 1);
         let protection = area.protection;
         let backing = area.backing.clone();
-        if let Some(mapping) = self.table.translate(page) {
+        let existing = match self.table.translate(page) {
+            // A scratch page (`map_scratch_page`) a system call still
+            // holds, where the program has since mapped memory again: the
+            // program's memory takes the address; the system call's
+            // cleanup sees the frame isn't its own any more.
+            Some(mapping) if mapping.flags & USER == 0 => {
+                self.drop_scratch_pages(page, page + PAGE_SIZE);
+                None
+            }
+            existing => existing,
+        };
+        if let Some(mapping) = existing {
             if write && mapping.flags & COPY_ON_WRITE != 0 {
                 return match self.break_copy_on_write(page, mapping.phys, mapping.flags, protection) {
                     Ok(()) => Fault::Resolved,
@@ -547,6 +564,55 @@ impl AddressSpace {
         // Other threads may have the read-only entry cached.
         smp::flush_tlb(page, page + PAGE_SIZE);
         Ok(())
+    }
+
+    /// Maps `frame` at `page`, where nothing is mapped, for the kernel
+    /// alone (no `USER` bit, so the program still faults there). Used when
+    /// another thread unmapped memory a system call was using: see
+    /// [`super::handle_kernel_fault`]. Marked as a device page so nothing
+    /// else frees the frame.
+    pub fn map_scratch_page(&mut self, page: u64, frame: u64) -> bool {
+        if self.table.translate(page).is_some() {
+            return false;
+        }
+        if self.table.map(page, frame, PageSize::Small, WRITABLE | NO_EXECUTE | DEVICE_PAGE).is_err() {
+            return false;
+        }
+        self.resident_pages += 1;
+        self.scratch_pages.push(page);
+        true
+    }
+
+    /// Removes a scratch page, if `frame` is still what's mapped at `page`
+    /// (an `munmap` covering it may have gone first). The caller flushes
+    /// the TLB.
+    pub fn unmap_scratch_page(&mut self, page: u64, frame: u64) {
+        let Some(index) = self.scratch_pages.iter().position(|&p| p == page) else { return };
+        self.scratch_pages.swap_remove(index);
+        if self.table.translate(page).is_some_and(|mapping| mapping.phys == frame && mapping.flags & USER == 0) {
+            self.table.unmap(page);
+            self.resident_pages -= 1;
+        }
+    }
+
+    /// Removes the scratch pages between `start` and `end`, where the
+    /// program's own memory is changing (it maps or reprotects it): what
+    /// the program sees there must be its memory, never a scratch frame.
+    /// The system call that had them still fails with `EFAULT` and frees
+    /// its frame after a TLB flush.
+    fn drop_scratch_pages(&mut self, start: u64, end: u64) {
+        if self.scratch_pages.is_empty() {
+            return;
+        }
+        let pages = core::mem::take(&mut self.scratch_pages);
+        for page in pages {
+            if !(start..end).contains(&page) {
+                self.scratch_pages.push(page);
+            } else if self.table.translate(page).is_some_and(|mapping| mapping.flags & USER == 0) {
+                self.table.unmap(page);
+                self.resident_pages -= 1;
+            }
+        }
     }
 
     fn map_fresh_page(&mut self, page: u64, protection: u32) -> Result<u64> {
@@ -649,6 +715,11 @@ impl AddressSpace {
         copy.brk = self.brk;
         let mut downgraded = false;
         for (virt, mapping) in self.table.user_pages() {
+            // Scratch pages (see `map_scratch_page`) belong to a system
+            // call of this process, not to the program.
+            if mapping.flags & USER == 0 {
+                continue;
+            }
             let shared = self.area_at(virt).is_some_and(|(_, area)| area.shared());
             let mut flags = mapping.flags & (USER | WRITABLE | NO_EXECUTE | COPY_ON_WRITE | DEVICE_PAGE);
             flags |= mapping.flags & crate::memory::paging::WRITE_THROUGH;
@@ -697,6 +768,7 @@ impl AddressSpace {
                 }
                 extendable
             });
+            self.drop_scratch_pages(old_end, new_end);
             if !extended
                 && self
                     .add_named_area(old_end, new_end, PROT_READ | PROT_WRITE, Backing::Anonymous, Some("[heap]".into()))

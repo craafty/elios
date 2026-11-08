@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -125,6 +127,38 @@ static void *take_tokens(void *argument) {
 static void *block_forever(void *argument) {
     (void)argument;
     for (;;) pause();
+    return NULL;
+}
+
+/* Memory unmapped by one thread while another's system call uses it: the
+   call fails with EFAULT (the kernel must not crash). */
+static int unmap_pipe[2];
+static char *unmap_buffer;
+static long unmap_result;
+static int unmap_errno;
+
+static void *read_into_buffer(void *unused) {
+    (void)unused;
+    unmap_result = read(unmap_pipe[0], unmap_buffer, 3 * 4096);
+    unmap_errno = errno;
+    return NULL;
+}
+
+static volatile int racing = 1;
+static long race_reads, race_faults, race_other, race_last;
+
+static void *read_zeros(void *buffer) {
+    int zero = open("/dev/zero", O_RDONLY);
+    while (racing) {
+        long got = read(zero, buffer, 1 << 20);
+        if (got == 1 << 20) race_reads++;
+        else if (got == -1 && errno == EFAULT) race_faults++;
+        else {
+            race_other++;
+            race_last = got == -1 ? -errno : got;
+        }
+    }
+    close(zero);
     return NULL;
 }
 
@@ -247,6 +281,35 @@ int main(void) {
     }
     waitpid(child, &status, 0);
     check("a fatal signal ends every thread", WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM);
+
+    pipe(unmap_pipe);
+    unmap_buffer = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    pthread_create(&threads[0], NULL, read_into_buffer, NULL);
+    usleep(20000);
+    munmap(unmap_buffer, 3 * 4096);
+    static char fill[3 * 4096];
+    memset(fill, 'x', sizeof fill);
+    write(unmap_pipe[1], fill, sizeof fill);
+    pthread_join(threads[0], NULL);
+    check("a buffer unmapped mid-read gives EFAULT", unmap_result == -1 && unmap_errno == EFAULT);
+    char *again = mmap(unmap_buffer, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    check("...and the address maps afresh", again == unmap_buffer && again[0] == 0 && again[4095] == 0);
+    munmap(again, 4096);
+
+    char *race = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    pthread_create(&threads[0], NULL, read_zeros, race);
+    for (int i = 0; i < 300; i++) {
+        munmap(race, 1 << 20);
+        mmap(race, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        race[i * 1000] = 1;
+        if (i % 50 == 0) usleep(1000);
+    }
+    racing = 0;
+    pthread_join(threads[0], NULL);
+    printf("  (%ld reads, %ld EFAULT, %ld other, last %ld)\n", race_reads, race_faults, race_other, race_last);
+    check("unmapping during reads: data or EFAULT", race_other == 0);
+    race[12345] = 7;
+    check("...and leaves the memory usable", race[12345] == 7 && race[0] == 0);
 
     printf(failures ? "%d FAILED\n" : "all passed\n", failures);
     return failures != 0;

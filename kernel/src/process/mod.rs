@@ -125,6 +125,10 @@ pub struct UserThread {
     /// call, for /proc/PID/stacks.
     pub syscall_stack: AtomicU64,
     pub syscall_rip: AtomicU64,
+    /// Pages of user memory the running system call found unmapped by
+    /// another thread, and the frame put there instead (see
+    /// [`handle_kernel_fault`]).
+    scratch: SpinLock<Option<(u64, Vec<u64>)>>,
 }
 
 impl UserThread {
@@ -246,6 +250,7 @@ fn start_thread(process: &Arc<Process>, new: NewThread) {
         syscall_arguments: Default::default(),
         syscall_stack: AtomicU64::new(0),
         syscall_rip: AtomicU64::new(0),
+        scratch: SpinLock::new(None),
     });
     process.threads.lock().push(thread.clone());
     let options = Spawn {
@@ -944,11 +949,69 @@ pub fn handle_user_exception(frame: &mut InterruptFrame) {
 /// it before using it, but another thread of the program can change it
 /// meanwhile: a `fork` makes its pages copy-on-write. Returns whether the
 /// fault was resolved (and the access can be retried).
+///
+/// Another thread can also unmap the memory (or end the area) while a
+/// system call uses it in place (`read` into a buffer, say), which leaves
+/// nothing to resolve. Linux would make the access fail with `EFAULT`
+/// through an exception table; here the kernel code using the buffer is
+/// any code at all (a file system filling it, a socket copying from it),
+/// so instead a scratch frame only the kernel can reach is mapped at the
+/// page, the access completes there, and when the system call returns its
+/// result becomes `EFAULT` and the scratch pages go (see
+/// [`finish_system_call`]). The program sees the unmapped memory as it
+/// left it: its own accesses still fault.
 pub fn handle_kernel_fault(frame: &InterruptFrame, address: u64) -> bool {
     let Some(process) = task::current_process() else { return false };
     let write = frame.error_code & 2 != 0;
+    let not_present = frame.error_code & 1 == 0;
     let interrupts_were_on = frame.rflags & (1 << 9) != 0;
-    address_space::resolve_kernel_fault(&process.space, address, write, interrupts_were_on)
+    if address_space::resolve_kernel_fault(&process.space, address, write, interrupts_were_on) {
+        return true;
+    }
+    // Only during a system call: that's when the result can say so.
+    let Some(thread) = task::current_user_thread() else { return false };
+    if !not_present || thread.syscall.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let mut scratch = thread.scratch.lock();
+    if scratch.is_none() {
+        let Some(frame) = memory::frames::allocate_zeroed() else { return false };
+        *scratch = Some((frame, Vec::new()));
+    }
+    let (scratch_frame, pages) = scratch.as_mut().unwrap();
+    let page = address & !(memory::PAGE_SIZE - 1);
+    let mapped = process.space.lock().as_mut().is_some_and(|space| space.map_scratch_page(page, *scratch_frame));
+    if mapped {
+        pages.push(page);
+    }
+    if mapped && pages.len() == 1 {
+        debug!(
+            "{} (pid {}): system call {} found {address:#x} unmapped",
+            process.name.lock(),
+            thread.tid(),
+            thread.syscall.load(Ordering::Relaxed) - 1
+        );
+    }
+    mapped
+}
+
+/// Called as each system call returns: if it ran into memory another
+/// thread had unmapped ([`handle_kernel_fault`]), removes the scratch
+/// pages and fails the call with `EFAULT`, as Linux would.
+pub fn finish_system_call(thread: &UserThread, result: Result<u64>) -> Result<u64> {
+    let Some((frame, pages)) = thread.scratch.lock().take() else { return result };
+    if let Some(space) = thread.process.space.lock().as_mut() {
+        for &page in &pages {
+            space.unmap_scratch_page(page, frame);
+        }
+    }
+    // Other threads may have cached the pages, though only the kernel
+    // could use them: the frame goes once no CPU can reach it.
+    if let (Some(&low), Some(&high)) = (pages.iter().min(), pages.iter().max()) {
+        crate::arch::smp::flush_tlb(low, high + memory::PAGE_SIZE);
+    }
+    memory::frames::free(frame);
+    Err(Errno::EFAULT)
 }
 
 /// A snapshot of a process, for `ps`.

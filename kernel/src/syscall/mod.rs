@@ -152,8 +152,9 @@ extern "sysv64" fn syscall_dispatch(frame: &mut InterruptFrame) {
         thread.syscall_stack.store(frame.rsp, core::sync::atomic::Ordering::Relaxed);
         thread.syscall_rip.store(frame.rip, core::sync::atomic::Ordering::Relaxed);
     }
-    let result = dispatch(number, a, frame);
+    let mut result = dispatch(number, a, frame);
     if let Some(thread) = &thread {
+        result = process::finish_system_call(thread, result);
         thread.syscall.store(0, core::sync::atomic::Ordering::Relaxed);
     }
     if let Some(pid) = traced
