@@ -508,6 +508,21 @@ const F_GET_SEALS: u64 = 1034;
 const F_UNLCK: i16 = 2;
 const FD_CLOEXEC: u64 = 1;
 
+/// `flock`: like record locks (see `fcntl`), whole-file locks are granted
+/// without being enforced; only the file and the operation are checked.
+/// (Firefox and Mesa's shader cache lock files this way.)
+pub fn flock(fd: u64, operation: u64) -> Result<u64> {
+    const LOCK_SH: u64 = 1;
+    const LOCK_EX: u64 = 2;
+    const LOCK_NB: u64 = 4;
+    const LOCK_UN: u64 = 8;
+    process::current().files.lock().get(descriptor(fd)?)?;
+    match operation & !LOCK_NB {
+        LOCK_SH | LOCK_EX | LOCK_UN => Ok(0),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
 pub fn fcntl(fd: u64, command: u64, argument: u64) -> Result<u64> {
     let process = process::current();
     let mut files = process.files.lock();

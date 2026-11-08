@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -66,6 +67,10 @@ int main(int argc, char **argv) {
     check("fopen, fprintf, fgets, stat", file_ok);
     check("unlink", unlink("/tmp/ctest.txt") == 0 && access("/tmp/ctest.txt", F_OK) != 0);
     check("errno for a missing file", open("/nonexistent", O_RDONLY) < 0 && errno == ENOENT);
+    int lock_fd = open("/tmp", O_RDONLY);
+    check("flock", flock(lock_fd, LOCK_EX | LOCK_NB) == 0 && flock(lock_fd, LOCK_UN) == 0 &&
+                       flock(lock_fd, 0) < 0 && errno == EINVAL && flock(-1, LOCK_SH) < 0 && errno == EBADF);
+    close(lock_fd);
 
     /* Directories. */
     DIR *dir = opendir("/bin");
