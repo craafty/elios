@@ -20,12 +20,15 @@
 //! the boot protocol, the keyboard types `echo bluetooth keyboard works`
 //! and Enter, and the mouse moves. When the host disconnects one, it
 //! connects back by itself once, a second later, as a paired keyboard
-//! does when a key is pressed.
+//! does when a key is pressed. The headset is an A2DP sink: it answers
+//! AVDTP's questions (one SBC sink endpoint), checks every audio packet's
+//! SBC frames, and writes them to target/headset.sbc, which ffmpeg can
+//! decode (`ffmpeg -f sbc -i target/headset.sbc out.wav`).
 
 use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -123,6 +126,10 @@ const TYPED: &str = "echo bluetooth keyboard works\n";
 /// HID's L2CAP channels.
 const PSM_CONTROL: u16 = 0x11;
 const PSM_INTERRUPT: u16 = 0x13;
+/// AVDTP: signaling, then (the second channel to the same PSM) audio,
+/// which goes by a made-up PSM here.
+const PSM_AVDTP: u16 = 0x19;
+const PSM_MEDIA: u16 = 0x1019;
 
 /// A connection to one of the devices.
 struct Link {
@@ -135,6 +142,9 @@ struct Link {
     next_cid: u16,
     next_ident: u8,
     typing: bool,
+    /// Audio packets received, and how many had broken SBC frames.
+    audio_packets: u64,
+    bad_audio: u64,
 }
 
 /// An L2CAP channel on the device's side: our CID and the host's.
@@ -172,6 +182,8 @@ struct State {
     /// Devices that have connected back by themselves already (they do it
     /// once).
     reconnected: Vec<usize>,
+    /// Where the headset writes the SBC frames it receives.
+    audio_file: PathBuf,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -188,7 +200,7 @@ pub fn start(path: &Path) -> Result<Vec<String>, String> {
     thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
             let _ = std::fs::remove_file(&owned);
-            if let Err(error) = serve(stream, steps)
+            if let Err(error) = serve(stream, steps, owned.with_file_name("headset.sbc"))
                 && error.kind() != io::ErrorKind::UnexpectedEof
             {
                 eprintln!("xtask: bluetooth: {error}");
@@ -222,7 +234,8 @@ fn parse(mut file: &[u8]) -> Option<Vec<Step>> {
     file.is_empty().then_some(steps)
 }
 
-fn serve(stream: UnixStream, steps: Vec<Step>) -> io::Result<()> {
+fn serve(stream: UnixStream, steps: Vec<Step>, audio_file: PathBuf) -> io::Result<()> {
+    let _ = std::fs::remove_file(&audio_file);
     let mut reader = stream.try_clone()?;
     let writer: Writer = Arc::new(Mutex::new(stream));
     hello(&writer, &mut reader, "eliOS Bluetooth")?;
@@ -249,6 +262,7 @@ fn serve(stream: UnixStream, steps: Vec<Step>) -> io::Result<()> {
         links: Vec::new(),
         next_handle: 0x0B,
         reconnected: Vec::new(),
+        audio_file,
     }));
     loop {
         let mut header = [0u8; 16];
@@ -560,6 +574,8 @@ fn link_command(
                 next_cid: 0x0050,
                 next_ident: 1,
                 typing: false,
+                audio_packets: 0,
+                bad_audio: 0,
             });
             queue_event(locked, writer, connection_complete(0, handle, parameters))
         }
@@ -650,7 +666,7 @@ fn link_command(
             let [low, high] = handle.to_le_bytes();
             queue_event(locked, writer, vec![0x05, 4, 0, low, high, 0x16])?;
             let device = link.device;
-            if DEVICES[device].hid != Hid::None && !locked.reconnected.contains(&device) {
+            if (DEVICES[device].hid != Hid::None || device == HEADSET) && !locked.reconnected.contains(&device) {
                 locked.reconnected.push(device);
                 later(state, writer, 1000, move |locked, _, writer| {
                     let class = DEVICES[device].class.to_le_bytes();
@@ -735,7 +751,8 @@ fn acl_from_host(locked: &mut State, state: &Shared, writer: &Writer, data: &[u8
     let cid = u16::from_le_bytes([*cid_low, *cid_high]);
     let Some(link) = locked.links.iter_mut().find(|link| link.handle == handle) else { return Ok(()) };
     if cid != 0x0001 {
-        let psm = link.channels.iter().find(|channel| channel.ours == cid).map(|channel| channel.psm);
+        let channel = link.channels.iter().find(|channel| channel.ours == cid);
+        let (psm, theirs) = (channel.map(|channel| channel.psm), channel.map_or(0, |channel| channel.theirs));
         // SET_PROTOCOL (boot): handshake "successful", then input.
         if psm == Some(PSM_CONTROL) && payload.first() == Some(&0x70) {
             let control = link.channels.iter().find(|channel| channel.psm == PSM_CONTROL).map_or(0, |c| c.theirs);
@@ -744,6 +761,28 @@ fn acl_from_host(locked: &mut State, state: &Shared, writer: &Writer, data: &[u8
             send_l2cap(locked, writer, handle, control, &[0x00])?;
             if start {
                 type_input(state, writer, handle);
+            }
+        }
+        if psm == Some(PSM_AVDTP)
+            && let Some(reply) = avdtp_sink(payload)
+        {
+            send_l2cap(locked, writer, handle, theirs, &reply)?;
+        }
+        if psm == Some(PSM_MEDIA) {
+            let frames = sbc_frames(payload);
+            let Some(link) = locked.links.iter_mut().find(|link| link.handle == handle) else { return Ok(()) };
+            link.audio_packets += 1;
+            if frames.is_none() {
+                link.bad_audio += 1;
+            }
+            let (count, bad) = (link.audio_packets, link.bad_audio);
+            if count == 1 || count % 500 == 0 {
+                eprintln!("xtask: pretend headset: {count} audio packets, {bad} broken");
+            }
+            if let Some(frames) = frames {
+                use std::io::Write;
+                let file = std::fs::OpenOptions::new().create(true).append(true).open(&locked.audio_file);
+                file.and_then(|mut file| file.write_all(frames))?;
             }
         }
         return Ok(());
@@ -758,7 +797,10 @@ fn acl_from_host(locked: &mut State, state: &Shared, writer: &Writer, data: &[u8
         match code {
             // Connection request: accepted, and our configuration.
             0x02 => {
-                let (psm, theirs) = (word(0), word(2));
+                let (mut psm, theirs) = (word(0), word(2));
+                if psm == PSM_AVDTP && link.channels.iter().any(|channel| channel.psm == PSM_AVDTP) {
+                    psm = PSM_MEDIA;
+                }
                 let ours = link.next_cid;
                 link.next_cid += 1;
                 link.channels.push(Channel { psm, ours, theirs });
@@ -806,6 +848,51 @@ fn acl_from_host(locked: &mut State, state: &Shared, writer: &Writer, data: &[u8
         send_signal(locked, writer, handle, reply)?;
     }
     Ok(())
+}
+
+/// The headset's answer to an AVDTP command: one audio sink endpoint
+/// (SEID 1) that takes any SBC settings with 8 subbands, bitpool 2 to 53.
+fn avdtp_sink(message: &[u8]) -> Option<Vec<u8>> {
+    let [header, signal, ..] = *message else { return None };
+    if header & 0x03 != 0 {
+        // A response (the host doesn't ask us to answer those).
+        return None;
+    }
+    let accept = |body: &[u8]| [&[header & 0xF0 | 0x02, signal][..], body].concat();
+    Some(match signal & 0x3F {
+        // Discover: SEID 1, free, audio, sink.
+        0x01 => accept(&[1 << 2, 0x08]),
+        // Get (all) capabilities: media transport, SBC.
+        0x02 | 0x0C => accept(&[0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0xFF, 0xFF, 2, 53]),
+        // Set configuration, open, start, close, suspend, abort.
+        0x03 | 0x06..=0x0A => accept(&[]),
+        // Anything else: general reject.
+        _ => vec![header & 0xF0 | 0x01, signal],
+    })
+}
+
+/// The SBC frames in an A2DP audio packet (RTP header, frame count,
+/// frames), if they're all whole and well-formed.
+fn sbc_frames(packet: &[u8]) -> Option<&[u8]> {
+    let count = usize::from(*packet.get(12)? & 0x0F);
+    let frames = packet.get(13..)?;
+    let mut rest = frames;
+    for _ in 0..count {
+        let [0x9C, settings, bitpool, ..] = *rest else { return None };
+        let blocks = 4 * (usize::from(settings >> 4 & 3) + 1);
+        let mode = settings >> 2 & 3;
+        let subbands = if settings & 1 != 0 { 8 } else { 4 };
+        let channels = if mode == 0 { 1 } else { 2 };
+        let bitpool = usize::from(bitpool);
+        let audio_bits = match mode {
+            0 | 1 => blocks * channels * bitpool,
+            2 => blocks * bitpool,
+            _ => subbands + blocks * bitpool,
+        };
+        let length = 4 + 4 * subbands * channels / 8 + audio_bits.div_ceil(8);
+        rest = rest.get(length..)?;
+    }
+    rest.is_empty().then_some(frames)
 }
 
 /// What a device sends once it's set up: the keyboard types a command,

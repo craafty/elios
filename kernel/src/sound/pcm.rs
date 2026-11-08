@@ -582,6 +582,45 @@ impl Pcm {
         Then::Start
     }
 
+    /// For sending what plays somewhere else as well (a Bluetooth
+    /// headset): appends to `out` the frames written and about to play,
+    /// from `cursor` (a stream position the caller keeps) to `lead` frames
+    /// past the device's position. Frames already played may have been
+    /// overwritten, so a cursor that fell behind skips ahead to the device.
+    /// Returns the rate, or `None` (and forgets the cursor) when nothing is
+    /// playing.
+    pub fn tap(&self, cursor: &mut Option<u64>, lead: u64, out: &mut Vec<u8>) -> Option<u32> {
+        let (then, region) = {
+            let mut runtime = self.runtime.lock();
+            let then = self.update(&mut runtime);
+            let playing = matches!(runtime.state, State::Running | State::Draining) && runtime.buffer > 0;
+            let region = if playing && self.direction == Direction::Playback {
+                let device = runtime.hw_ptr;
+                let queued = runtime.queued(self.direction);
+                let start = cursor.filter(|&at| runtime.distance(at, device) <= queued).unwrap_or(device);
+                let count = queued.min(lead).saturating_sub(runtime.distance(start, device));
+                *cursor = Some((start + count) % runtime.boundary);
+                Some((start % runtime.buffer, count, runtime.buffer, runtime.rate))
+            } else {
+                *cursor = None;
+                None
+            };
+            (then, region)
+        };
+        self.act(then);
+        let (offset, count, buffer, rate) = region?;
+        // The written, unplayed part of the ring doesn't change under us.
+        let first = count.min(buffer - offset);
+        let at = out.len();
+        out.resize(at + (count * FRAME_BYTES) as usize, 0);
+        let split = at + (first * FRAME_BYTES) as usize;
+        self.hardware.read_buffer((offset * FRAME_BYTES) as usize, &mut out[at..split]);
+        if split < out.len() {
+            self.hardware.read_buffer(0, &mut out[split..]);
+        }
+        Some(rate)
+    }
+
     fn info(&self, address: u64) -> Result<u64> {
         let mut info = [0u8; 288];
         info[8..12].copy_from_slice(&(if self.direction == Direction::Playback { 0u32 } else { 1 }).to_le_bytes());

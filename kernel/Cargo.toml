@@ -15,4 +15,5 @@ apk = { path = "../apk" }
 bootinfo = { path = "../bootinfo" }
 ext2 = { path = "../ext2" }
 fat = { path = "../fat" }
+sbc = { path = "../sbc" }
 tls = { path = "../tls" }

@@ -16,10 +16,12 @@
 //! paired devices) and takes requests ("scan", "pair ADDRESS", ...) for
 //! the `bluetooth` command, as `/proc/wifi` does for Wi-Fi.
 
+mod a2dp;
 mod hid;
 mod intel;
 mod keys;
 mod l2cap;
+mod sdp;
 mod stack;
 
 use alloc::collections::VecDeque;
@@ -187,6 +189,13 @@ static STATUS: SpinLock<Status> = SpinLock::new(Status {
 
 /// The adapter in use (the first one found).
 static ADAPTER: SpinLock<Option<Arc<Adapter>>> = SpinLock::new(None);
+
+/// Wakes the adapter's thread (audio for a headset came).
+fn wake() {
+    if let Some(adapter) = ADAPTER.lock().clone() {
+        adapter.arrived.wake_all();
+    }
+}
 
 /// Called by the transport for each controller found: starts its thread.
 pub fn register(adapter: Arc<Adapter>) {

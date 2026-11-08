@@ -1,0 +1,6 @@
+[package]
+name = "sbc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

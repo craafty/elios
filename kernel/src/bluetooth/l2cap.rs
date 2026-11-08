@@ -45,11 +45,24 @@ const MTU: u16 = 672;
 /// Our CIDs start here (lower ones are fixed channels).
 const FIRST_DYNAMIC_CID: u16 = 0x0040;
 
+/// AVDTP (audio streaming) opens two channels to the same PSM: the first
+/// carries its signaling and the second the audio. Here the second goes
+/// by this made-up PSM (even, so no real one), so each has a name.
+pub(super) const AVDTP: u16 = 0x0019;
+pub(super) const AVDTP_MEDIA: u16 = 0x1018;
+
+/// The PSM a channel is opened to on the air.
+fn wire_psm(psm: u16) -> u16 {
+    if psm == AVDTP_MEDIA { AVDTP } else { psm }
+}
+
 pub(super) struct Channel {
     pub psm: u16,
     pub local: u16,
     /// The device's CID for it, once known.
     pub remote: u16,
+    /// The largest packet the device takes on it.
+    pub remote_mtu: u16,
     /// Whether the device agreed to our configuration, and we to its.
     configured_out: bool,
     configured_in: bool,
@@ -112,13 +125,14 @@ impl L2cap {
             psm,
             local,
             remote: 0,
+            remote_mtu: MTU,
             configured_out: false,
             configured_in: false,
             config_sent: false,
             waiting_for_security: None,
         });
         let ident = self.ident();
-        self.signal(CONNECTION_REQUEST, ident, &[psm.to_le_bytes(), local.to_le_bytes()].concat());
+        self.signal(CONNECTION_REQUEST, ident, &[wire_psm(psm).to_le_bytes(), local.to_le_bytes()].concat());
     }
 
     /// Queues data on the open channel to `psm`.
@@ -161,7 +175,10 @@ impl L2cap {
         let word = |at: usize| body.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
         match code {
             CONNECTION_REQUEST => {
-                let (psm, remote) = (word(0), word(2));
+                let (mut psm, remote) = (word(0), word(2));
+                if psm == AVDTP && self.channel(AVDTP).is_some() {
+                    psm = AVDTP_MEDIA;
+                }
                 if !self.served.contains(&psm) {
                     debug!("bluetooth: refused a channel to PSM {psm:#06x}");
                     self.connection_response(ident, 0, remote, PSM_NOT_SUPPORTED, 0);
@@ -172,6 +189,7 @@ impl L2cap {
                     psm,
                     local,
                     remote,
+                    remote_mtu: MTU,
                     configured_out: false,
                     configured_in: false,
                     config_sent: false,
@@ -213,6 +231,17 @@ impl L2cap {
                 // Bit 0: more configuration follows in another request.
                 if flags & 1 == 0 {
                     channel.configured_in = true;
+                }
+                // Options: type, length, value; type 1 is the MTU (the
+                // high bit of a type means "skip if unknown").
+                let mut options = body.get(4..).unwrap_or(&[]);
+                while let [kind, length, rest @ ..] = options {
+                    let length = usize::from(*length);
+                    let Some(value) = rest.get(..length) else { break };
+                    if kind & 0x7F == 1 && length == 2 {
+                        channel.remote_mtu = u16::from_le_bytes([value[0], value[1]]);
+                    }
+                    options = &rest[length..];
                 }
                 let remote = channel.remote;
                 // Whatever it asks (its MTU, mostly) is fine.

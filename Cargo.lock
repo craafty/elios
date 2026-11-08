@@ -37,6 +37,7 @@ dependencies = [
  "bootinfo",
  "ext2",
  "fat",
+ "sbc",
  "tls",
 ]
 
@@ -65,6 +66,10 @@ dependencies = [
  "eli",
  "ui",
 ]
+
+[[package]]
+name = "sbc"
+version = "0.1.0"
 
 [[package]]
 name = "term"

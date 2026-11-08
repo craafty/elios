@@ -181,6 +181,7 @@ impl ControlNode {
             }
             *setting
         };
+        let on = on && !(element.output && super::speakers_off(self.card.index));
         self.card.mixer.set_volume(element.output, step, on);
         self.card.changed.notify();
         Ok(0)

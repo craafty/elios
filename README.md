@@ -230,8 +230,8 @@ may work too, but QEMU is the one eliOS is tested on.
   campus networks use) networks, with the `wifi` command; written for the
   T440p and still being tried there), the 7260's Bluetooth (Intel's
   firmware patch, scanning, Secure Simple Pairing with kept link keys,
-  L2CAP, and keyboards and mice, with the `bluetooth` command; audio to
-  come), ACPI power management.
+  L2CAP, keyboards and mice, and headphones: A2DP audio with eliOS's own
+  SBC encoder, with the `bluetooth` command), ACPI power management.
 - **Networking:** eliOS's own TCP/IP stack (Ethernet, ARP, IPv4, ICMP, UDP,
   TCP), DHCP, loopback, and the Linux socket API, so programs like
   BusyBox's `wget` and `netstat` work unmodified.
@@ -282,7 +282,9 @@ ext2 tests check every volume they make with Linux's `e2fsck`. The `tls`
 crate's tests (`cargo test -p tls`) talk to `openssl s_server`, and, with
 `RADIUS_SERVER=host:port` set, sign in to a FreeRADIUS server over PEAP.
 The `truetype` crate's (`cargo test -p truetype`) check the bundled font
-and the rasterizer against shapes whose coverage is known exactly.
+and the rasterizer against shapes whose coverage is known exactly, and the
+`sbc` crate's (`cargo test -p sbc`) decode what the encoder makes with
+ffmpeg and measure how close it comes back.
 
 ### The font
 
@@ -304,6 +306,7 @@ eliOS's own rasterizer in `truetype/`.
 | `apk/`          | Alpine's package format: gzip, tar, hashes, RSA, indexes      |
 | `tls/`          | TLS 1.2 client and PEAP/MS-CHAPv2, for enterprise Wi-Fi       |
 | `truetype/`     | TrueType fonts: reading and anti-aliased rasterizing          |
+| `sbc/`          | The SBC audio encoder, for Bluetooth headphones               |
 | `user/ui/`      | The toolkit: Wayland windows, drawing, widgets (and `uidemo`) |
 | `user/term/`    | `term`, the terminal                                         |
 | `user/files/`   | `files`, the file explorer                                   |
@@ -350,8 +353,10 @@ eliOS's own rasterizer in `truetype/`.
       scanning, and joining Purdue's WPA2-Enterprise PAL3.0 with DHCP;
       open and WPA2 networks use the same path) and Bluetooth (the
       Intel firmware patch loads and scans find devices; pairing, L2CAP
-      and HID keyboards and mice, checked against a pretend controller
-      in QEMU; next, trying them on the laptop, then audio)
+      and HID keyboards and mice, and A2DP audio to headphones (SDP,
+      AVDTP, our own SBC encoder; the sound card's output follows the
+      headset), checked against a pretend controller in QEMU; next,
+      trying them on the laptop, then the headset's microphone (HFP))
 - [x] **Desktop groundwork:** copy-on-write `fork`, shared memory
       (`memfd`, `MAP_SHARED`, a page cache), `epoll`, `eventfd`,
       `timerfd`, Unix domain sockets with descriptor passing,

@@ -24,9 +24,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
+use super::a2dp::{self, Audio};
 use super::hid::{self, Control, Hid};
 use super::keys::{Keys, Paired};
 use super::l2cap::{self, L2cap};
+use super::sdp;
 use super::*;
 use crate::keyboard::{self, Key};
 
@@ -85,7 +87,17 @@ const DISPLAY_YES_NO: u8 = 0x01;
 const GENERAL_BONDING_MITM: u8 = 0x05;
 
 /// The services devices may open channels to.
-const SERVED: &[u16] = &[hid::CONTROL, hid::INTERRUPT];
+const SERVED: &[u16] = &[sdp::PSM, hid::CONTROL, hid::INTERRUPT, l2cap::AVDTP, l2cap::AVDTP_MEDIA];
+
+/// Unsent audio packets allowed to wait for the controller; past this the
+/// link isn't keeping up and audio is dropped rather than delayed.
+const AUDIO_BACKLOG: usize = 12;
+
+/// Headphones, speakers and the like: the audio/video major class, or the
+/// audio service bit.
+fn is_audio(class: u32) -> bool {
+    (class >> 8 & 0x1F) == 0x04 || class & 1 << 21 != 0
+}
 
 struct Connection {
     handle: u16,
@@ -98,6 +110,7 @@ struct Connection {
     encrypted: bool,
     l2cap: L2cap,
     hid: Option<Hid>,
+    audio: Option<Audio>,
     /// ACL packets sent that the controller hasn't reported done.
     in_flight: u16,
     /// An L2CAP frame arriving in pieces.
@@ -142,6 +155,7 @@ enum Work {
     Removed,
     Request(Request),
     Packets,
+    Audio,
 }
 
 impl Stack {
@@ -175,7 +189,10 @@ impl Stack {
                 if let Some(request) = adapter.requests.lock().pop_front() {
                     return Some(Work::Request(request));
                 }
-                (stash_waiting || !adapter.incoming.lock().is_empty()).then_some(Work::Packets)
+                if stash_waiting || !adapter.incoming.lock().is_empty() {
+                    return Some(Work::Packets);
+                }
+                a2dp::waiting().then_some(Work::Audio)
             });
             match work {
                 Some(Work::Removed) => {
@@ -190,6 +207,7 @@ impl Stack {
                     return;
                 }
                 Some(Work::Request(request)) => self.request(request),
+                Some(Work::Audio) => self.play(),
                 Some(Work::Packets) => {
                     while let Some(packet) = self.hci.next(0) {
                         match packet {
@@ -212,7 +230,22 @@ impl Stack {
             .chain(self.pairing.as_ref().map(|p| p.deadline))
             .chain(self.scan.as_ref().map(|s| s.deadline))
             .chain(self.keys.next_try())
+            .chain(self.connections.iter().filter_map(|c| c.audio.as_ref()?.deadline()))
             .min()
+    }
+
+    /// Sends what the sound card played to the headsets streaming it.
+    fn play(&mut self) {
+        let Some((rate, samples)) = a2dp::take() else { return };
+        for index in 0..self.connections.len() {
+            let handle = self.connections[index].handle;
+            let room = self.acl_waiting.iter().filter(|(h, _)| *h == handle).count() < AUDIO_BACKLOG;
+            let connection = &mut self.connections[index];
+            if let Some(audio) = connection.audio.as_mut() {
+                audio.play(&mut connection.l2cap, rate, &samples, room);
+                self.service(index);
+            }
+        }
     }
 
     fn timers(&mut self) {
@@ -225,6 +258,11 @@ impl Stack {
             }
         }
         self.typed.drain(..).for_each(keyboard::send_key);
+        for index in 0..self.connections.len() {
+            if self.connections[index].audio.as_ref().and_then(Audio::deadline).is_some_and(|d| now >= d) {
+                self.service(index);
+            }
+        }
         if self.pairing.as_ref().is_some_and(|p| now >= p.deadline) {
             self.pairing_failed(String::from("timed out"));
         }
@@ -245,6 +283,9 @@ impl Stack {
                     None => String::from("not connected"),
                     Some(Connection { hid: Some(hid), .. }) => {
                         format!("connected, {}, {} reports", hid.kinds(), hid.reports)
+                    }
+                    Some(Connection { audio: Some(audio), encrypted: true, .. }) => {
+                        format!("connected, {}, {} packets", audio.describe(), audio.packets)
                     }
                     Some(connection) if connection.encrypted => String::from("connected"),
                     Some(_) => String::from("connecting"),
@@ -536,6 +577,7 @@ impl Stack {
             encrypted: false,
             l2cap: L2cap::new(SERVED),
             hid: None,
+            audio: None,
             in_flight: 0,
             partial: Vec::new(),
         });
@@ -611,10 +653,15 @@ impl Stack {
             if !connection.incoming {
                 connection.l2cap.connect(hid::CONTROL);
             }
-        } else if self.pairing.as_ref().is_some_and(|p| p.address == address) {
-            // Paired; nothing more to connect to it yet (audio is for
-            // later).
-            self.pairing_done();
+        } else {
+            if is_audio(connection.class) {
+                set_pairing_step(&address, "connecting audio");
+                connection.audio = Some(Audio::new(!connection.incoming));
+            }
+            // Paired; audio (if it's for audio) sets itself up from here.
+            if self.pairing.as_ref().is_some_and(|p| p.address == address) {
+                self.pairing_done();
+            }
         }
         self.service(index);
         Ok(())
@@ -780,6 +827,11 @@ impl Stack {
                     }
                     self.typed.drain(..).for_each(keyboard::send_key);
                 }
+                (Some(sdp::PSM), _) => connection.l2cap.send(sdp::PSM, sdp::respond(payload)),
+                (Some(l2cap::AVDTP), _) => {
+                    let audio = connection.audio.get_or_insert_with(|| Audio::new(false));
+                    audio.signal(&mut connection.l2cap, payload);
+                }
                 _ => {}
             }
         }
@@ -809,6 +861,15 @@ impl Stack {
             }
         }
         let connection = &mut self.connections[index];
+        if connection.audio.is_none() && connection.l2cap.channel(l2cap::AVDTP).is_some() {
+            // Something not known for audio opened an audio channel.
+            connection.audio = Some(Audio::new(false));
+        }
+        if let Some(audio) = connection.audio.as_mut()
+            && connection.encrypted
+        {
+            audio.service(&mut connection.l2cap);
+        }
         let handle = connection.handle;
         let outbox: Vec<(u16, Vec<u8>)> = core::mem::take(&mut connection.l2cap.outbox);
         for (cid, payload) in outbox {

@@ -2661,8 +2661,55 @@ version, firmware, devices found, paired devices and their connections,
 pairing under way); `bluetooth scan` writes `scan` to it and waits;
 `bluetooth pair DEVICE` (an address or a name the scan showed) writes
 `pair ADDRESS` and follows the pairing, showing the passkey;
-`connect`, `disconnect` and `forget` the same way. Not yet: audio
-(A2DP, HFP), SDP, Bluetooth Low Energy.
+`connect`, `disconnect` and `forget` the same way. Not yet: the
+headset microphone (HFP), Bluetooth Low Energy.
+
+**Service discovery** (`sdp.rs`). Headsets look up what we offer after
+connecting, and some give up on a host that doesn't answer. SDP is a
+request/response protocol on PSM 1 whose values are "data elements" (a
+type and size byte, then the value); we keep one record, an A2DP audio
+source on AVDTP, and answer searches, attribute requests and the
+combined search-and-attributes request, splitting long answers with
+SDP's continuation state.
+
+**Headphones** (`a2dp.rs`, and the `sbc/` crate). A2DP streams audio
+over AVDTP, which uses two L2CAP channels to PSM 0x19: the first for
+signaling, the second (opened after `OPEN`) for audio. L2CAP names the
+second by a made-up PSM so the rest of the stack can tell them apart.
+When we connect to a device whose class says audio, we open signaling
+and lead: `DISCOVER` the headset's endpoints, `GET_CAPABILITIES` of
+each sink, `SET_CONFIGURATION` with the best SBC settings both take
+(48 kHz, joint stereo, 16 blocks, 8 subbands, loudness allocation,
+bitpool 51), `OPEN`, then the media channel. A headset that connects to
+us usually leads itself, so we also answer all of those as an
+acceptor with our one source endpoint; if it opens nothing within 3
+seconds, or opens signaling and asks nothing for 1.5, we lead anyway.
+`START` comes when sound starts and `SUSPEND` after 2 quiet seconds.
+
+The sound comes from sound card 0 ("audio follows the headset"): while
+a stream is open, the card's speakers are muted (its volume setting
+stays and is applied to the headset's samples instead), and a thread
+copies what the card is about to play every 10 ms: the frames between
+the card's position and 20 ms past it that programs have written
+(`Pcm::tap`; played frames may already be overwritten, so it never looks
+behind the card). The card's DMA keeps running, so its clock paces the
+audio and programs see a normal sound card. The Bluetooth thread
+resamples (linearly) if the program's rate isn't the stream's, encodes
+SBC, and sends packets as big as the channel's MTU allows: an RTP
+header, a byte with the frame count, and the frames (7 frames, 18.7 ms,
+when the headset takes 895-byte packets). If the controller falls behind, audio is dropped
+rather than delayed.
+
+SBC (`sbc/`, a `no_std` crate) is the codec every A2DP headset must
+take. Each frame takes 128 samples per channel through an analysis
+filter bank into 8 subbands (an 80-tap prototype window and a cosine
+matrix, as the specification gives them), finds each band's scale
+factor, shares the bitpool's bits among the bands (the specification's
+loudness or SNR allocation), quantizes, and adds a CRC-8. Everything is
+fixed point, as the kernel has no floating point. Joint stereo codes a
+band as sum and difference when that needs less. Host tests encode
+tones and decode them with ffmpeg's decoder: 68 dB signal-to-noise at
+the usual bitpool.
 
 **Testing without the hardware**: QEMU has no Bluetooth device, so
 `xtask/src/bluetooth.rs` is one, attached over usbredir like the
@@ -2677,8 +2724,13 @@ by passkey, the others "just work"), with link keys derived from their
 addresses, so a stored key is checked; the keyboard and mouse then do
 L2CAP and HID, and after `SET_PROTOCOL` the keyboard types `echo
 bluetooth keyboard works` and Enter (in a session, the shell runs it)
-and the mouse moves and clicks. Disconnected by the host, a keyboard
-or mouse connects back by itself once, a second later. Kernel tests
+and the mouse moves and clicks. Disconnected by the host, a keyboard,
+mouse or the headset connects back by itself once, a second later. The
+headset is an A2DP sink: it answers AVDTP as one SBC endpoint, checks
+the frames of every audio packet, and appends them to
+`target/headset.sbc`, which `ffmpeg -f sbc -i target/headset.sbc` turns
+back into sound (`speaker-test -t sine` comes back as clean 440 Hz
+tones, left then right). Kernel tests
 check scanning, and pairing both devices, typing, reconnecting with the
 stored key and forgetting (`bluetooth_keyboards_and_mice_pair_and_come_back`).
 
@@ -3536,6 +3588,8 @@ trusted.
   keyboard interrupts (the PS/2 controller is told to fake a key press),
   a three-process pipeline, the C library self-test, disk I/O through AHCI.
 - **The FAT crate** has host unit tests (`cargo test -p fat`).
+- **The sbc crate**'s tests decode its frames with ffmpeg and measure
+  the signal-to-noise ratio: `cargo test -p sbc`.
 - **The tls crate** is tested against OpenSSL and, with
   `RADIUS_SERVER=host:port`, a FreeRADIUS server (secret `testing123`,
   user `testuser`, password `testpass`): `cargo test -p tls`.

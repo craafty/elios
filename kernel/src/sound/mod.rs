@@ -19,6 +19,7 @@ pub mod timer;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::errno::Result;
 use crate::fs::{self, Inode, PollSource, ramfs};
@@ -117,6 +118,42 @@ pub fn register_card(
 /// Card `card`'s stream in `direction`, if there is one.
 pub fn find_pcm(card: usize, direction: Direction) -> Option<Arc<pcm::Pcm>> {
     CARDS.lock().get(card)?.pcm(direction).cloned()
+}
+
+/// Whether card 0's speakers are off because its sound goes to a
+/// Bluetooth headset instead.
+static REDIRECTED: AtomicBool = AtomicBool::new(false);
+
+/// Turns card 0's speakers off (`true`) while what it plays is sent to a
+/// headset, or back on. Its volume setting still applies to the headset
+/// ([`playback_gain`]).
+pub fn redirect_playback(redirected: bool) {
+    if REDIRECTED.swap(redirected, Ordering::AcqRel) == redirected {
+        return;
+    }
+    let Some(card) = CARDS.lock().first().cloned() else { return };
+    let (step, on) = card.volumes.lock()[0];
+    card.mixer.set_volume(true, step, on && !redirected);
+    info!("sound: speakers {}", if redirected { "off (sound goes to a headset)" } else { "on" });
+}
+
+/// Whether card `index`'s speakers are kept off by [`redirect_playback`].
+fn speakers_off(index: usize) -> bool {
+    index == 0 && REDIRECTED.load(Ordering::Acquire)
+}
+
+/// Card 0's playback volume as a gain for samples sent elsewhere, in
+/// 1/65536ths: the setting's fraction of 0 dB, cubed (loudness goes
+/// roughly with the cube of amplitude steps), and nothing when muted.
+pub fn playback_gain() -> u32 {
+    let Some(card) = CARDS.lock().first().cloned() else { return 1 << 16 };
+    let (step, on) = card.volumes.lock()[0];
+    if !on {
+        return 0;
+    }
+    let full = u64::from(card.mixer.default_volume(true).max(1));
+    let fraction = u64::from(step).min(full) * 65536 / full;
+    (fraction * fraction / 65536 * fraction / 65536) as u32
 }
 
 /// /dev/snd, made on first use.
