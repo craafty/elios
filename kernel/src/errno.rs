@@ -38,6 +38,7 @@ pub enum Errno {
     EMLINK = 31,
     EPIPE = 32,
     ERANGE = 34,
+    EDEADLK = 35,
     ENAMETOOLONG = 36,
     ENOSYS = 38,
     ENOTEMPTY = 39,

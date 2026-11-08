@@ -14,7 +14,7 @@ pub const APPLETS: &[(&str, &str)] = &[
     ("dmesg", "show the kernel log"),
     ("echo", "print arguments"),
     ("edit", "edit a text file"),
-    ("env", "show environment variables"),
+    ("env", "show the environment, or run a command with a changed one"),
     ("false", "do nothing, unsuccessfully"),
     ("fetch", "show system information"),
     ("free", "show memory usage"),

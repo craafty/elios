@@ -109,8 +109,12 @@ const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
 const FUTEX_REQUEUE: u64 = 3;
 const FUTEX_CMP_REQUEUE: u64 = 4;
+const FUTEX_LOCK_PI: u64 = 6;
+const FUTEX_UNLOCK_PI: u64 = 7;
+const FUTEX_TRYLOCK_PI: u64 = 8;
 const FUTEX_WAIT_BITSET: u64 = 9;
 const FUTEX_WAKE_BITSET: u64 = 10;
+const FUTEX_LOCK_PI2: u64 = 13;
 const FUTEX_PRIVATE_FLAG: u64 = 128;
 const FUTEX_CLOCK_REALTIME: u64 = 256;
 
@@ -135,6 +139,15 @@ pub fn futex(address: u64, op: u64, value: u64, timeout: u64, address2: u64, val
         // For the requeue operations, the timeout argument is a count.
         FUTEX_REQUEUE => futex::requeue(address, address2, private, value, timeout as u32, None),
         FUTEX_CMP_REQUEUE => futex::requeue(address, address2, private, value, timeout as u32, Some(value3 as u32)),
+        // LOCK_PI's timeout is a time on the real-time clock; LOCK_PI2's
+        // is on the monotonic one unless FUTEX_CLOCK_REALTIME says.
+        FUTEX_LOCK_PI | FUTEX_LOCK_PI2 => {
+            let realtime = op & 0x7F == FUTEX_LOCK_PI || op & FUTEX_CLOCK_REALTIME != 0;
+            let deadline = deadline(timeout, Some(if realtime { CLOCK_REALTIME } else { CLOCK_MONOTONIC }))?;
+            futex::lock_pi(address, private, deadline, false).map(|_| 0)
+        }
+        FUTEX_TRYLOCK_PI => futex::lock_pi(address, private, None, true).map(|_| 0),
+        FUTEX_UNLOCK_PI => futex::unlock_pi(address, private),
         _ => Err(Errno::ENOSYS),
     }
 }

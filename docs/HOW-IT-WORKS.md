@@ -1154,6 +1154,17 @@ an address in the thread's descriptor. When the thread exits, the kernel
 stores 0 there and wakes one futex waiter at that address. That's all
 `pthread_join` needs: it waits on the thread id field until it's 0.
 
+**Priority-inheritance futexes.** For these the kernel, not the C
+library, decides who gets a mutex. The variable holds the owner's thread
+id, plus a "waiters" bit. `FUTEX_LOCK_PI` takes a free mutex (0) by storing
+the caller's id, and otherwise sets the waiters bit and sleeps.
+`FUTEX_UNLOCK_PI` hands the mutex straight to the first sleeper: it stores
+that thread's id, with the waiters bit if others still wait, and wakes it.
+`FUTEX_TRYLOCK_PI` never sleeps. There's no boosting (eliOS's scheduler has no
+priorities to lend), but the protocol is what matters: musl's
+`pthread_mutexattr_setprotocol(PTHREAD_PRIO_INHERIT)` tries `LOCK_PI` and
+fails if it's missing, and PulseAudio asserts that it works.
+
 **Ending threads.** `exit` (the system call) ends one thread;
 `exit_group` (what C's `exit()` calls) ends them all, and so does a fatal
 signal. A process-wide "ending" state records which: the status for
@@ -2109,6 +2120,24 @@ moving for 10 seconds fails reads and writes with `EIO`, as on Linux,
 instead of hanging the program. The hardware does one format, so
 `/etc/asound.conf` puts ALSA's `plug` layer in front of it, which
 converts any rate, format or channel count in the program.
+
+**Period timers** (`sound/timer.rs`). A program can ask to be woken at the
+end of every period rather than when enough frames are ready (ALSA's
+*period event*). PulseAudio does this when it can't schedule by the clock
+(inside a VM, or without mmap). `libasound` then opens `/dev/snd/timer`,
+selects the stream's PCM timer and polls it next to the PCM. Here each
+open timer counts the stream's periods by its hardware pointer, and is
+readable when that count has moved since the last read.
+
+**PulseAudio.** Firefox's ALSA backend can play but can't list or open
+microphones, so `getUserMedia({audio: true})` needs a sound server.
+Alpine's PulseAudio runs on eliOS's ALSA unchanged. Its default
+startup script wants udev, which eliOS lacks, so when `pulseaudio` is
+installed the desktop starts it with the modules named:
+the first card's sink and source, and the native socket in
+`$XDG_RUNTIME_DIR/pulse`. Its log goes to `$XDG_RUNTIME_DIR/pulseaudio.log`.
+Starting it from a shell without the desktop's `XDG_RUNTIME_DIR` puts
+the socket somewhere else, and Firefox then finds no devices.
 
 Two Linux details mattered. musl declares `ioctl`'s request as an `int`,
 so ALSA's requests (most have the top bit set) arrive sign-extended to

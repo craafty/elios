@@ -367,7 +367,9 @@ eliOS's own rasterizer in `truetype/`.
       `poll` wakeups, a kernel heap cache, damage-only redraws
 - [x] **Sound:** an Intel HD Audio driver (codec routes found like
       Linux's generic driver, so no per-laptop tables) behind Linux's
-      ALSA interface, so `libasound` programs play and record
+      ALSA interface, so `libasound` programs play and record;
+      PulseAudio (`eli add pulseaudio pulseaudio-alsa`) runs on it and the
+      desktop starts it, so Firefox's `getUserMedia` gets the microphone
 - [x] **Faster clocks:** a vDSO, so `clock_gettime`, `gettimeofday` and
       `time` read the TSC in the program without a system call (glibc and
       musl both use it)

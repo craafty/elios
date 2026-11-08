@@ -280,6 +280,9 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         128 => processes::sigtimedwait(a[0], a[1], a[2], a[3]),
         130 => processes::sigsuspend(a[0], a[1]),
         131 => processes::sigaltstack(a[0], a[1]),
+        // personality: only Linux's own (0) exists; 0xFFFFFFFF asks.
+        135 if a[0] as u32 == 0 || a[0] as u32 == 0xFFFF_FFFF => Ok(0),
+        135 => Err(Errno::EINVAL),
         137 => files::statfs(a[0], a[1]),
         // getpriority and setpriority: everything runs at the normal
         // priority (reported, as the system call does, as 20 - nice).

@@ -720,11 +720,55 @@ fn dmesg(_: &[String]) -> i32 {
     }
 }
 
-fn env_command(_: &[String]) -> i32 {
-    for variable in env::vars() {
-        println!("{variable}");
+/// `env [-i] [-u NAME]... [NAME=VALUE]... [COMMAND [ARGUMENT]...]`: shows
+/// the environment, or runs a command with a changed one.
+fn env_command(arguments: &[String]) -> i32 {
+    let mut variables = env::vars();
+    let mut rest = &arguments[1..];
+    while let Some(first) = rest.first() {
+        if first == "-i" || first == "-" {
+            variables.clear();
+        } else if first == "-u" {
+            let Some(name) = rest.get(1) else {
+                eprintln!("usage: env [-i] [-u NAME] [NAME=VALUE]... [COMMAND [ARGUMENT]...]");
+                return 2;
+            };
+            variables.retain(|v| v.split_once('=').is_none_or(|(key, _)| key != name));
+            rest = &rest[1..];
+        } else if let Some((name, _)) = first.split_once('=') {
+            variables.retain(|v| v.split_once('=').is_none_or(|(key, _)| key != name));
+            variables.push(first.clone());
+        } else {
+            break;
+        }
+        rest = &rest[1..];
     }
-    0
+    let Some(name) = rest.first() else {
+        for variable in variables {
+            println!("{variable}");
+        }
+        return 0;
+    };
+    // The command is looked up in the new $PATH, as other envs do.
+    if let Some(path) = variables.iter().find_map(|v| v.strip_prefix("PATH=")) {
+        env::set_var("PATH", path);
+    }
+    let Some(path) = process::find_program(name) else {
+        eprintln!("env: {name}: command not found");
+        return 127;
+    };
+    match process::fork() {
+        Ok(0) => {
+            let error = process::exec(&path, rest, &variables);
+            eprintln!("env: {name}: {error}");
+            process::exit(126)
+        }
+        Ok(pid) => match process::wait(pid as i32, false) {
+            Ok(Some((_, status))) => status.shell_code(),
+            _ => 1,
+        },
+        Err(error) => report("env", name, error),
+    }
 }
 
 fn kill(arguments: &[String]) -> i32 {

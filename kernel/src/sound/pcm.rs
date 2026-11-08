@@ -1143,6 +1143,36 @@ impl Card {
 }
 
 impl Pcm {
+    pub fn card(&self) -> usize {
+        self.card
+    }
+
+    /// Notified at every period's end and state change.
+    pub fn events(&self) -> Arc<PollSource> {
+        self.events.clone()
+    }
+
+    /// How many periods the device has played or recorded since the stream
+    /// was prepared (wrapping), if it's running: what the stream's timer
+    /// ([`super::timer`]) counts.
+    pub fn periods_elapsed(&self) -> Option<u64> {
+        let mut runtime = self.runtime.lock();
+        let then = self.update(&mut runtime);
+        let count = match runtime.state {
+            State::Running | State::Draining if runtime.period > 0 => Some(runtime.hw_ptr / runtime.period),
+            _ => None,
+        };
+        drop(runtime);
+        self.act(then);
+        count
+    }
+
+    /// A period's length in nanoseconds (0 before the parameters are set).
+    pub fn period_nanos(&self) -> u64 {
+        let runtime = self.runtime.lock();
+        if runtime.rate == 0 { 0 } else { runtime.period * 1_000_000_000 / u64::from(runtime.rate) }
+    }
+
     /// Fills a `struct snd_pcm_info` for the control device.
     pub fn write_info(&self, address: u64) -> Result<u64> {
         self.info(address)

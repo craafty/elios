@@ -7,6 +7,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use super::address_space;
 use crate::errno::{Errno, Result};
@@ -41,6 +42,19 @@ pub fn write_value<T: Copy>(address: u64, value: &T) -> Result<()> {
     // SAFETY: as for `read_value`.
     unsafe { core::ptr::write_unaligned(address as *mut T, *value) };
     Ok(())
+}
+
+/// Atomically replaces the `u32` at `address` with `new` if it holds
+/// `current` (for PI futexes, whose variable both sides change). Returns
+/// what it held.
+pub fn compare_exchange_u32(address: u64, current: u32, new: u32) -> Result<u32> {
+    if !address.is_multiple_of(4) {
+        return Err(Errno::EINVAL);
+    }
+    check(address, 4, true)?;
+    // SAFETY: checked above, and aligned.
+    let atomic = unsafe { core::sync::atomic::AtomicU32::from_ptr(address as *mut u32) };
+    Ok(atomic.compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst).unwrap_or_else(|held| held))
 }
 
 pub fn write_bytes(address: u64, data: &[u8]) -> Result<()> {

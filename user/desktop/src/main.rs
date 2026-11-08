@@ -111,6 +111,7 @@ fn main() -> i32 {
     let _ = epoll.add(timer, TOKEN_TIMER);
 
     let mut desktop = Desktop::new(screen, font);
+    start_sound_server(&mut desktop, &runtime);
     let mut devices: Vec<InputDevice> = Vec::new();
     let mut ticks = 0u64;
     scan_devices(&mut devices, &epoll);
@@ -184,6 +185,31 @@ fn main() -> i32 {
     sys::unlink(&socket_path);
     println!("desktop: goodbye");
     0
+}
+
+/// Starts PulseAudio, if it's installed, so programs find it in
+/// `$XDG_RUNTIME_DIR/pulse`. Firefox needs it for microphones: its ALSA
+/// backend can only play. PulseAudio's default script wants udev, which
+/// eliOS doesn't have, so the modules are named here: the first sound
+/// card's speaker and microphone, and the socket clients connect to.
+/// `-D` makes it a daemon that outlives the desktop; starting it again
+/// when one runs does nothing.
+fn start_sound_server(desktop: &mut Desktop, runtime: &str) {
+    let Some(path) = eli::process::find_program("pulseaudio") else { return };
+    let arguments = [
+        "-n",
+        "-D",
+        "--exit-idle-time=-1",
+        &format!("--log-target=file:{runtime}/pulseaudio.log"),
+        "-L",
+        "module-alsa-sink device=hw:0",
+        "-L",
+        "module-alsa-source device=hw:0",
+        "-L",
+        "module-native-protocol-unix",
+    ];
+    let arguments: Vec<String> = arguments.iter().map(|&a| String::from(a)).collect();
+    desktop.run(&path, &arguments);
 }
 
 /// `$XDG_RUNTIME_DIR`, or a private directory in /tmp.

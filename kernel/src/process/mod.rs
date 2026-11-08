@@ -270,9 +270,13 @@ struct Image {
     space: AddressSpace,
     entry: u64,
     stack_pointer: u64,
-    /// The program actually run, and its arguments (scripts gain their
+    /// The program actually run, with symbolic links resolved (for
+    /// `/proc/PID/exe`), and its arguments (scripts gain their
     /// interpreter).
     path: String,
+    /// The process's name: the program's file name as it was run (so
+    /// BusyBox's links name their applets).
+    name: String,
     arguments: Vec<String>,
     /// Who the program runs as: changed if it's setuid or setgid.
     credentials: Credentials,
@@ -290,7 +294,7 @@ fn load_image(
     arguments: Vec<String>,
     environment: &[String],
 ) -> Result<Image> {
-    let inode = fs::lookup_as(credentials, cwd, path, true)?;
+    let (inode, resolved) = fs::lookup_with_path(credentials, cwd, path)?;
     let metadata = inode.metadata();
     if metadata.kind != FileKind::Regular {
         return Err(Errno::EACCES);
@@ -326,8 +330,7 @@ fn load_image(
     };
     let mut space = AddressSpace::new()?;
     let mut program = elf::load(&mut space, &data)?;
-    let full_path = fs::normalize(cwd, path);
-    space.name_unnamed(&full_path, program.base);
+    space.name_unnamed(&resolved, program.base);
     if let Some(interpreter) = program.interpreter.clone() {
         let inode = fs::lookup_as(&credentials, cwd, &interpreter, true)?;
         let mut interpreter_data = vec![0; inode.metadata().size as usize];
@@ -338,8 +341,8 @@ fn load_image(
     program.vdso = vdso::map(&mut space)?;
     let stack_pointer = elf::build_stack(&mut space, &program, &arguments, environment, path, &credentials)?;
     space.set_name(stack_pointer, "[stack]".into());
-    let path = full_path;
-    Ok(Image { space, entry: program.start(), stack_pointer, path, arguments, credentials })
+    let name = base_name(&fs::normalize(cwd, path)).to_string();
+    Ok(Image { space, entry: program.start(), stack_pointer, path: resolved, name, arguments, credentials })
 }
 
 fn base_name(path: &str) -> &str {
@@ -560,7 +563,7 @@ pub fn exec(frame: &mut InterruptFrame, path: &str, arguments: Vec<String>, envi
     timers::process_executed(process.pid);
     process.signals.lock().exec();
     thread.signals.lock().exec();
-    let name = base_name(&image.path).to_string();
+    let name = image.name.clone();
     task::set_name(&name);
     *process.name.lock() = name;
     *process.executable.lock() = image.path;

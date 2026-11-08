@@ -14,6 +14,7 @@
 
 pub mod control;
 pub mod pcm;
+pub mod timer;
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -107,7 +108,15 @@ pub fn register_card(
     if let Some(capture) = &card.capture {
         let _ = directory.link(&alloc::format!("pcmC{index}D0c"), pcm::PcmNode::new(capture.clone()));
     }
+    if directory.lookup("timer").is_err() {
+        let _ = directory.link("timer", timer::TimerNode::new());
+    }
     info!("sound: card {index}: {name}{}", if card.capture.is_some() { ", with a microphone" } else { "" });
+}
+
+/// Card `card`'s stream in `direction`, if there is one.
+pub fn find_pcm(card: usize, direction: Direction) -> Option<Arc<pcm::Pcm>> {
+    CARDS.lock().get(card)?.pcm(direction).cloned()
 }
 
 /// /dev/snd, made on first use.

@@ -13,6 +13,14 @@
 //! by the memory object and offset, as on Linux. Each waiter has its own
 //! wait queue, so waking one thread wakes exactly that thread, and a wake
 //! only looks at the waiters for its own futex.
+//!
+//! *Priority-inheritance* futexes (`FUTEX_LOCK_PI` and friends) are a
+//! second protocol on the same map: the variable holds the owner's thread
+//! ID (plus a "waiters" bit), and the kernel, not the program, hands the
+//! lock to the next waiter on unlock. musl uses them for
+//! `PTHREAD_PRIO_INHERIT` mutexes, which PulseAudio asks for. There's no
+//! priority to inherit here (the scheduler has none), so only the locking
+//! is done.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -54,6 +62,9 @@ pub fn key(address: u64, private: bool) -> (Key, Option<Arc<MemoryObject>>) {
 }
 
 struct Waiter {
+    /// For PI futexes, the waiting thread (which an unlock makes the
+    /// owner); 0 for ordinary waits.
+    tid: Pid,
     /// For the `_BITSET` operations: a wake only reaches waiters whose bits
     /// overlap its own.
     bitset: u32,
@@ -86,7 +97,7 @@ pub fn wait(address: u64, private: bool, expected: u32, bitset: u32, deadline: O
     }
     let (mut key, object) = key(address, private);
     let queue = Arc::new(WaitQueue::new());
-    let mut waiter = Some(Waiter { bitset, queue: queue.clone(), _object: object });
+    let mut waiter = Some(Waiter { tid: 0, bitset, queue: queue.clone(), _object: object });
     let outcome = queue.wait_until_deadline(deadline, || {
         let mut waiters = WAITERS.lock();
         if let Some(waiter) = waiter.take() {
@@ -202,4 +213,121 @@ pub fn requeue(from: u64, to: u64, private: bool, count: u32, requeue: u32, expe
         waiter.queue.wake_all();
     }
     Ok(woken.1 as u64)
+}
+
+/// Bits of a PI futex's variable: the rest is the owner's thread ID.
+const PI_WAITERS: u32 = 0x8000_0000;
+const PI_OWNER_DIED: u32 = 0x4000_0000;
+const PI_TID: u32 = 0x3FFF_FFFF;
+
+/// `FUTEX_LOCK_PI` (and `FUTEX_TRYLOCK_PI` when `try_only`): takes the PI
+/// lock at `address`, waiting (until `deadline`) while another thread owns
+/// it. Linux's errors: `EDEADLK` for the owner itself, `EAGAIN` when
+/// trying a held lock.
+pub fn lock_pi(address: u64, private: bool, deadline: Option<u64>, try_only: bool) -> Result<()> {
+    // Mapped (and made private, if copy-on-write) before the lock is taken.
+    user::compare_exchange_u32(address, 0, 0)?;
+    let tid = super::current_thread().tid();
+    let (mut key, object) = key(address, private);
+    let queue = Arc::new(WaitQueue::new());
+    let mut waiter = Some(Waiter { tid, bitset: u32::MAX, queue: queue.clone(), _object: object });
+    let outcome = queue.wait_until_deadline(deadline, || {
+        let mut waiters = WAITERS.lock();
+        if let Some(new) = waiter.take() {
+            loop {
+                let value = match user::compare_exchange_u32(address, 0, 0) {
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error)),
+                };
+                if value & PI_TID == 0 {
+                    // Free: take it, keeping the bits (a waiter that gave
+                    // up may have left the waiters bit; it's harmless).
+                    let others = if waiters.contains_key(&key) { PI_WAITERS } else { 0 };
+                    let taken = tid | (value & PI_OWNER_DIED) | others;
+                    match user::compare_exchange_u32(address, value, taken) {
+                        Ok(held) if held == value => return Some(Ok(())),
+                        Ok(_) => continue,
+                        Err(error) => return Some(Err(error)),
+                    }
+                }
+                if value & PI_TID == tid {
+                    return Some(Err(Errno::EDEADLK));
+                }
+                if try_only {
+                    return Some(Err(Errno::EAGAIN));
+                }
+                // Held: say there's a waiter, so the owner's unlock comes here.
+                match user::compare_exchange_u32(address, value, value | PI_WAITERS) {
+                    Ok(held) if held == value => break,
+                    Ok(_) => continue,
+                    Err(error) => return Some(Err(error)),
+                }
+            }
+            waiters.entry(key).or_default().push(new);
+            return None;
+        }
+        let Some(here) = find(&waiters, key, &queue) else {
+            // An unlock handed it over.
+            return Some(Ok(()));
+        };
+        key = here;
+        if super::signal_pending() {
+            remove(&mut waiters, key, &queue);
+            return Some(Err(Errno::EINTR));
+        }
+        None
+    });
+    match outcome {
+        Some(result) => result,
+        None => {
+            let mut waiters = WAITERS.lock();
+            match find(&waiters, key, &queue) {
+                Some(here) => {
+                    remove(&mut waiters, here, &queue);
+                    Err(Errno::ETIMEDOUT)
+                }
+                None => Ok(()),
+            }
+        }
+    }
+}
+
+/// `FUTEX_UNLOCK_PI`: releases the PI lock at `address`, which the running
+/// thread must own, handing it straight to the longest waiter if any.
+pub fn unlock_pi(address: u64, private: bool) -> Result<u64> {
+    user::compare_exchange_u32(address, 0, 0)?;
+    let tid = super::current_thread().tid();
+    let (key, _object) = key(address, private);
+    let next = {
+        let mut waiters = WAITERS.lock();
+        loop {
+            let value = user::compare_exchange_u32(address, 0, 0)?;
+            if value & PI_TID != tid {
+                return Err(Errno::EPERM);
+            }
+            let list = waiters.get_mut(&key);
+            let next = list.as_ref().and_then(|list| list.iter().position(|waiter| waiter.tid != 0));
+            let new = match (next, &list) {
+                (Some(index), Some(list)) => {
+                    let others = if list.len() > 1 { PI_WAITERS } else { 0 };
+                    list[index].tid | others
+                }
+                _ => 0,
+            };
+            if user::compare_exchange_u32(address, value, new)? != value {
+                continue;
+            }
+            let Some(index) = next else { break None };
+            let list = waiters.get_mut(&key).expect("the list just looked at");
+            let waiter = list.remove(index);
+            if list.is_empty() {
+                waiters.remove(&key);
+            }
+            break Some(waiter);
+        }
+    };
+    if let Some(waiter) = next {
+        waiter.queue.wake_all();
+    }
+    Ok(0)
 }

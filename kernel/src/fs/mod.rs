@@ -429,16 +429,24 @@ pub fn lookup(cwd: &str, path: &str, follow: bool) -> Result<Arc<dyn Inode>> {
 
 /// [`lookup`] with someone else's credentials.
 pub fn lookup_as(credentials: &Credentials, cwd: &str, path: &str, follow: bool) -> Result<Arc<dyn Inode>> {
-    lookup_depth(credentials, cwd, path, follow, 0)
+    lookup_depth(credentials, cwd, path, follow, 0).map(|(inode, _)| inode)
 }
 
+/// [`lookup_as`] (following links), also giving the absolute path of what
+/// was found, with every symbolic link resolved (what Linux's
+/// `/proc/PID/exe` shows).
+pub fn lookup_with_path(credentials: &Credentials, cwd: &str, path: &str) -> Result<(Arc<dyn Inode>, String)> {
+    lookup_depth(credentials, cwd, path, true, 0)
+}
+
+/// The inode at `path`, and the path it was finally found at.
 fn lookup_depth(
     credentials: &Credentials,
     cwd: &str,
     path: &str,
     follow: bool,
     depth: usize,
-) -> Result<Arc<dyn Inode>> {
+) -> Result<(Arc<dyn Inode>, String)> {
     if path.is_empty() {
         return Err(Errno::ENOENT);
     }
@@ -465,7 +473,7 @@ fn lookup_depth(
         }
         inode = next;
     }
-    Ok(inode)
+    Ok((inode, full))
 }
 
 fn format_path(components: &[&str]) -> String {

@@ -38,6 +38,31 @@ static void *count_up(void *argument) {
     return NULL;
 }
 
+/* The same with a priority-inheritance mutex, whose contended paths are
+   FUTEX_LOCK_PI and FUTEX_UNLOCK_PI (PulseAudio uses these). */
+static pthread_mutex_t pi_lock;
+static long pi_counter = 0;
+
+static void *count_up_pi(void *argument) {
+    (void)argument;
+    for (int i = 0; i < 20000; i++) {
+        pthread_mutex_lock(&pi_lock);
+        pi_counter++;
+        pthread_mutex_unlock(&pi_lock);
+    }
+    return NULL;
+}
+
+static void *try_pi_lock(void *argument) {
+    (void)argument;
+    struct timespec soon;
+    clock_gettime(CLOCK_REALTIME, &soon);
+    soon.tv_nsec += 50000000;
+    if (soon.tv_nsec >= 1000000000) soon.tv_sec++, soon.tv_nsec -= 1000000000;
+    int tried = pthread_mutex_trylock(&pi_lock), timed = pthread_mutex_timedlock(&pi_lock, &soon);
+    return (void *)(long)(tried == EBUSY && timed == ETIMEDOUT);
+}
+
 /* A one-slot queue between a producer and a consumer. */
 static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_changed = PTHREAD_COND_INITIALIZER;
@@ -117,6 +142,21 @@ int main(void) {
     for (int i = 0; i < 8; i++) pthread_create(&threads[i], NULL, count_up, NULL);
     for (int i = 0; i < 8; i++) pthread_join(threads[i], NULL);
     check("a mutex protects a shared counter", counter == 8 * 20000);
+
+    pthread_mutexattr_t attributes;
+    pthread_mutexattr_init(&attributes);
+    check("priority-inheritance mutexes exist",
+          pthread_mutexattr_setprotocol(&attributes, PTHREAD_PRIO_INHERIT) == 0 &&
+              pthread_mutex_init(&pi_lock, &attributes) == 0);
+    for (int i = 0; i < 8; i++) pthread_create(&threads[i], NULL, count_up_pi, NULL);
+    for (int i = 0; i < 8; i++) pthread_join(threads[i], NULL);
+    check("and protect a shared counter", pi_counter == 8 * 20000);
+    pthread_mutex_lock(&pi_lock);
+    pthread_create(&threads[0], NULL, try_pi_lock, NULL);
+    pthread_join(threads[0], &result);
+    check("a held one can't be tried or taken in time", (long)result == 1);
+    check("and unlocks", pthread_mutex_unlock(&pi_lock) == 0 && pthread_mutex_trylock(&pi_lock) == 0 &&
+                             pthread_mutex_unlock(&pi_lock) == 0);
 
     pthread_create(&threads[0], NULL, produce, NULL);
     int sum = 0, received = 0;
