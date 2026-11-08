@@ -42,6 +42,11 @@ pub struct Cpu {
     /// (the scheduler keeps both up to date).
     pub current_thread: AtomicU64,
     pub current_user: AtomicPtr<()>,
+    /// The page tables the scheduler last loaded here (CR3), so that
+    /// changes to a program's mappings only interrupt the CPUs running it
+    /// (see `smp::flush_user_tlb`). `u64::MAX` until the first switch:
+    /// unknown, so always flushed.
+    pub page_table: AtomicU64,
 }
 
 impl Cpu {
@@ -58,6 +63,7 @@ impl Cpu {
             tss: AtomicU64::new(0),
             current_thread: AtomicU64::new(0),
             current_user: AtomicPtr::new(core::ptr::null_mut()),
+            page_table: AtomicU64::new(u64::MAX),
         }
     }
 

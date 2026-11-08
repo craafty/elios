@@ -9,9 +9,10 @@ pub mod interrupts;
 pub mod pic;
 pub mod pit;
 pub mod smp;
+pub mod speed;
 pub mod syscall;
 
-use core::arch::asm;
+use core::arch::{asm, global_asm};
 
 /// # Safety
 /// Writing to an I/O port can reconfigure hardware arbitrarily.
@@ -82,6 +83,76 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
             options(nostack, preserves_flags),
         )
     };
+}
+
+// MSR accesses that may fault: if `rdmsr` or `wrmsr` raises #GP (the MSR
+// doesn't exist, or refuses the value), the exception handler resumes at
+// `eli_msr_fault`, which returns 0 instead of 1 (see `msr_fault_fixup`).
+global_asm!(
+    ".global eli_try_rdmsr",
+    "eli_try_rdmsr:", // (msr: u32, value: *mut u64) -> u32
+    "mov ecx, edi",
+    ".global eli_rdmsr_instruction",
+    "eli_rdmsr_instruction:",
+    "rdmsr",
+    "shl rdx, 32",
+    "or rax, rdx",
+    "mov [rsi], rax",
+    "mov eax, 1",
+    "ret",
+    ".global eli_try_wrmsr",
+    "eli_try_wrmsr:", // (msr: u32, value: u64) -> u32
+    "mov ecx, edi",
+    "mov eax, esi",
+    "mov rdx, rsi",
+    "shr rdx, 32",
+    ".global eli_wrmsr_instruction",
+    "eli_wrmsr_instruction:",
+    "wrmsr",
+    "mov eax, 1",
+    "ret",
+    ".global eli_msr_fault",
+    "eli_msr_fault:",
+    "xor eax, eax",
+    "ret",
+);
+
+unsafe extern "sysv64" {
+    fn eli_try_rdmsr(msr: u32, value: *mut u64) -> u32;
+    fn eli_try_wrmsr(msr: u32, value: u64) -> u32;
+    static eli_rdmsr_instruction: u8;
+    static eli_wrmsr_instruction: u8;
+    static eli_msr_fault: u8;
+}
+
+/// Reads a model-specific register, or `None` if this CPU doesn't have it.
+/// For registers that only some CPUs have (speed control): reading has no
+/// side effects on those.
+pub fn try_rdmsr(msr: u32) -> Option<u64> {
+    let mut value = 0;
+    // SAFETY: a missing MSR faults and is caught; reading the ones this is
+    // used for changes nothing.
+    (unsafe { eli_try_rdmsr(msr, &raw mut value) } != 0).then_some(value)
+}
+
+/// Writes a model-specific register, returning false if the CPU refused
+/// (no such register, or a value it doesn't accept). Only for registers
+/// whose values can't break the kernel (speed requests).
+pub fn try_wrmsr(msr: u32, value: u64) -> bool {
+    // SAFETY: as above; callers only write performance controls.
+    unsafe { eli_try_wrmsr(msr, value) != 0 }
+}
+
+/// Called for a general protection fault in the kernel: if it was one of
+/// the MSR instructions above, makes it return failure. Returns whether
+/// it was.
+pub fn msr_fault_fixup(rip: &mut u64) -> bool {
+    let at = |symbol: *const u8| symbol as u64;
+    if *rip == at(&raw const eli_rdmsr_instruction) || *rip == at(&raw const eli_wrmsr_instruction) {
+        *rip = at(&raw const eli_msr_fault);
+        return true;
+    }
+    false
 }
 
 /// Returns `[eax, ebx, ecx, edx]` for a CPUID leaf and subleaf.

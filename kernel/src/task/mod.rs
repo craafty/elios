@@ -370,6 +370,8 @@ pub fn set_address_space(root: u64) {
             let current = s.current();
             s.threads.get_mut(&current).unwrap().address_space = root;
         });
+        // Recorded first: see `smp::flush_user_tlb`.
+        cpu::current().page_table.store(root, Ordering::SeqCst);
         // SAFETY: callers pass tables that share the kernel half.
         unsafe { arch::set_page_table_root(root) };
     });
@@ -435,6 +437,12 @@ pub fn join(id: ThreadId) {
 /// Each CPU's (busy, idle) time in timer ticks, by CPU index.
 pub fn cpu_times() -> Vec<(u64, u64)> {
     with(|s| s.cpus.iter().map(|slot| (slot.busy_ticks, slot.idle_ticks)).collect())
+}
+
+/// Timer ticks (milliseconds) the given threads have spent running, in
+/// total; threads that have gone count nothing.
+pub fn cpu_ticks_of(ids: &[ThreadId]) -> u64 {
+    with(|s| ids.iter().filter_map(|id| s.threads.get(id)).map(|thread| thread.cpu_ticks).sum())
 }
 
 pub fn list() -> Vec<ThreadInfo> {
@@ -595,6 +603,8 @@ fn switch(how: How) {
     let user = new.user.as_ref().map_or(core::ptr::null_mut(), |user| Arc::as_ptr(user).cast_mut().cast());
     cpu.current_user.store(user, Ordering::Relaxed);
     if new.address_space != old_address_space {
+        // Recorded first: see `smp::flush_user_tlb`.
+        cpu.page_table.store(new.address_space, Ordering::SeqCst);
         // SAFETY: every address space shares the kernel half, where this
         // code and the stacks live.
         unsafe { arch::set_page_table_root(new.address_space) };

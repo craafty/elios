@@ -288,6 +288,7 @@ extern "sysv64" fn ap_main(cpu: &'static Cpu) -> ! {
     interrupts::load();
     syscall::init();
     fpu::init_cpu();
+    super::speed::init_other();
     apic::init_local(acpi::madt().expect("ACPI tables were read at startup"));
     time::start_timer();
     let stack = STARTING_STACK.lock().take().expect("started CPU has no stack");
@@ -304,6 +305,35 @@ static SHOOTDOWN_END: AtomicU64 = AtomicU64::new(0);
 /// freeing the memory they pointed at: other CPUs may still have the old
 /// translations cached.
 pub fn flush_tlb(start: u64, end: u64) {
+    shoot_down(start, end, None);
+}
+
+/// [`flush_tlb`] for a range of a program's memory (the lower half) in the
+/// page tables at `root`: only CPUs running with those tables can have
+/// its translations cached, since loading CR3 drops all non-global ones.
+/// Programs free and discard memory all the time (allocators returning
+/// pages with `madvise`), and interrupting every CPU each time, to wait
+/// for all of them, is most of what that costs.
+///
+/// Why skipping the others is safe: the caller changed the entries before
+/// calling, and the scheduler records a CPU's tables before loading them.
+/// A CPU not yet recorded as running `root` when this looks will load it
+/// afterwards, after the change, and so can't hold the old entries.
+pub fn flush_user_tlb(root: u64, start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+    shoot_down(start, end, Some(root));
+}
+
+/// Flushes `start..end` here and on the other CPUs: all of them, or only
+/// those running the page tables at `root`.
+fn shoot_down(start: u64, end: u64, root: Option<u64>) {
+    let involved = |cpu: &cpu::Cpu| {
+        let loaded = cpu.page_table.load(Ordering::SeqCst);
+        root.is_none_or(|root| loaded == root || loaded == u64::MAX)
+    };
     flush_local(start, end);
     if !ACTIVE.load(Ordering::Acquire) {
         return;
@@ -311,22 +341,34 @@ pub fn flush_tlb(start: u64, end: u64) {
     let enabled = super::interrupts_enabled();
     super::disable_interrupts();
     let me = cpu::current().index();
+    let targets = || cpu::online().filter(|cpu| cpu.index() != me && involved(cpu));
+    if targets().next().is_none() {
+        if enabled {
+            super::enable_interrupts();
+        }
+        return;
+    }
     while SHOOTDOWN_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
         serve_shootdown();
         core::hint::spin_loop();
     }
     SHOOTDOWN_START.store(start, Ordering::Relaxed);
     SHOOTDOWN_END.store(end, Ordering::Relaxed);
-    let mut others = false;
-    for cpu in cpu::online().filter(|cpu| cpu.index() != me) {
+    // Which CPUs to wait for is decided once: one that switches to the
+    // tables meanwhile picks up the change by itself.
+    let mut waiting = [false; cpu::MAX_CPUS];
+    for cpu in targets() {
+        waiting[cpu.index()] = true;
         cpu.shootdown_pending.store(true, Ordering::Release);
-        others = true;
-    }
-    if others {
-        apic::broadcast_ipi(interrupts::TLB_SHOOTDOWN);
-        while cpu::online().any(|cpu| cpu.shootdown_pending.load(Ordering::Acquire)) {
-            core::hint::spin_loop();
+        if root.is_some() {
+            apic::send_ipi(cpu.apic_id.load(Ordering::Relaxed), interrupts::TLB_SHOOTDOWN);
         }
+    }
+    if root.is_none() {
+        apic::broadcast_ipi(interrupts::TLB_SHOOTDOWN);
+    }
+    while cpu::online().any(|cpu| waiting[cpu.index()] && cpu.shootdown_pending.load(Ordering::Acquire)) {
+        core::hint::spin_loop();
     }
     SHOOTDOWN_LOCK.store(false, Ordering::Release);
     if enabled {

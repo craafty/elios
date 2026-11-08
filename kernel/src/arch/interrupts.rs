@@ -21,6 +21,7 @@ use crate::sync::TakeOnce;
 pub const DOUBLE_FAULT: u8 = 8;
 pub const NMI: u8 = 2;
 pub const BREAKPOINT: u8 = 3;
+pub const GENERAL_PROTECTION: u8 = 13;
 pub const PAGE_FAULT: u8 = 14;
 pub const MACHINE_CHECK: u8 = 18;
 /// The legacy PICs are remapped here and masked; only spurious interrupts
@@ -293,6 +294,9 @@ fn handle_exception(frame: &mut InterruptFrame) {
     if frame.vector == u64::from(BREAKPOINT) {
         BREAKPOINTS.fetch_add(1, Ordering::Relaxed);
         debug!("breakpoint at {:#x}", frame.rip);
+        return;
+    }
+    if frame.vector == u64::from(GENERAL_PROTECTION) && super::msr_fault_fixup(&mut frame.rip) {
         return;
     }
     let fault_address = if frame.vector == u64::from(PAGE_FAULT) { Some(super::read_cr2()) } else { None };

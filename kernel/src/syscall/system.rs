@@ -73,6 +73,35 @@ pub fn time(address: u64) -> Result<u64> {
     Ok(now)
 }
 
+/// `getrusage(who, usage)`: CPU time used and the largest resident size.
+/// Firefox asks many times a second (to watch its own CPU use), so this
+/// must be cheap and never fail. The scheduler counts running time but
+/// not where it went, so all of it is reported as user time. Children's
+/// use (`RUSAGE_CHILDREN`) isn't kept once they're reaped: it reads zero.
+pub fn getrusage(who: u64, usage: u64) -> Result<u64> {
+    const RUSAGE_SELF: i32 = 0;
+    const RUSAGE_THREAD: i32 = 1;
+    const RUSAGE_CHILDREN: i32 = -1;
+    let process = process::current();
+    let ids: Vec<crate::task::ThreadId> = match who as i32 {
+        RUSAGE_SELF => process.threads.lock().iter().map(|thread| thread.id).collect(),
+        RUSAGE_THREAD => alloc::vec![crate::task::current()],
+        RUSAGE_CHILDREN => Vec::new(),
+        _ => return Err(Errno::EINVAL),
+    };
+    let milliseconds = crate::task::cpu_ticks_of(&ids);
+    // struct rusage: user and system `timeval`s, then 14 longs, the first
+    // of which is the largest resident set size in KiB.
+    let mut fields = [0u64; 18];
+    fields[0] = milliseconds / 1000;
+    fields[1] = milliseconds % 1000 * 1000;
+    if who as i32 != RUSAGE_CHILDREN {
+        fields[4] = process.space.lock().as_ref().map_or(0, process::AddressSpace::resident_bytes) / 1024;
+    }
+    user::write_value(usage, &fields)?;
+    Ok(0)
+}
+
 /// `sysinfo`: uptime, memory and process count.
 pub fn sysinfo(address: u64) -> Result<u64> {
     let memory = frames::stats();

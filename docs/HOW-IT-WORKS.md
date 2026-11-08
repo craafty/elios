@@ -601,6 +601,28 @@ The TSC on older CPUs (and in QEMU's default CPU model) isn't "invariant":
 it can change speed with power states. The kernel warns but uses it anyway;
 in QEMU it's stable.
 
+### CPU speed (`arch/speed.rs`)
+
+Intel CPUs start at whatever speed the firmware left them, usually the
+base clock (the T440p's i7-4910MQ: 2.9 GHz), and turbo (up to 3.9 GHz on
+one core) only runs when the operating system asks for a ratio above
+base by writing `IA32_PERF_CTL`. Without that, single-thread speed (which
+software video rendering in Firefox lives on) is a quarter lower than it
+could be. At boot the kernel turns Enhanced SpeedStep on if needed,
+reads the base ratio (`MSR_PLATFORM_INFO`) and the one-core turbo limit
+(`MSR_TURBO_RATIO_LIMIT`), unless the firmware's setup forbids turbo
+(`IA32_MISC_ENABLE` bit 38), and asks every CPU for the higher. This is
+Linux's "performance" policy: idle cores still halt and drop their clock,
+and the CPU throttles itself when hot. The measured speed before and
+after (APERF against MPERF over 20 ms of spinning) goes to the log.
+
+Model-specific registers fault (`#GP`) where they don't exist, so these
+accesses go through `try_rdmsr`/`try_wrmsr`: the `rdmsr`/`wrmsr`
+instruction has a known address, and the general protection handler,
+finding the fault there, resumes at a stub that returns failure. Virtual
+machines are skipped (CPUID's hypervisor bit): KVM hides SpeedStep and
+refuses the writes anyway.
+
 ### Wall-clock time (`rtc.rs`)
 
 The CMOS real-time clock is read once at boot (twice in a row until two
@@ -775,6 +797,27 @@ the CPU waiting for the shootdown, neither moves. The fix: the spinlock's
 wait loop also serves pending shootdown requests. Small ranges are flushed
 page by page with `invlpg`; large ones flush everything by toggling CR4's
 global-pages bit (which also drops global, kernel, translations).
+
+User mappings are cheaper to shoot down. Nothing uses PCIDs, so loading
+CR3 drops every non-global translation: a CPU that isn't running an
+address space right now holds none of its entries. Each CPU records the
+page table root it last loaded (`cpu.page_table`, stored *before* the CR3
+write), and `smp::flush_user_tlb(root, range)` interrupts only the CPUs
+whose record matches (or is still unknown). The ordering argument: the
+flusher changes the entries, then a full fence, then reads the records; a
+CPU switching in stores its record, then loads CR3 (which serializes). So
+either the flusher sees the new record and interrupts that CPU, or the CPU
+loads CR3 after the entries changed and walks the new tables. A
+single-threaded program's `munmap` or `madvise` then flushes only its own
+CPU, without an interrupt at all.
+
+Unmapping itself walks the page tables once per range
+(`PageTable::unmap_range`), skipping absent upper-level entries by their
+whole span, instead of a walk from the root and an `invlpg` per page; the
+range is flushed once at the end, and not at all if nothing was mapped.
+Firefox `madvise(MADV_DONTNEED)`s its allocator's free memory many times a
+second: in 20 seconds of video playback this took `madvise` from 1832
+profiler samples to 269.
 
 A related, gentler case: when a page gains permissions (an `mprotect`
 that adds write access, say), other CPUs may still hold the old read-only
@@ -1568,6 +1611,19 @@ Alpine's Firefox runs unmodified. What it needed, in the order it asked:
 - `/proc/PID/stat` with all 52 of Linux's fields: BusyBox's `ps`,
   `pidof` and `killall` parse it with a number reader that runs off the
   end of a shorter line.
+
+- `getrusage`: Firefox's media code asks for its own CPU time many
+  times a second; unimplemented, every call wrote a debug line to the log.
+
+**Video playback** (YouTube) costs little to decode: VP9, AV1 and H.264
+decoders are Firefox's own (libvpx, dav1d, ffmpeg) and mostly idle. The
+expense is drawing: without a GPU driver, software WebRender (SWGL)
+converts each frame from YUV to RGB and scales it bilinearly to the
+player's size: about half of one core for 1080p in a window. A 720p
+video shown at its own size took under a third of the samples the same
+video did scaled up.
+Hardware help would mean an i915-compatible GPU driver for Mesa and
+VA-API decoding, which is a project of its own.
 
 Firefox starts about a dozen processes through its fork server: the
 parent, a socket process, extensions, a graphics decoder (RDD), and

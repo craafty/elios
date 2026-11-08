@@ -147,6 +147,7 @@ extern "sysv64" fn kernel_main(boot_info: u64) -> ! {
     arch::cpu::current().apic_id.store(u32::from(arch::apic::local_id()), core::sync::atomic::Ordering::Relaxed);
     arch::apic::init_io(madt);
     time::init();
+    arch::speed::init();
     match arch::smp::start_others(boot_info, madt) {
         1 => info!("smp: running on 1 CPU"),
         count => info!("smp: running on {count} CPUs"),

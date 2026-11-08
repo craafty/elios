@@ -297,6 +297,7 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         95 => processes::umask(a[0]),
         96 => system::gettimeofday(a[0]),
         97 => system::prlimit(a[0], a[1]),
+        98 => system::getrusage(a[0], a[1]),
         99 => system::sysinfo(a[0]),
         102 | 104 | 107 | 108 => processes::get_id(number),
         105 => processes::setuid(a[0]),

@@ -1008,15 +1008,20 @@ pub fn handle_kernel_fault(frame: &InterruptFrame, address: u64) -> bool {
 /// pages and fails the call with `EFAULT`, as Linux would.
 pub fn finish_system_call(thread: &UserThread, result: Result<u64>) -> Result<u64> {
     let Some((frame, pages)) = thread.scratch.lock().take() else { return result };
+    let mut root = None;
     if let Some(space) = thread.process.space.lock().as_mut() {
         for &page in &pages {
             space.unmap_scratch_page(page, frame);
         }
+        root = Some(space.root());
     }
     // Other threads may have cached the pages, though only the kernel
     // could use them: the frame goes once no CPU can reach it.
     if let (Some(&low), Some(&high)) = (pages.iter().min(), pages.iter().max()) {
-        crate::arch::smp::flush_tlb(low, high + memory::PAGE_SIZE);
+        match root {
+            Some(root) => crate::arch::smp::flush_user_tlb(root, low, high + memory::PAGE_SIZE),
+            None => crate::arch::smp::flush_tlb(low, high + memory::PAGE_SIZE),
+        }
     }
     memory::frames::free(frame);
     Err(Errno::EFAULT)

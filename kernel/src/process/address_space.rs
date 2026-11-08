@@ -277,10 +277,25 @@ impl AddressSpace {
 
     /// Unmaps a page, dropping this address space's reference to it.
     /// Returns the frame to free (after the TLB is flushed), if it's one.
-    fn unmap_page(&mut self, page: u64) -> Option<u64> {
-        let mapping = self.table.unmap(page)?;
-        self.resident_pages -= 1;
-        (mapping.flags & DEVICE_PAGE == 0).then_some(mapping.phys)
+    /// Unmaps the pages of `start..end` and adds the frames to free (not
+    /// devices' memory) to `freed`. Returns whether anything was mapped
+    /// there, that is, whether the TLB needs flushing.
+    fn unmap_pages(&mut self, start: u64, end: u64, freed: &mut Vec<u64>) -> bool {
+        let mut unmapped = 0;
+        self.table.unmap_range(start, end, |_, mapping| {
+            unmapped += 1;
+            if mapping.flags & DEVICE_PAGE == 0 {
+                freed.push(mapping.phys);
+            }
+        });
+        self.resident_pages -= unmapped;
+        unmapped != 0
+    }
+
+    /// Flushes `start..end` of these page tables from every CPU's TLB:
+    /// only CPUs running them need it.
+    fn flush(&self, start: u64, end: u64) {
+        smp::flush_user_tlb(self.table.root(), start, end);
     }
 
     /// Removes `start..end` from whatever areas cover it, splitting them as
@@ -290,15 +305,16 @@ impl AddressSpace {
         self.split_at(end);
         let doomed: Vec<u64> = self.areas.range(start..end).map(|(&s, _)| s).collect();
         let mut freed = Vec::new();
+        let mut unmapped = false;
         for area_start in doomed {
             let area = self.areas.remove(&area_start).unwrap();
-            for page in (area_start..area.end).step_by(PAGE_SIZE as usize) {
-                freed.extend(self.unmap_page(page));
-            }
+            unmapped |= self.unmap_pages(area_start, area.end, &mut freed);
         }
         // Other threads of the program may be running on other CPUs: the
         // frames can only go once no CPU can reach them.
-        smp::flush_tlb(start, end);
+        if unmapped {
+            self.flush(start, end);
+        }
         freed.into_iter().for_each(frames::free);
     }
 
@@ -327,18 +343,21 @@ impl AddressSpace {
             address = area.end;
         }
         let mut freed = Vec::new();
+        let mut unmapped = false;
         let mut page = start;
         while page < end {
             let (_, area) = self.area_at(page).expect("checked above");
             let area_end = area.end.min(end);
             if !matches!(area.backing, Backing::Device { .. }) {
-                for page in (page..area_end).step_by(PAGE_SIZE as usize) {
-                    freed.extend(self.unmap_page(page));
-                }
+                unmapped |= self.unmap_pages(page, area_end, &mut freed);
             }
             page = area_end;
         }
-        smp::flush_tlb(start, end);
+        // Allocators often discard memory that's already gone: then there's
+        // nothing any CPU could have cached.
+        if unmapped {
+            self.flush(start, end);
+        }
         freed.into_iter().for_each(frames::free);
         Ok(())
     }
@@ -370,7 +389,7 @@ impl AddressSpace {
                 }
             }
         }
-        smp::flush_tlb(start, end);
+        self.flush(start, end);
         Ok(())
     }
 
@@ -434,7 +453,7 @@ impl AddressSpace {
                 }
             }
         }
-        smp::flush_tlb(start, old_end);
+        self.flush(start, old_end);
         Ok(target)
     }
 
@@ -574,7 +593,7 @@ impl AddressSpace {
             frames::free(frame);
         }
         // Other threads may have the read-only entry cached.
-        smp::flush_tlb(page, page + PAGE_SIZE);
+        self.flush(page, page + PAGE_SIZE);
         Ok(())
     }
 
@@ -753,7 +772,7 @@ impl AddressSpace {
         }
         if downgraded {
             // Other threads of this process must stop writing to them.
-            smp::flush_tlb(0, USER_END);
+            self.flush(0, USER_END);
         }
         Ok(copy)
     }

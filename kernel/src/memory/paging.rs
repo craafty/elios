@@ -188,6 +188,51 @@ impl PageTable {
         Some(mapping)
     }
 
+    /// Unmaps every page in `start..end` (page-aligned), calling `each` with
+    /// the address and what was mapped there, the way calling [`unmap`] on
+    /// each page would, but skipping unmapped stretches a table at a time
+    /// and without flushing the TLB: the caller flushes the whole range
+    /// once afterwards (which it must, before freeing what was mapped).
+    ///
+    /// [`unmap`]: PageTable::unmap
+    pub fn unmap_range(&mut self, start: u64, end: u64, mut each: impl FnMut(u64, Mapping)) {
+        let mut virt = start;
+        'walk: while virt < end {
+            let mut table = self.root;
+            for level in (2..=4).rev() {
+                let entry = &mut entries(table)[index(virt, level)];
+                let span = 1u64 << (12 + 9 * (level - 1));
+                if *entry & PRESENT == 0 {
+                    virt = (virt & !(span - 1)).saturating_add(span);
+                    continue 'walk;
+                }
+                if level <= 3 && *entry & HUGE != 0 {
+                    let size = if level == 2 { PageSize::Large } else { PageSize::Huge };
+                    let address_bits = ADDRESS_MASK & !(size.bytes() - 1);
+                    each(virt, Mapping { phys: *entry & address_bits, size, flags: *entry & !ADDRESS_MASK });
+                    *entry = 0;
+                    virt = (virt & !(span - 1)).saturating_add(span);
+                    continue 'walk;
+                }
+                table = *entry & ADDRESS_MASK;
+            }
+            // A table of small pages: go through its entries in `virt..end`.
+            let small = entries(table);
+            for entry in &mut small[index(virt, 1)..] {
+                if virt >= end {
+                    break;
+                }
+                if *entry & PRESENT != 0 {
+                    let mapping =
+                        Mapping { phys: *entry & ADDRESS_MASK, size: PageSize::Small, flags: *entry & !ADDRESS_MASK };
+                    *entry = 0;
+                    each(virt, mapping);
+                }
+                virt += PageSize::Small.bytes();
+            }
+        }
+    }
+
     /// Changes the flags of the page mapping `virt`, keeping its address.
     pub fn set_flags(&mut self, virt: u64, flags: u64) -> Option<()> {
         let (entry, mapping) = self.leaf(virt)?;
@@ -324,6 +369,33 @@ mod tests {
             assert_eq!(table.translate_address(0x3F_FFFF), Some(0x3F_FFFF));
             assert_eq!(table.translate(0x40_0000).unwrap().size, PageSize::Small);
             assert_eq!(table.translate(0x40_1000), None);
+        }
+
+        fn unmap_range_finds_scattered_pages_and_stops_at_the_end() {
+            let mut table = PageTable::new().unwrap();
+            // Pages far apart (separate tables at every level), a large page,
+            // and one just past the end that must stay.
+            let small = [0x1000, 0x1FF000, 0x4000_0000, 0x7F_0000_0000];
+            for &virt in &small {
+                table.map(virt, virt, PageSize::Small, WRITABLE).unwrap();
+            }
+            table.map(0x60_0000, 0x60_0000, PageSize::Large, 0).unwrap();
+            let end = 0x7F_0000_0000;
+            let mut seen = Vec::new();
+            table.unmap_range(0, end, |virt, mapping| seen.push((virt, mapping.phys, mapping.size)));
+            assert_eq!(
+                seen,
+                [
+                    (0x1000, 0x1000, PageSize::Small),
+                    (0x1FF000, 0x1FF000, PageSize::Small),
+                    (0x60_0000, 0x60_0000, PageSize::Large),
+                    (0x4000_0000, 0x4000_0000, PageSize::Small),
+                ]
+            );
+            for virt in [0x1000, 0x1FF000, 0x60_0000, 0x4000_0000] {
+                assert_eq!(table.translate(virt), None);
+            }
+            assert!(table.translate(end).is_some());
         }
 
         fn misaligned_and_overlapping_maps_are_refused() {

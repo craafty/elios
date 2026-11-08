@@ -361,7 +361,8 @@ eliOS's own rasterizer in `truetype/`.
       and HID keyboards and mice, and A2DP audio to headphones (SDP,
       AVDTP, our own SBC encoder; the sound card's output follows the
       headset), checked against a pretend controller in QEMU; next,
-      trying them on the laptop, then the headset's microphone (HFP))
+      trying them on the laptop, then the headset's microphone (HFP)),
+      and CPU speed control (turbo on, the same as Linux's "performance")
 - [x] **Desktop groundwork:** copy-on-write `fork`, shared memory
       (`memfd`, `MAP_SHARED`, a page cache), `epoll`, `eventfd`,
       `timerfd`, Unix domain sockets with descriptor passing,
@@ -380,7 +381,9 @@ eliOS's own rasterizer in `truetype/`.
       (package triggers, `mremap`, `statx`, `prctl` and `arch_prctl`
       additions, `/proc/sys`, namespaces refused so sandboxes fall back),
       tuned with a sampling profiler (`/proc/PID/profile`): per-file
-      `poll` wakeups, a kernel heap cache, damage-only redraws
+      `poll` wakeups, a kernel heap cache, damage-only redraws, single-walk
+      `madvise`/`munmap` with TLB shootdowns only to the CPUs running the
+      program, `getrusage`
 - [x] **Sound:** an Intel HD Audio driver (codec routes found like
       Linux's generic driver, so no per-laptop tables) behind Linux's
       ALSA interface, so `libasound` programs play and record;
