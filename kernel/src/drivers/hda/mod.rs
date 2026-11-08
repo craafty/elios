@@ -319,6 +319,7 @@ impl Controller {
         }
         let analog = codec.outputs.iter().any(|p| p.device != codec::Device::LineOut);
         info!("hda: {:04x}:{:04x}: codec {} ({})", device.vendor, device.device, codec.address, codec.describe());
+        info!("hda: amps on the output routes: {}", codec.describe_amps());
         let has_input = codec.input.is_some() && inputs > 0;
         let new_stream = |direction, index, tag| Stream {
             direction,
@@ -547,9 +548,6 @@ impl Hardware for StreamHandle {
                 codec.start_input(link, tag, layout.format);
             }
         });
-        if self.output && controller.headphones.load(Ordering::Relaxed) {
-            controller.command(|codec, link| codec.set_speakers(link, false));
-        }
     }
 
     fn pause(&self, paused: bool) {

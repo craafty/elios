@@ -18,7 +18,7 @@
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Sends verbs to a codec: the controller's command rings, or a test's
 /// simulation. `verb` is 12 bits with an 8-bit payload, or (for the
@@ -187,6 +187,8 @@ pub struct Codec {
     /// and a muted card (sound going to a Bluetooth headset) must stay
     /// muted when a program starts playing.
     levels: [AtomicU32; 2],
+    /// Headphones are plugged in, so the speakers stay off.
+    headphones_in: AtomicBool,
 }
 
 fn parameter(link: &mut impl Link, nid: u16, parameter: u8) -> u32 {
@@ -233,8 +235,15 @@ impl Codec {
             }
             widgets.insert(nid, Widget { nid, kind, caps, connections, pin_caps, config, in_amp, out_amp });
         }
-        let mut codec =
-            Codec { address, vendor, widgets, outputs: Vec::new(), input: None, levels: Default::default() };
+        let mut codec = Codec {
+            address,
+            vendor,
+            widgets,
+            outputs: Vec::new(),
+            input: None,
+            levels: Default::default(),
+            headphones_in: AtomicBool::new(false),
+        };
         codec.find_routes(link);
         Some(codec)
     }
@@ -342,6 +351,7 @@ impl Codec {
             link.send(dac, Verb::Short(SET_CHANNEL_STREAM, tag << 4));
         }
         self.restore_volume(link, true);
+        self.switch_outputs(link);
     }
 
     /// Puts the volume amp back to the last setting (if there was one).
@@ -486,6 +496,59 @@ impl Codec {
             };
             self.set_amp(link, widget, output, index, unmuted, step);
         }
+        if output {
+            self.switch_outputs(link);
+        }
+    }
+
+    /// Whether playback is muted (by the volume setting, or because sound
+    /// goes to a Bluetooth headset).
+    fn output_muted(&self) -> bool {
+        let level = self.levels[0].load(Ordering::Relaxed);
+        level != 0 && level & 1 << 31 == 0
+    }
+
+    /// Turns each output pin on or off to match the mute setting and the
+    /// headphone jack, and mutes or unmutes the mixers on the routes.
+    ///
+    /// Muting the volume amp alone isn't enough: on Realtek codecs (the
+    /// T440p's ALC292) the DACs' amps can't mute at all (their amp
+    /// capabilities have no mute bit), so the mute is done where it works,
+    /// as Linux does: the pins' outputs (which always switch off), the
+    /// pins' own amps, and the mixers' inputs.
+    fn switch_outputs(&self, link: &mut impl Link) {
+        let muted = self.output_muted();
+        let headphones_in = self.headphones_in.load(Ordering::Relaxed);
+        for path in &self.outputs {
+            let on = !muted && !(headphones_in && path.device == Device::Speaker);
+            let pin = &self.widgets[&path.nodes[0]];
+            let control = if !on {
+                0
+            } else if pin.device() == Device::Headphone {
+                PIN_OUT_ENABLE | PIN_HEADPHONE
+            } else {
+                PIN_OUT_ENABLE
+            };
+            link.send(pin.nid, Verb::Short(SET_PIN_CONTROL, control));
+            if pin.pin_caps & PIN_EAPD != 0 {
+                // The external amplifier (laptop speakers) powers down too.
+                link.send(pin.nid, Verb::Short(SET_EAPD, if on { 0x02 } else { 0 }));
+            }
+            if pin.caps & CAP_OUT_AMP != 0 {
+                self.set_amp(link, pin, true, 0, on, amp_steps(pin.out_amp).zero);
+            }
+            // Mixers are shared between routes (speakers and headphones
+            // share one on the T440p), so they follow the mute alone.
+            for pair in path.nodes.windows(2) {
+                let widget = &self.widgets[&pair[0]];
+                if widget.kind != Kind::Mixer {
+                    continue;
+                }
+                if let Some(position) = widget.connections.iter().position(|&c| c == pair[1]) {
+                    self.set_amp(link, widget, false, position as u8, !muted, amp_steps(widget.in_amp).zero);
+                }
+            }
+        }
     }
 
     /// Headphone jacks that can tell whether something is plugged in.
@@ -534,13 +597,31 @@ impl Codec {
     /// pins' outputs, and their pins' own amplifiers too, since on some
     /// laptops (the T440p) speakers and headphones share a DAC and mixer.
     pub fn set_speakers(&self, link: &mut impl Link, on: bool) {
-        for path in self.outputs.iter().filter(|path| path.device == Device::Speaker) {
-            let pin = &self.widgets[&path.nodes[0]];
-            link.send(pin.nid, Verb::Short(SET_PIN_CONTROL, if on { PIN_OUT_ENABLE } else { 0 }));
-            if pin.caps & CAP_OUT_AMP != 0 {
-                self.set_amp(link, pin, true, 0, on, amp_steps(pin.out_amp).zero);
+        self.headphones_in.store(!on, Ordering::Relaxed);
+        self.switch_outputs(link);
+    }
+
+    /// The amps on the output routes and whether each can mute (bit 31 of
+    /// its capabilities), for the log: what muting relies on.
+    pub fn describe_amps(&self) -> String {
+        let mut seen = Vec::new();
+        let mut parts = Vec::new();
+        for path in &self.outputs {
+            for nid in &path.nodes {
+                let widget = &self.widgets[nid];
+                if seen.contains(nid) {
+                    continue;
+                }
+                seen.push(*nid);
+                for (has, caps, name) in [(CAP_IN_AMP, widget.in_amp, "in"), (CAP_OUT_AMP, widget.out_amp, "out")] {
+                    if widget.caps & has != 0 {
+                        let mute = if caps & 1 << 31 != 0 { "mutes" } else { "can't mute" };
+                        parts.push(alloc::format!("{nid:#x} {name} {caps:08x} ({mute})"));
+                    }
+                }
             }
         }
+        parts.join(", ")
     }
 
     /// A one-line description of the routes, for the log.
@@ -598,7 +679,9 @@ mod tests {
     /// A simulated codec shaped like the ALC292 in a ThinkPad: DACs 0x02
     /// and 0x03, mixers 0x0C and 0x0D, speaker pin 0x14, headphone jack
     /// 0x21, ADC 0x08 behind mixer 0x23, internal microphone 0x12 and a
-    /// microphone jack 0x18. It records the verbs it gets.
+    /// microphone jack 0x18. It records the verbs it gets. Its amps are
+    /// the real one's: the DACs' have steps but can't mute, the speaker
+    /// pin's and the output mixers' can only mute.
     struct Simulated {
         widgets: BTreeMap<u16, (u32, Vec<u16>, u32, u32)>,
         sent: Vec<(u16, u32)>,
@@ -613,13 +696,15 @@ mod tests {
             widgets.insert(0x02, (wcaps(0, CAP_OUT_AMP), alloc::vec![], 0, 0));
             widgets.insert(0x03, (wcaps(0, CAP_OUT_AMP), alloc::vec![], 0, 0));
             widgets.insert(0x08, (wcaps(1, CAP_IN_AMP | CAP_CONNECTIONS), alloc::vec![0x23], 0, 0));
-            widgets.insert(0x0C, (wcaps(2, CAP_IN_AMP | CAP_CONNECTIONS), alloc::vec![0x02, 0x0B], 0, 0));
-            widgets.insert(0x0D, (wcaps(2, CAP_IN_AMP | CAP_CONNECTIONS), alloc::vec![0x03, 0x0B], 0, 0));
+            let mixer = CAP_IN_AMP | CAP_CONNECTIONS | CAP_AMP_OVERRIDE;
+            widgets.insert(0x0C, (wcaps(2, mixer), alloc::vec![0x02, 0x0B], 0, 0));
+            widgets.insert(0x0D, (wcaps(2, mixer), alloc::vec![0x03, 0x0B], 0, 0));
             widgets.insert(0x0B, (wcaps(2, CAP_IN_AMP | CAP_CONNECTIONS), alloc::vec![0x18, 0x12], 0, 0));
             widgets.insert(0x23, (wcaps(2, CAP_IN_AMP | CAP_CONNECTIONS), alloc::vec![0x18, 0x12, 0x0B], 0, 0));
             // Pins: (caps, connections, pin caps, configuration default).
             let output = PIN_OUTPUT | PIN_EAPD;
-            widgets.insert(0x14, (wcaps(4, CAP_CONNECTIONS | CAP_OUT_AMP), alloc::vec![0x0C], output, 0x9017_0110));
+            let speaker = CAP_CONNECTIONS | CAP_OUT_AMP | CAP_AMP_OVERRIDE;
+            widgets.insert(0x14, (wcaps(4, speaker), alloc::vec![0x0C], output, 0x9017_0110));
             let headphone = PIN_OUTPUT | PIN_PRESENCE;
             widgets.insert(0x21, (wcaps(4, CAP_CONNECTIONS), alloc::vec![0x0D], headphone, 0x0221_1020));
             widgets.insert(0x12, (wcaps(4, 0), alloc::vec![], PIN_INPUT, 0x90A6_0130));
@@ -643,7 +728,8 @@ mod tests {
                 (0, Verb::Short(GET_PARAMETER, PARAM_NODE_COUNT)) => 0x0001_0001,
                 (1, Verb::Short(GET_PARAMETER, PARAM_FUNCTION_TYPE)) => 0x01,
                 (1, Verb::Short(GET_PARAMETER, PARAM_NODE_COUNT)) => 0x0002_0022,
-                (1, Verb::Short(GET_PARAMETER, PARAM_OUT_AMP_CAPS)) => 0x8005_5757,
+                // Steps (0x57 of them, 0 dB at 0x57), no mute.
+                (1, Verb::Short(GET_PARAMETER, PARAM_OUT_AMP_CAPS)) => 0x0005_5757,
                 (1, Verb::Short(GET_PARAMETER, PARAM_IN_AMP_CAPS)) => 0x0003_3F00,
                 (nid, Verb::Short(verb, parameter)) => {
                     let Some((caps, connections, pin_caps, config)) = self.widgets.get(&nid) else { return 0 };
@@ -651,6 +737,8 @@ mod tests {
                         (GET_PARAMETER, PARAM_WIDGET_CAPS) => *caps,
                         (GET_PARAMETER, PARAM_PIN_CAPS) => *pin_caps,
                         (GET_PARAMETER, PARAM_CONNECTION_LENGTH) => connections.len() as u32,
+                        // Mute only.
+                        (GET_PARAMETER, PARAM_OUT_AMP_CAPS | PARAM_IN_AMP_CAPS) => 0x8000_0000,
                         (GET_CONNECTION_LIST, index) => connections
                             .iter()
                             .skip(index as usize)
@@ -697,14 +785,15 @@ mod tests {
             link.sent.clear();
             codec.set_speakers(&mut link, false);
             // The speaker pin's output is off and its amplifier muted; the
-            // headphone pin is left alone.
+            // headphones and the mixers stay on.
             assert!(link.sent.contains(&(0x14, 0x707 << 8)));
-            assert!(link.sent.contains(&(0x14, 0x3 << 16 | 0xB0D7)));
-            assert!(link.sent.iter().all(|&(nid, _)| nid == 0x14));
+            assert!(link.sent.contains(&(0x14, 0x3 << 16 | 0xB080)));
+            assert!(link.sent.contains(&(0x21, 0x707 << 8 | 0xC0)));
+            assert!(link.sent.contains(&(0x0C, 0x3 << 16 | 0x7000)));
             link.sent.clear();
             codec.set_speakers(&mut link, true);
             assert!(link.sent.contains(&(0x14, 0x707 << 8 | 0x40)));
-            assert!(link.sent.contains(&(0x14, 0x3 << 16 | 0xB057)));
+            assert!(link.sent.contains(&(0x14, 0x3 << 16 | 0xB000)));
         }
 
         fn codec_routes_are_opened() {
@@ -741,6 +830,29 @@ mod tests {
                 let last = link.sent.iter().rev().find(|&&(nid, code)| nid == dac && code >> 16 == 0x3);
                 assert_eq!(last, Some(&(dac, 0x3 << 16 | 0xB0A0)));
             }
+            // The DACs' amps can't mute, so nothing may play: every pin's
+            // output is off, the speaker's amp and amplifier (EAPD) off,
+            // and the mixers' inputs from the DACs muted.
+            let last = |link: &Simulated, nid: u16, kind: u32| {
+                link.sent.iter().rev().find(|&&(n, code)| n == nid && code & kind == kind).map(|&(_, code)| code)
+            };
+            let pin_control = (SET_PIN_CONTROL as u32) << 8;
+            let eapd = (SET_EAPD as u32) << 8;
+            for pin in [0x14, 0x21] {
+                assert_eq!(last(&link, pin, pin_control).map(|c| c & 0xFF), Some(0));
+            }
+            assert_eq!(last(&link, 0x14, eapd), Some(eapd));
+            assert_eq!(last(&link, 0x14, 0x3 << 16 | 0x8000), Some(0x3 << 16 | 0xB080));
+            assert_eq!(last(&link, 0x0C, 0x3 << 16 | 0x4000), Some(0x3 << 16 | 0x7080));
+            assert_eq!(last(&link, 0x0D, 0x3 << 16 | 0x4000), Some(0x3 << 16 | 0x7080));
+            // Unmuting (the headset gone) turns them all back on.
+            link.sent.clear();
+            codec.set_volume(&mut link, true, 0x20, true);
+            assert!(link.sent.contains(&(0x14, 0x707 << 8 | 0x40)));
+            assert!(link.sent.contains(&(0x14, 0x70C << 8 | 0x02)));
+            assert!(link.sent.contains(&(0x21, 0x707 << 8 | 0xC0)));
+            assert!(link.sent.contains(&(0x0C, 0x3 << 16 | 0x7000)));
+            assert!(link.sent.contains(&(0x14, 0x3 << 16 | 0xB000)));
         }
     }
 }

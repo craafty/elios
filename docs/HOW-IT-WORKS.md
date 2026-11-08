@@ -2307,7 +2307,21 @@ turns off both the speaker pin's output and its own amplifier: on the
 T440p the speaker and the headphone jack hang off the same mixer and DAC,
 so nothing earlier on the route can tell them apart. The jacks' pin
 capabilities and readings are logged at boot and at every change. The route search is tested against a simulated ALC292
-laid out like the T440p's.
+laid out like the T440p's, with its amplifiers' real capabilities.
+
+**Muting** can't rely on the volume amplifier. Realtek's DACs have
+volume steps but no mute bit in their amplifier capabilities, so a mute
+written there is ignored and the sound plays on (this is why the T440p
+kept playing through its speakers while a Bluetooth headset was
+connected). The codec driver therefore mutes where it works, as Linux
+does: every output pin's output is switched off (with its external
+amplifier, EAPD, powered down), the pins' own amplifiers are muted, and
+so are the mixers' inputs from the DACs. One function sets all of that
+from two facts, the mute setting and whether headphones are plugged in
+(which switches only the speaker pin off, since the mixer is shared), and
+it runs after every volume change, jack change and stream start. Each
+amplifier on the output routes, and whether it can mute, is logged at
+boot.
 
 **The interface** (`sound/`) is Linux's ALSA, so `libasound`, and with it
 Firefox, `aplay` and `arecord`, works unchanged. Each card has
@@ -2787,7 +2801,8 @@ stays and is applied to the headset's samples instead). Starting a stream
 opens its routes, which unmutes every amplifier on them, so the codec
 remembers the last volume setting and puts it back as the last step:
 otherwise the first program to play after the headset connected would
-come out of both. A thread
+come out of both. The mute itself switches the output pins off (see
+Muting, above), since the DAC amplifier can't mute. A thread
 copies what the card is about to play every 10 ms: the frames between
 the card's position and 20 ms past it that programs have written
 (`Pcm::tap`; played frames may already be overwritten, so it never looks
