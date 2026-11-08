@@ -674,7 +674,12 @@ impl Drop for OpenFile {
     }
 }
 
-pub const MAX_FILES: usize = 256;
+/// The most file descriptors a process can have open (`RLIMIT_NOFILE`;
+/// 4096 is Linux's usual hard limit). Firefox's main process passes
+/// hundreds around once a page plays video (shared memory for frames and
+/// sound, a channel per helper process), and it ran out at 256: YouTube's
+/// tab crashed. The table only grows as far as the highest one used.
+pub const MAX_FILES: usize = 4096;
 
 #[derive(Clone)]
 struct Descriptor {

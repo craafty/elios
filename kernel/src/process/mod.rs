@@ -639,11 +639,43 @@ pub fn exit_group(status: i32) -> ! {
         // The first exit_group decides the status.
         if !matches!(*ending, Some(Ending::Exit(_))) {
             *ending = Some(Ending::Exit(status));
+            log_signal_death(&thread, status);
         }
     }
     interrupt_threads(&thread.process, thread.id);
     drop(thread);
     exit_thread(status)
+}
+
+/// Logs a process ended by a signal: programs that crash with a handler
+/// of their own (Firefox's crash reporter) or abort, or that a seccomp
+/// filter kills, leave no other trace in the log. Signals people send on
+/// purpose (Ctrl+C, `kill`, a closed pipe) are only debug lines.
+fn log_signal_death(thread: &UserThread, status: i32) {
+    let signal = (status & 0x7F) as u32;
+    if signal == 0 || status & 0xFF00 != 0 {
+        return;
+    }
+    let name = match signal {
+        SIGILL => "invalid instruction",
+        SIGTRAP => "breakpoint",
+        6 => "abort",
+        SIGBUS => "bus error",
+        SIGFPE => "arithmetic error",
+        SIGSEGV => "segmentation fault",
+        signal::SIGSYS => "bad system call",
+        _ => {
+            debug!("{} (pid {}) ended by signal {signal}", thread.process.name.lock(), thread.process.pid);
+            return;
+        }
+    };
+    warn!(
+        "{} (pid {}, thread {}) ended by signal {signal} ({name}) in system call {}",
+        thread.process.name.lock(),
+        thread.process.pid,
+        thread.tid(),
+        thread.syscall.load(Ordering::Relaxed) as i64
+    );
 }
 
 /// `exit`: ends the running thread. The last thread to exit ends the

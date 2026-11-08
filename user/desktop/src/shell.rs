@@ -90,6 +90,8 @@ pub struct Desktop {
     /// The process groups of the programs started (each its own), so
     /// logging out can end them and everything they started.
     groups: Vec<u32>,
+    /// Whether PulseAudio has been started (see [`Desktop::start_sound_server`]).
+    sound_server: bool,
     /// Who is logged in, on the session button.
     user: String,
     clock: String,
@@ -170,6 +172,7 @@ impl Desktop {
             running: true,
             children: Vec::new(),
             groups: Vec::new(),
+            sound_server: false,
             user: eli::env::var("USER").filter(|user| !user.is_empty()).unwrap_or_else(|| String::from("Session")),
             clock: String::new(),
             zone: eli::time::local_zone(),
@@ -1344,8 +1347,43 @@ impl Desktop {
         self.run(&path, &[]);
     }
 
-    /// Starts a program, in a process group of its own.
+    /// Starts a program, in a process group of its own. PulseAudio is
+    /// started first if it was installed since the desktop started, so
+    /// a browser installed and opened in the same session has sound.
     pub fn run(&mut self, path: &str, arguments: &[String]) {
+        self.start_sound_server();
+        self.spawn(path, arguments);
+    }
+
+    /// Starts PulseAudio, if it's installed and not started yet, so
+    /// programs find it in `$XDG_RUNTIME_DIR/pulse`. Firefox needs it: its
+    /// ALSA backend can't open the sound card here, and can't record.
+    /// PulseAudio's default script wants udev, which eliOS doesn't have,
+    /// so it runs /etc/pulse/eli.pa instead, which names the first sound
+    /// card's speaker and microphone. (PulseAudio started by a program
+    /// gets the same script, from /etc/pulse/client.conf.d/eli.conf.)
+    /// `-D` makes it a daemon that outlives the desktop; starting it
+    /// again when one runs does nothing.
+    pub fn start_sound_server(&mut self) {
+        if self.sound_server {
+            return;
+        }
+        let Some(path) = eli::process::find_program("pulseaudio") else { return };
+        self.sound_server = true;
+        let runtime = eli::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".to_string());
+        let arguments = [
+            "-n",
+            "-D",
+            "--exit-idle-time=-1",
+            &alloc::format!("--log-target=file:{runtime}/pulseaudio.log"),
+            "-F",
+            "/etc/pulse/eli.pa",
+        ];
+        let arguments: Vec<String> = arguments.iter().map(|&a| a.to_string()).collect();
+        self.spawn(&path, &arguments);
+    }
+
+    fn spawn(&mut self, path: &str, arguments: &[String]) {
         let mut argv = alloc::vec![path.rsplit('/').next().unwrap_or(path).to_string()];
         argv.extend_from_slice(arguments);
         match eli::process::fork() {

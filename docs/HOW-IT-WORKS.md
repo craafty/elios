@@ -1038,6 +1038,15 @@ with the standard MXCSR value).
 
 A process is: an address space, a file descriptor table, a working
 directory, signal handlers, a process group, and one or more threads.
+The descriptor table holds up to 4096 (`fs::MAX_FILES`, reported as
+`RLIMIT_NOFILE`) and grows only as far as the highest one in use. It was
+256 until YouTube showed that Firefox's main process needs more: frames
+and sound travel in shared memory, each block a descriptor.
+
+A process ended by a crash signal (segmentation fault, abort, bad system
+call and the like) is logged with its name, pid, thread and the system
+call it was in. Firefox catches its own crashes and then dies by the
+signal, so this line is often the only trace of a crash in the log.
 
 ### Address spaces (`process/address_space.rs`)
 
@@ -2314,15 +2323,27 @@ selects the stream's PCM timer and polls it next to the PCM. Here each
 open timer counts the stream's periods by its hardware pointer, and is
 readable when that count has moved since the last read.
 
-**PulseAudio.** Firefox's ALSA backend can play but can't list or open
-microphones, so `getUserMedia({audio: true})` needs a sound server.
-Alpine's PulseAudio runs on eliOS's ALSA unchanged. Its default
-startup script wants udev, which eliOS lacks, so when `pulseaudio` is
-installed the desktop starts it with the modules named:
-the first card's sink and source, and the native socket in
-`$XDG_RUNTIME_DIR/pulse`. Its log goes to `$XDG_RUNTIME_DIR/pulseaudio.log`.
-Starting it from a shell without the desktop's `XDG_RUNTIME_DIR` puts
-the socket somewhere else, and Firefox then finds no devices.
+**PulseAudio.** Firefox can't play through ALSA here (its cubeb
+library fails to start without a sound server, and the page plays
+silently), and it can't list or open microphones that way either, so it
+needs PulseAudio. Alpine's PulseAudio runs on eliOS's ALSA unchanged. Its
+default startup script finds sound cards through udev, which eliOS
+lacks: it starts with no speakers and plays everything into silence. So
+eliOS ships its own script, `/etc/pulse/eli.pa`, naming the first card's
+sink and source, the native socket in `$XDG_RUNTIME_DIR/pulse`, and
+`module-suspend-on-idle`. The last lets go of the card after a few quiet
+seconds, so `speaker-test` and `aplay`, which open the card directly
+(one program at a time), work while PulseAudio is idle.
+
+The desktop starts PulseAudio with that script when the session starts.
+It also checks again before it starts any program, because a PulseAudio
+installed during the session would otherwise wait for the next login.
+`/etc/pulse/client.conf.d/eli.conf` gives the same script to a PulseAudio
+that a program starts itself (libpulse's *autospawn*; it never does this
+for root). The desktop's PulseAudio logs to
+`$XDG_RUNTIME_DIR/pulseaudio.log`. Starting it from a shell without the
+desktop's `XDG_RUNTIME_DIR` puts the socket somewhere else, and Firefox
+then finds no devices.
 
 Two Linux details mattered. musl declares `ioctl`'s request as an `int`,
 so ALSA's requests (most have the top bit set) arrive sign-extended to
@@ -3371,11 +3392,13 @@ is a `Menu`.
 ### Fonts (`truetype/`)
 
 The desktop and its programs write with a TrueType font, read and
-rasterized by eliOS's own code: one font file ships,
+rasterized by eliOS's own code:
 `/usr/share/fonts/dejavu/DejaVuSansMono.ttf` (DejaVu Sans Mono, with its
 licence beside it). It's monospaced so the terminal can use it as well as
 the bar and menus; the `truetype` crate reads any TrueType font, so adding
-a proportional one later is just another file.
+a proportional one later is just another file. DejaVu Sans and Serif ship
+beside it for other programs. Firefox doesn't bring a font of its own, so
+with only the monospaced one every web page came out in it.
 
 - **Reading** (`lib.rs`): the tables needed to draw are `head` (units per
   em, `loca`'s format), `maxp` (glyph count), `cmap` (character to glyph:

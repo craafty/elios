@@ -1,0 +1,13 @@
+# PulseAudio's start-up script on eliOS. PulseAudio's own default.pa finds
+# sound cards through udev, which eliOS doesn't have, so it would start
+# with no speakers and play everything into silence. This one names them:
+# the first sound card's speakers and microphone, and the socket programs
+# connect to. The desktop starts PulseAudio with it, and so does a program
+# that finds no PulseAudio running (client.conf.d/eli.conf).
+load-module module-alsa-sink device=hw:0
+load-module module-alsa-source device=hw:0
+load-module module-native-protocol-unix
+# Let go of the sound card after a few quiet seconds, so programs that use
+# it directly (speaker-test, aplay) work while nothing plays through
+# PulseAudio.
+load-module module-suspend-on-idle

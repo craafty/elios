@@ -295,7 +295,8 @@ ffmpeg and measure how close it comes back.
 The console font is drawn as ASCII art in `kernel/font/eli-8x16.txt`; edit a
 glyph and rebuild. The desktop uses a TrueType font instead, DejaVu Sans
 Mono (`rootfs/usr/share/fonts/dejavu/`, with its licence), drawn by
-eliOS's own rasterizer in `truetype/`.
+eliOS's own rasterizer in `truetype/`. DejaVu Sans and Serif are there too,
+for web pages.
 
 ## Layout
 
