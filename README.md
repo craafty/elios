@@ -375,5 +375,6 @@ eliOS's own rasterizer in `truetype/`.
       commit, isochronous xHCI transfers, frame assembly) behind Linux's
       V4L2 interface (`/dev/video0`), tested against a pretend camera
       xtask attaches to QEMU over usbredir (`videotest`), and a Camera
-      app on the desktop to see it; to try on the T440p's webcam
+      app on the desktop to see it; Firefox's `getUserMedia` uses it as
+      is; to try on the T440p's webcam
 - [ ] **Next:** Wi-Fi working on the T440p, Bluetooth

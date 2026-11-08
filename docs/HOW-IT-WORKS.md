@@ -2198,6 +2198,11 @@ and if there's no camera, or it goes away mid-stream, it says so and
 looks again every second. It's for trying a webcam before a call,
 without Firefox.
 
+**Firefox** needed nothing more: its WebRTC capture code finds
+`/dev/video0`, picks 640x480 YUYV at 30 frames a second, and
+`getUserMedia({video: true})` plays in a `<video>` element (checked in
+a session with the pretend camera).
+
 **Testing without a camera.** QEMU has no emulated webcam, but it can
 attach a USB device from elsewhere over **usbredir**, a protocol for
 forwarding USB devices across a socket. `xtask/src/camera.rs` is the
