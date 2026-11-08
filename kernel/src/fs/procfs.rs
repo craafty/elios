@@ -596,9 +596,14 @@ fn status(pid: Pid) -> String {
 fn stat(pid: Pid) -> String {
     let Some(info) = info(pid) else { return String::new() };
     let group = process::find(pid).map_or(pid, |p| p.group());
-    // Times are in clock ticks of 1/100 s.
+    // Times are in clock ticks of 1/100 s. All 52 of Linux's fields are
+    // there, mostly 0: BusyBox's `ps`, `pidof` and `killall` read them
+    // without checking for the end of the line. After `rss` come the
+    // limit (none), code, stack and signal addresses, the exit signal
+    // (SIGCHLD), and the CPU, scheduling, data and argument fields.
     format!(
-        "{pid} ({}) {} {} {group} {group} 0 -1 0 0 0 0 0 {} 0 0 0 20 0 1 0 0 {} {} 0\n",
+        "{pid} ({}) {} {} {group} {group} 0 -1 0 0 0 0 0 {} 0 0 0 20 0 1 0 0 {} {} 18446744073709551615 \
+         0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         info.name,
         info.state,
         info.parent,

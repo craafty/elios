@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub use self::address_space::{AddressSpace, PROT_EXEC, PROT_READ, PROT_WRITE, USER_END};
-use self::credentials::Credentials;
+use self::credentials::{Credentials, Uid};
 #[cfg(test)]
 use self::signal::SIGTERM;
 use self::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
@@ -710,8 +710,9 @@ pub fn signal_status(signal: u32) -> i32 {
 /// `wait4`: waits for a child to exit and collects it. `pid` selects which
 /// children qualify, as in Linux: a pid, -1 for any, 0 for the caller's
 /// group, -group for that group. With `no_hang`, returns `None` instead of
-/// waiting.
-pub fn wait(pid: i64, no_hang: bool) -> Result<Option<(Pid, i32)>> {
+/// waiting; with `keep` (`waitid`'s `WNOWAIT`), leaves the child to be
+/// collected again. Returns the child's pid, wait status and real user.
+pub fn wait(pid: i64, no_hang: bool, keep: bool) -> Result<Option<(Pid, i32, Uid)>> {
     let me = current();
     CHILD_EVENTS.wait_until(|| {
         let mut processes = PROCESSES.lock();
@@ -730,8 +731,10 @@ pub fn wait(pid: i64, no_hang: bool) -> Result<Option<(Pid, i32)>> {
         }
         if let Some(child) = children.iter().find(|child| child.status.lock().is_some()) {
             let status = child.status.lock().unwrap();
-            processes.remove(&child.pid);
-            return Some(Ok(Some((child.pid, status))));
+            if !keep {
+                processes.remove(&child.pid);
+            }
+            return Some(Ok(Some((child.pid, status, child.credentials.lock().uid))));
         }
         drop(processes);
         if no_hang {
@@ -803,10 +806,12 @@ pub fn kill(pid: i64, signal: u32) -> Result<()> {
     }
     let me = current();
     let credentials = me.credentials.lock().clone();
+    // Zombies count as targets (they exist until reaped, and Linux finds
+    // them: `killall` signals every match and reports a failure), but
+    // there's nothing to deliver to them.
     let targets: Vec<Arc<Process>> = PROCESSES
         .lock()
         .values()
-        .filter(|p| p.status.lock().is_none())
         .filter(|p| match pid {
             0 => p.group() == me.group(),
             -1 => p.pid != INIT && p.pid != me.pid,
@@ -827,7 +832,7 @@ pub fn kill(pid: i64, signal: u32) -> Result<()> {
     }
     // Signal 0 only checks that the process exists and may be signalled.
     if signal != 0 {
-        for process in permitted {
+        for process in permitted.into_iter().filter(|p| p.status.lock().is_none()) {
             send_signal(process, signal);
         }
     }

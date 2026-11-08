@@ -4,6 +4,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -177,6 +179,44 @@ int main(void) {
     struct timeval timeout = {0, 200000};
     setsockopt(a, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
     check("receive timeouts give EAGAIN", recv(a, text, sizeof text, 0) == -1 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    close(a);
+    close(b);
+
+    /* Interfaces, as WebRTC finds them: getifaddrs (route netlink), names
+       through if_indextoname (an ioctl on an AF_UNIX socket), then UDP
+       between two sockets bound to the machine's own address. */
+    struct ifaddrs *interfaces = NULL;
+    struct sockaddr_in own = {0};
+    char own_name[IF_NAMESIZE] = "";
+    if (getifaddrs(&interfaces) == 0) {
+        for (struct ifaddrs *i = interfaces; i; i = i->ifa_next) {
+            if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET && !(i->ifa_flags & IFF_LOOPBACK)) {
+                own = *(struct sockaddr_in *)i->ifa_addr;
+                snprintf(own_name, sizeof own_name, "%s", i->ifa_name);
+            }
+        }
+        freeifaddrs(interfaces);
+    }
+    check("getifaddrs finds a named IPv4 interface", own.sin_addr.s_addr != 0 && own_name[0]);
+    char named[IF_NAMESIZE] = "";
+    unsigned index = if_nametoindex(own_name);
+    check("if_nametoindex and if_indextoname agree",
+          index > 0 && if_indextoname(index, named) && strcmp(named, own_name) == 0);
+    a = socket(AF_INET, SOCK_DGRAM, 0);
+    b = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in own_a = own, own_b = own;
+    own_a.sin_port = 0;
+    own_b.sin_port = 0;
+    bind(a, (struct sockaddr *)&own_a, sizeof own_a);
+    bind(b, (struct sockaddr *)&own_b, sizeof own_b);
+    length = sizeof own_b;
+    getsockname(b, (struct sockaddr *)&own_b, &length);
+    sendto(a, "own", 4, 0, (struct sockaddr *)&own_b, sizeof own_b);
+    entry = (struct pollfd){.fd = b, .events = POLLIN};
+    length = sizeof from;
+    check("UDP to our own address arrives",
+          poll(&entry, 1, 2000) == 1 && recvfrom(b, text, sizeof text, 0, (struct sockaddr *)&from, &length) == 4 &&
+              from.sin_addr.s_addr == own.sin_addr.s_addr);
     close(a);
     close(b);
 

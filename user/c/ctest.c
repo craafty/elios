@@ -4,6 +4,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,6 +92,26 @@ int main(int argc, char **argv) {
     int status = 0;
     check("fork, _exit and waitpid", child > 0 && waitpid(child, &status, 0) == child &&
           WIFEXITED(status) && WEXITSTATUS(status) == 7);
+
+    /* waitid: WNOWAIT leaves the child to collect again; a killed child
+       reports CLD_KILLED and the signal; WNOHANG with nothing clears si_pid. */
+    child = fork();
+    if (child == 0) _exit(3);
+    siginfo_t child_info = {0};
+    int waitid_ok = waitid(P_PID, child, &child_info, WEXITED | WNOWAIT) == 0 && child_info.si_pid == child &&
+                    child_info.si_code == CLD_EXITED && child_info.si_status == 3;
+    waitid_ok = waitid_ok && waitid(P_ALL, 0, &child_info, WEXITED) == 0 && child_info.si_pid == child;
+    child = fork();
+    if (child == 0) {
+        pause();
+        _exit(0);
+    }
+    child_info.si_pid = 1;
+    waitid_ok = waitid_ok && waitid(P_PID, child, &child_info, WEXITED | WNOHANG) == 0 && child_info.si_pid == 0;
+    kill(child, SIGKILL);
+    waitid_ok = waitid_ok && waitid(P_PID, child, &child_info, WEXITED) == 0 && child_info.si_code == CLD_KILLED &&
+                child_info.si_status == SIGKILL && child_info.si_signo == SIGCHLD;
+    check("waitid", waitid_ok);
 
     child = fork();
     if (child == 0) {

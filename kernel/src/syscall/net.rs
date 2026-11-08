@@ -1,11 +1,12 @@
-//! Socket system calls: the Linux API over eliOS's TCP/IP stack, and Unix
-//! domain sockets (`net::unix`).
+//! Socket system calls: the Linux API over eliOS's TCP/IP stack, Unix
+//! domain sockets (`net::unix`) and route netlink (`net::netlink`).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::errno::{Errno, Result};
 use crate::fs::{Inode, O_NONBLOCK, O_RDWR, OpenFile};
+use crate::net::netlink::{AF_NETLINK, NetlinkFile, NetlinkSocket};
 use crate::net::socket::{self, AF_INET, Endpoint, SocketFile};
 use crate::net::unix::{self, AF_UNIX};
 use crate::net::{self, Ipv4};
@@ -24,6 +25,13 @@ const MSG_NOSIGNAL: u64 = 0x4000;
 fn unix_socket(fd: u64) -> Result<Option<(Arc<OpenFile>, Arc<unix::Socket>)>> {
     let file = process::current().files.lock().get(fd as i32 as usize)?;
     let socket = file.inode.as_any().and_then(|any| any.downcast_ref::<unix::SocketFile>()).map(|f| f.socket.clone());
+    Ok(socket.map(|socket| (file, socket)))
+}
+
+/// The netlink socket `fd` refers to, if it is one.
+fn netlink_socket(fd: u64) -> Result<Option<(Arc<OpenFile>, Arc<NetlinkSocket>)>> {
+    let file = process::current().files.lock().get(fd as i32 as usize)?;
+    let socket = file.inode.as_any().and_then(|any| any.downcast_ref::<NetlinkFile>()).map(|f| f.socket.clone());
     Ok(socket.map(|socket| (file, socket)))
 }
 
@@ -126,6 +134,10 @@ pub fn socket(domain: u64, kind: u64, protocol: u64) -> Result<u64> {
         let socket = unix::Socket::new(unix::Kind::from_type(kind & 0xF)?);
         return install(unix::SocketFile::new(socket), kind);
     }
+    if domain == AF_NETLINK {
+        let socket = crate::net::netlink::create(kind & 0xF, protocol)?;
+        return install(Arc::new(NetlinkFile { socket }), kind);
+    }
     let socket = socket::create(domain, kind & 0xF, protocol)?;
     install(socket, kind)
 }
@@ -156,6 +168,10 @@ pub fn bind(fd: u64, address: u64, length: u64) -> Result<u64> {
         socket.bind(read_unix_address(address, length)?)?;
         return Ok(0);
     }
+    if let Some((_, socket)) = netlink_socket(fd)? {
+        socket.bind(&user::read_bytes(address, (length as usize).min(12))?)?;
+        return Ok(0);
+    }
     let endpoint = read_address(address, length)?;
     with_socket(fd, |_, socket| socket::bind(socket, endpoint)).map(|_| 0)
 }
@@ -163,6 +179,10 @@ pub fn bind(fd: u64, address: u64, length: u64) -> Result<u64> {
 pub fn connect(fd: u64, address: u64, length: u64) -> Result<u64> {
     if let Some((file, socket)) = unix_socket(fd)? {
         socket.connect(&read_unix_address(address, length)?, nonblocking(&file, 0))?;
+        return Ok(0);
+    }
+    if netlink_socket(fd)?.is_some() {
+        // Netlink sockets only talk to the kernel.
         return Ok(0);
     }
     let endpoint = read_address(address, length)?;
@@ -194,6 +214,9 @@ pub fn send_to(fd: u64, buffer: u64, length: u64, flags: u64, address: u64, addr
         let destination = if address == 0 { None } else { Some(read_unix_address(address, address_length)?) };
         return unix_send(&file, &socket, data, Vec::new(), destination.as_ref(), flags);
     }
+    if let Some((_, socket)) = netlink_socket(fd)? {
+        return socket.send(data).map(|count| count as u64);
+    }
     let destination = if address == 0 { None } else { Some(read_address(address, address_length)?) };
     with_socket(fd, |file, socket| {
         socket::send(socket, data, destination, nonblocking(file, flags), flags & MSG_NOSIGNAL != 0)
@@ -210,6 +233,13 @@ pub fn receive_from(fd: u64, buffer: u64, length: u64, flags: u64, address: u64,
         }
         // Files sent along are lost on a plain receive, as on Linux.
         return Ok(if flags & MSG_TRUNC as u64 != 0 && received.truncated { length } else { received.count as u64 });
+    }
+    if let Some((file, socket)) = netlink_socket(fd)? {
+        let (count, full) = socket.receive(buf, nonblocking(&file, flags), flags & MSG_PEEK != 0)?;
+        if address != 0 {
+            write_address_bytes(address, address_length, &NetlinkSocket::kernel_address())?;
+        }
+        return Ok(if flags & MSG_TRUNC as u64 != 0 { full as u64 } else { count as u64 });
     }
     let (count, from) = with_socket(fd, |file, socket| receive_all(file, socket, buf, flags))?;
     if let Some(from) = from {
@@ -357,6 +387,9 @@ pub fn send_message(fd: u64, message: u64, flags: u64) -> Result<u64> {
             if header.name == 0 { None } else { Some(read_unix_address(header.name, u64::from(header.name_length))?) };
         return unix_send(&file, &socket, &data, files, destination.as_ref(), flags);
     }
+    if let Some((_, socket)) = netlink_socket(fd)? {
+        return socket.send(&data).map(|count| count as u64);
+    }
     let destination =
         if header.name == 0 { None } else { Some(read_address(header.name, u64::from(header.name_length))?) };
     with_socket(fd, |file, socket| {
@@ -390,6 +423,27 @@ pub fn receive_message(fd: u64, message: u64, flags: u64) -> Result<u64> {
         header.flags = if received.truncated { MSG_TRUNC } else { 0 } | if control_truncated { MSG_CTRUNC } else { 0 };
         user::write_value(message, &header)?;
         return Ok(copied as u64);
+    }
+    if let Some((file, socket)) = netlink_socket(fd)? {
+        let mut data = alloc::vec![0; total];
+        let (count, full) = socket.receive(&mut data, nonblocking(&file, flags), flags & MSG_PEEK != 0)?;
+        let mut copied = 0;
+        for (base, length) in vectors {
+            let chunk = length.min(count - copied);
+            user::write_bytes(base, &data[copied..copied + chunk])?;
+            copied += chunk;
+        }
+        if header.name != 0 {
+            let bytes = NetlinkSocket::kernel_address();
+            let room = (header.name_length as usize).min(bytes.len());
+            user::write_bytes(header.name, &bytes[..room])?;
+            header.name_length = bytes.len() as u32;
+        }
+        header.control_length = 0;
+        let truncated = full > count;
+        header.flags = if truncated { MSG_TRUNC } else { 0 };
+        user::write_value(message, &header)?;
+        return Ok(if truncated && flags & MSG_TRUNC as u64 != 0 { full as u64 } else { copied as u64 });
     }
     // One byte extra tells whether a datagram was cut short.
     let mut data = alloc::vec![0; total + 1];
@@ -429,6 +483,9 @@ pub fn get_socket_name(fd: u64, address: u64, length: u64) -> Result<u64> {
     if let Some((_, socket)) = unix_socket(fd)? {
         return write_address_bytes(address, length, &socket.local_address().encode()).map(|()| 0);
     }
+    if let Some((_, socket)) = netlink_socket(fd)? {
+        return write_address_bytes(address, length, &socket.local_address()).map(|()| 0);
+    }
     let endpoint = with_socket(fd, |_, socket| socket::local_endpoint(socket))?;
     write_address(address, length, endpoint).map(|_| 0)
 }
@@ -436,6 +493,9 @@ pub fn get_socket_name(fd: u64, address: u64, length: u64) -> Result<u64> {
 pub fn get_peer_name(fd: u64, address: u64, length: u64) -> Result<u64> {
     if let Some((_, socket)) = unix_socket(fd)? {
         return write_address_bytes(address, length, &socket.peer_address()?.encode()).map(|()| 0);
+    }
+    if netlink_socket(fd)?.is_some() {
+        return write_address_bytes(address, length, &NetlinkSocket::kernel_address()).map(|()| 0);
     }
     let endpoint = with_socket(fd, |_, socket| socket::remote_endpoint(socket))?;
     write_address(address, length, endpoint).map(|_| 0)
@@ -465,6 +525,10 @@ pub fn set_option(fd: u64, level: u64, name: u64, value: u64, length: u64) -> Re
             let on: i32 = user::read_value(value)?;
             socket.pass_credentials.store(on != 0, core::sync::atomic::Ordering::Relaxed);
         }
+        return Ok(0);
+    }
+    if netlink_socket(fd)?.is_some() {
+        // Buffer sizes, extended acks, strict checking: no effect here.
         return Ok(0);
     }
     with_socket(fd, |_, socket| {
@@ -500,6 +564,21 @@ pub fn get_option(fd: u64, level: u64, name: u64, value: u64, length: u64) -> Re
             (SOL_SOCKET, SO_PASSCRED) => i32::from(socket.pass_credentials.load(core::sync::atomic::Ordering::Relaxed)),
             _ => 0,
         };
+        if room < 4 {
+            return Err(Errno::EINVAL);
+        }
+        user::write_value(value, &result)?;
+        user::write_value(length, &4u32)?;
+        return Ok(0);
+    }
+    if let Some((_, socket)) = netlink_socket(fd)? {
+        let result: i32 = match (level, name) {
+            (SOL_SOCKET, SO_TYPE) => socket.kind() as i32,
+            (SOL_SOCKET, SO_DOMAIN) => AF_NETLINK as i32,
+            (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => 212_992,
+            _ => 0,
+        };
+        let room: u32 = user::read_value(length)?;
         if room < 4 {
             return Err(Errno::EINVAL);
         }
@@ -564,6 +643,19 @@ pub fn net_ioctl(socket: &SocketFile, request: u64, argument: u64) -> Result<u64
     if request == FIONREAD {
         user::write_value(argument, &(socket::available(socket) as i32))?;
         return Ok(0);
+    }
+    interface_ioctl(request, argument)
+}
+
+/// The interface queries (`SIOCGIF...`). Linux answers them on a socket of
+/// any family, and programs rely on it: musl's `if_indextoname` asks an
+/// `AF_UNIX` socket, which is how Firefox names the interfaces it gathers
+/// WebRTC candidates on.
+pub fn interface_ioctl(request: u64, argument: u64) -> Result<u64> {
+    // Socket ioctls are 0x89xx; anything else isn't one, and mustn't
+    // read the argument as an ifreq.
+    if request >> 8 != 0x89 {
+        return Err(Errno::ENOTTY);
     }
     let interfaces = net::interfaces();
     if request == SIOCGIFCONF {

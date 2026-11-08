@@ -15,7 +15,7 @@ mod poll;
 mod processes;
 mod system;
 
-pub use self::net::net_ioctl;
+pub use self::net::{interface_ioctl, net_ioctl};
 pub use self::system::{HOSTNAME, KERNEL_RELEASE};
 
 use crate::arch::interrupts::InterruptFrame;
@@ -231,6 +231,7 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         59 => processes::exec(frame, a[0], a[1], a[2]),
         60 => processes::exit(a[0]),
         61 => processes::wait(a[0], a[1], a[2]),
+        247 => processes::waitid(a[0], a[1], a[2], a[3], a[4]),
         62 => processes::kill(a[0], a[1]),
         63 => system::uname(a[0]),
         72 => files::fcntl(a[0], a[1], a[2]),

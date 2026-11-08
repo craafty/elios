@@ -18,6 +18,7 @@
 mod arp;
 mod dhcp;
 mod icmp;
+pub mod netlink;
 pub mod socket;
 mod tcp;
 mod udp;

@@ -714,7 +714,7 @@ impl Inode for SocketFile {
             process::user::write_value(argument, &(self.socket.available() as i32))?;
             return Ok(0);
         }
-        Err(Errno::ENOTTY)
+        crate::syscall::interface_ioctl(request, argument)
     }
 
     fn as_any(&self) -> Option<&dyn core::any::Any> {

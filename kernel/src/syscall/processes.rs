@@ -67,8 +67,8 @@ pub fn exit_group(code: u64) -> ! {
 const WNOHANG: u64 = 1;
 
 pub fn wait(pid: u64, status: u64, options: u64) -> Result<u64> {
-    match process::wait(pid as i32 as i64, options & WNOHANG != 0)? {
-        Some((pid, wait_status)) => {
+    match process::wait(pid as i32 as i64, options & WNOHANG != 0, false)? {
+        Some((pid, wait_status, _)) => {
             if status != 0 {
                 user::write_value(status, &wait_status)?;
             }
@@ -76,6 +76,57 @@ pub fn wait(pid: u64, status: u64, options: u64) -> Result<u64> {
         }
         None => Ok(0),
     }
+}
+
+const WEXITED: u64 = 4;
+const WSTOPPED: u64 = 2;
+const WCONTINUED: u64 = 8;
+const WNOWAIT: u64 = 0x0100_0000;
+
+/// `waitid(idtype, id, info, options, rusage)`: `wait4` with the result as
+/// a `siginfo_t`. Firefox's process watcher uses it. Children never stop
+/// here, so only exits are reported; pidfds don't exist, so `P_PIDFD`
+/// is refused as by Linux before them.
+pub fn waitid(id_type: u64, id: u64, info: u64, options: u64, usage: u64) -> Result<u64> {
+    const P_ALL: u64 = 0;
+    const P_PID: u64 = 1;
+    const P_PGID: u64 = 2;
+    let id = id as i32 as i64;
+    let pid = match id_type {
+        P_ALL => -1,
+        P_PID if id > 0 => id,
+        P_PGID if id >= 0 => -id,
+        _ => return Err(Errno::EINVAL),
+    };
+    if options & (WEXITED | WSTOPPED | WCONTINUED) == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let no_hang = options & WNOHANG != 0;
+    let found = if options & WEXITED != 0 { process::wait(pid, no_hang, options & WNOWAIT != 0)? } else { None };
+    // Nothing to report (`WNOHANG`): Linux clears the pid, and programs
+    // check it.
+    let mut siginfo = [0u8; 128];
+    if let Some((child, status, uid)) = found {
+        // CLD_EXITED with the exit code, or CLD_KILLED / CLD_DUMPED with
+        // the signal.
+        let (code, value): (i32, i32) = match status & 0x7F {
+            0 => (1, (status >> 8) & 0xFF),
+            signal if status & 0x80 != 0 => (3, signal),
+            signal => (2, signal),
+        };
+        siginfo[..4].copy_from_slice(&17i32.to_le_bytes());
+        siginfo[8..12].copy_from_slice(&code.to_le_bytes());
+        siginfo[16..20].copy_from_slice(&(child as i32).to_le_bytes());
+        siginfo[20..24].copy_from_slice(&uid.to_le_bytes());
+        siginfo[24..28].copy_from_slice(&value.to_le_bytes());
+    }
+    if info != 0 {
+        user::write_bytes(info, &siginfo)?;
+    }
+    if usage != 0 {
+        user::write_bytes(usage, &[0u8; 144])?;
+    }
+    Ok(0)
 }
 
 pub fn kill(pid: u64, signal: u64) -> Result<u64> {

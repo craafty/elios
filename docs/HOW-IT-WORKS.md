@@ -1105,6 +1105,11 @@ start.
   process stays as a "zombie" until its parent collects it.
 - **`wait4`** finds a matching zombie child (by pid, any child, or process
   group, as Linux defines) and removes it, or sleeps until one appears.
+  **`waitid`** is the same with the answer as a `siginfo_t` (`CLD_EXITED`
+  or `CLD_KILLED`, pid, uid, status) and `WNOWAIT` to leave the child for
+  later; Firefox's process watcher uses it. Children never stop, so only
+  exits are reported. `kill` finds zombies (and succeeds without
+  delivering anything), as Linux does, or `killall` reports errors.
 
 Wait statuses use Linux's encoding: exit code in bits 8-15, or the signal
 number in the low 7 bits.
@@ -1478,6 +1483,15 @@ Alpine's Firefox runs unmodified. What it needed, in the order it asked:
   unprivileged namespaces.
 - `/proc/sys/kernel/overflowuid` and the other `/proc/sys` files.
 - A non-blocking `pipe2` (see Pipes).
+
+- **WebRTC** (`RTCPeerConnection`): route netlink to list addresses, and
+  interface names through `if_indextoname` (see Networking); then ICE,
+  DTLS and SRTP are Firefox's own, over ordinary UDP sockets. A loopback
+  call (two peer connections in one page, camera and microphone) connects
+  and plays the video.
+- `/proc/PID/stat` with all 52 of Linux's fields: BusyBox's `ps`,
+  `pidof` and `killall` parse it with a number reader that runs off the
+  end of a shorter line.
 
 Firefox starts about a dozen processes through its fork server: the
 parent, a socket process, extensions, a graphics decoder (RDD), and
@@ -2544,7 +2558,30 @@ out with `EAGAIN`; writing to a closed connection raises SIGPIPE; and
 Interface information comes the way Linux tools ask for it: the `SIOCGIF*`
 ioctls on any socket (address, netmask, flags, MAC, MTU...), and
 `/proc/net/dev`, `route`, `arp`, `tcp` and `udp` in Linux's formats. That's
-all BusyBox's `ifconfig`, `route` and `netstat` need.
+all BusyBox's `ifconfig`, `route` and `netstat` need. "Any socket" means
+Unix and netlink sockets too: musl's `if_indextoname` asks an `AF_UNIX`
+socket, and Firefox names the interfaces it gathers WebRTC candidates on
+that way (with no name, nICEr's per-interface setting is an invalid
+registry key and it gathers nothing).
+
+### Route netlink (`net/netlink.rs`)
+
+Newer programs ask for interfaces, addresses and routes over a netlink
+socket (`AF_NETLINK`, `NETLINK_ROUTE`) instead: musl's and glibc's
+`getifaddrs`, BusyBox's `ip`, and Firefox, which lists the machine's
+addresses this way before WebRTC's ICE picks candidates. A netlink socket
+is a datagram socket whose peer is the kernel: a program sends requests
+(an `nlmsghdr`, then a message for its type) and reads the answers. Only
+the dump requests are answered, from the stack's interface table:
+`RTM_GETLINK` (each interface's name, MAC, MTU and state, as
+`RTM_NEWLINK`), `RTM_GETADDR` (IPv4 addresses with prefix, broadcast and
+label) and `RTM_GETROUTE` (the subnet and default routes). Replies are
+packed into datagrams of up to a page, and a dump ends with `NLMSG_DONE`
+in a datagram of its own, as Linux sends it; other requests get
+`NLMSG_ERROR` with `EOPNOTSUPP`, and `NLM_F_ACK` an acknowledgement. A
+socket's port id is its process id, unless that's taken, as on Linux.
+Nothing is ever announced to multicast groups: interfaces don't change
+often enough for a program to need telling.
 
 ### Unix domain sockets (`net/unix.rs`)
 
@@ -2585,7 +2622,9 @@ which reads the same files.
 `nettest` (a glibc program) checks TCP and UDP over loopback: 200 KiB
 through an echo server in both directions at once, nonblocking connect,
 `poll` and `select`, `MSG_PEEK`, `shutdown`, timeouts, refused
-connections. A kernel test pings loopback and QEMU's virtual router. By
+connections; then `getifaddrs`, interface names both ways, and UDP
+between two sockets bound to the machine's own address (as WebRTC's host
+candidates talk in a call to oneself). A kernel test reads a netlink dump. A kernel test pings loopback and QEMU's virtual router. By
 hand: downloads from a web server on the host (`wget` with an MD5 check)
 and from the internet, and connections from the host into eliOS through a
 forwarded port (`cargo xtask run --forward 8080:80`).
