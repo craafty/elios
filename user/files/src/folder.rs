@@ -233,13 +233,13 @@ pub fn human_size(bytes: u64) -> String {
     if value < 10.0 { format!("{value:.1} {unit}") } else { format!("{value:.0} {unit}") }
 }
 
-/// A modification time as "2026-10-17 01:09" (UTC, like the desktop's
-/// clock).
+/// A modification time as "2026-10-17 01:09" (local time, like the
+/// desktop's clock).
 pub fn date(seconds: i64) -> String {
     if seconds <= 0 {
         return String::new();
     }
-    let time = eli::time::DateTime::from_unix(seconds as u64);
+    let time = eli::time::DateTime::local(seconds);
     format!("{}-{:02}-{:02} {:02}:{:02}", time.year, time.month, time.day, time.hour, time.minute)
 }
 

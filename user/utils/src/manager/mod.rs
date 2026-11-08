@@ -307,7 +307,7 @@ fn show_generations() -> Result<(), String> {
         fs::read_to_string(&format!("{RUN}/generation")).ok().and_then(|text| text.trim().parse().ok());
     for number in generations::list() {
         let Ok(generation) = generations::load(number) else { continue };
-        let date = time::DateTime::from_unix(generation.created);
+        let date = time::DateTime::local(generation.created as i64);
         let mut marks = Vec::new();
         if Some(number) == current {
             marks.push("current");

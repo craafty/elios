@@ -34,6 +34,7 @@ pub mod system;
 pub mod term;
 pub mod time;
 pub mod users;
+pub mod zone;
 
 use core::arch::naked_asm;
 use core::panic::PanicInfo;

@@ -42,6 +42,7 @@ const SET_CHANNEL_STREAM: u16 = 0x706;
 const SET_PIN_CONTROL: u16 = 0x707;
 const SET_EAPD: u16 = 0x70C;
 const GET_PIN_SENSE: u16 = 0xF09;
+const SET_PIN_SENSE: u16 = 0x709;
 const GET_CONFIG_DEFAULT: u16 = 0xF1C;
 const SET_STREAM_FORMAT: u8 = 0x2;
 const SET_AMP: u8 = 0x3;
@@ -65,6 +66,8 @@ const CAP_DIGITAL: u32 = 1 << 9;
 const CAP_POWER: u32 = 1 << 10;
 
 // Pin capabilities.
+/// Sensing must be started (SET_PIN_SENSE) before each reading.
+const PIN_TRIGGER: u32 = 1 << 1;
 const PIN_PRESENCE: u32 = 1 << 2;
 const PIN_OUTPUT: u32 = 1 << 4;
 const PIN_INPUT: u32 = 1 << 5;
@@ -464,20 +467,58 @@ impl Codec {
         }
     }
 
-    /// Whether headphones are plugged in (so the speakers should be quiet).
-    pub fn headphones_plugged(&self, link: &mut impl Link) -> bool {
-        self.outputs.iter().any(|path| {
-            let pin = &self.widgets[&path.nodes[0]];
-            pin.device() == Device::Headphone
-                && pin.pin_caps & PIN_PRESENCE != 0
-                && link.send(pin.nid, Verb::Short(GET_PIN_SENSE, 0)) & (1 << 31) != 0
+    /// Headphone jacks that can tell whether something is plugged in.
+    fn headphone_jacks(&self) -> impl Iterator<Item = &Widget> {
+        self.widgets.values().filter(|w| {
+            w.kind == Kind::Pin
+                && w.connected()
+                && w.device() == Device::Headphone
+                && w.pin_caps & PIN_PRESENCE != 0
+                && w.pin_caps & PIN_OUTPUT != 0
         })
     }
 
-    /// Turns the speakers' pins off (headphones plugged in) or back on.
+    /// A pin's sense reading (bit 31: something is plugged in).
+    fn sense(&self, link: &mut impl Link, pin: &Widget) -> u32 {
+        if pin.pin_caps & PIN_TRIGGER != 0 {
+            link.send(pin.nid, Verb::Short(SET_PIN_SENSE, 0));
+        }
+        link.send(pin.nid, Verb::Short(GET_PIN_SENSE, 0))
+    }
+
+    /// Whether headphones are plugged in (so the speakers should be quiet).
+    pub fn headphones_plugged(&self, link: &mut impl Link) -> bool {
+        self.headphone_jacks().any(|pin| self.sense(link, pin) & (1 << 31) != 0)
+    }
+
+    /// The headphone jacks' pin capabilities and sense readings, for the
+    /// log (automute can only be checked on real hardware).
+    pub fn describe_jacks(&self, link: &mut impl Link) -> String {
+        let jacks: Vec<String> = self
+            .headphone_jacks()
+            .map(|pin| {
+                alloc::format!(
+                    "{:#x} (config {:08x}, pin caps {:08x}, sense {:08x})",
+                    pin.nid,
+                    pin.config,
+                    pin.pin_caps,
+                    self.sense(link, pin)
+                )
+            })
+            .collect();
+        if jacks.is_empty() { String::from("none that sense plugs") } else { jacks.join(", ") }
+    }
+
+    /// Turns the speakers off (headphones plugged in) or back on: their
+    /// pins' outputs, and their pins' own amplifiers too, since on some
+    /// laptops (the T440p) speakers and headphones share a DAC and mixer.
     pub fn set_speakers(&self, link: &mut impl Link, on: bool) {
         for path in self.outputs.iter().filter(|path| path.device == Device::Speaker) {
-            link.send(path.nodes[0], Verb::Short(SET_PIN_CONTROL, if on { PIN_OUT_ENABLE } else { 0 }));
+            let pin = &self.widgets[&path.nodes[0]];
+            link.send(pin.nid, Verb::Short(SET_PIN_CONTROL, if on { PIN_OUT_ENABLE } else { 0 }));
+            if pin.caps & CAP_OUT_AMP != 0 {
+                self.set_amp(link, pin, true, 0, on, amp_steps(pin.out_amp).zero);
+            }
         }
     }
 
@@ -540,6 +581,8 @@ mod tests {
     struct Simulated {
         widgets: BTreeMap<u16, (u32, Vec<u16>, u32, u32)>,
         sent: Vec<(u16, u32)>,
+        /// Whether the headphone jack (0x21) senses a plug.
+        headphones_in: bool,
     }
 
     impl Simulated {
@@ -563,7 +606,7 @@ mod tests {
             widgets.insert(0x18, (wcaps(4, 0), alloc::vec![], jack, 0x03A1_1040));
             // An unconnected pin, which must be ignored.
             widgets.insert(0x17, (wcaps(4, CAP_CONNECTIONS), alloc::vec![0x0C], output, 0x4000_0000));
-            Self { widgets, sent: Vec::new() }
+            Self { widgets, sent: Vec::new(), headphones_in: false }
         }
     }
 
@@ -596,6 +639,7 @@ mod tests {
                         (GET_CONFIG_DEFAULT, _) => *config,
                         // The microphone jack has something plugged in.
                         (GET_PIN_SENSE, _) if nid == 0x18 => 1 << 31,
+                        (GET_PIN_SENSE, _) if nid == 0x21 && self.headphones_in => 1 << 31,
                         _ => 0,
                     }
                 }
@@ -621,6 +665,25 @@ mod tests {
             // The plugged-in microphone jack wins over the built-in one.
             let input = codec.input.as_ref().expect("a microphone route");
             assert_eq!(input.nodes, alloc::vec![0x08, 0x23, 0x18]);
+        }
+
+        fn headphones_mute_the_speakers() {
+            let mut link = Simulated::thinkpad();
+            let codec = Codec::discover(&mut link, 0).unwrap();
+            assert!(!codec.headphones_plugged(&mut link));
+            link.headphones_in = true;
+            assert!(codec.headphones_plugged(&mut link));
+            link.sent.clear();
+            codec.set_speakers(&mut link, false);
+            // The speaker pin's output is off and its amplifier muted; the
+            // headphone pin is left alone.
+            assert!(link.sent.contains(&(0x14, 0x707 << 8)));
+            assert!(link.sent.contains(&(0x14, 0x3 << 16 | 0xB0D7)));
+            assert!(link.sent.iter().all(|&(nid, _)| nid == 0x14));
+            link.sent.clear();
+            codec.set_speakers(&mut link, true);
+            assert!(link.sent.contains(&(0x14, 0x707 << 8 | 0x40)));
+            assert!(link.sent.contains(&(0x14, 0x3 << 16 | 0xB057)));
         }
 
         fn codec_routes_are_opened() {

@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! hostname = elios
+//! timezone = America/New_York
 //! packages = git vim
 //!
 //! user alice
@@ -30,6 +31,9 @@ pub struct User {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub hostname: String,
+    /// A zone name from the IANA database ("Europe/Paris") or a POSIX
+    /// rule; the clock shows UTC without one.
+    pub timezone: String,
     pub packages: Vec<String>,
     /// Package repositories; empty means the defaults in
     /// /etc/eli/repositories.
@@ -43,6 +47,7 @@ pub struct Config {
 pub fn parse(text: &str) -> Result<Config, String> {
     let mut config = Config {
         hostname: "elios".into(),
+        timezone: "UTC".into(),
         packages: Vec::new(),
         repositories: Vec::new(),
         users: Vec::new(),
@@ -95,12 +100,21 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 }
                 config.hostname = value.into();
             }
+            "timezone" => {
+                let name = |c: char| c.is_ascii_alphanumeric() || "/_-+".contains(c);
+                let valid = eli::zone::rule_for(value).is_some()
+                    || (value.contains('/') && value.chars().all(name) && !value.contains(".."));
+                if !valid {
+                    return Err(problem(&format!("{value:?} isn't a time zone (try America/New_York or UTC)")));
+                }
+                config.timezone = if value.is_empty() { "UTC".into() } else { value.into() };
+            }
             "packages" => config.packages = value.split_whitespace().map(String::from).collect(),
             "repositories" => config.repositories = value.split_whitespace().map(String::from).collect(),
             "autologin" => config.autologin = (!value.is_empty()).then(|| value.into()),
             _ => {
                 return Err(problem(&format!(
-                    "unknown setting {key:?} (try hostname, packages, repositories, autologin)"
+                    "unknown setting {key:?} (try hostname, timezone, packages, repositories, autologin)"
                 )));
             }
         }

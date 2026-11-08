@@ -345,11 +345,12 @@ eliOS's own rasterizer in `truetype/`.
 - [x] **Installer:** partitions a disk (or uses its free space), a data
       partition, a UEFI boot entry through the firmware's runtime services
 - [x] **System manager:** `system.conf`, packages from Alpine, generations,
-      rollback, a boot menu of generations
+      rollback, a boot menu of generations, the time zone
 - [ ] **Laptop (ThinkPad T440p):** the log saved to the USB stick, USB
       ports routed to xHCI on Intel 8-series chipsets, PS/2 and USB mice
       and `/dev/input`, the I217 Ethernet (works: gigabit, DHCP), sound
-      (works: `speaker-test` plays), the Intel 7260 Wi-Fi driver (works:
+      (works: `speaker-test` and YouTube in Firefox play; headphones
+      plugged in now mute the speakers), the Intel 7260 Wi-Fi driver (works:
       scanning, and joining Purdue's WPA2-Enterprise PAL3.0 with DHCP;
       open and WPA2 networks use the same path) and Bluetooth (the
       Intel firmware patch loads and scans find devices; pairing, L2CAP

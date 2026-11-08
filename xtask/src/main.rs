@@ -411,7 +411,19 @@ fn add_test_account(rootfs: &Path) -> Result<(), String> {
         fs::write(path, contents).map_err(|e| format!("writing {}: {e}", path.display()))
     };
     append(&rootfs.join("etc/eli/system.conf"), TEST_ACCOUNT)?;
+    set_host_timezone(&rootfs.join("etc/eli/system.conf"))?;
     append(&rootfs.join("etc/shadow"), &format!("test:{TEST_PASSWORD_HASH}:20371:0:99999:7:::\n"))
+}
+
+/// Development images keep the time of the machine that built them (their
+/// tester is usually nearby): its zone, from where /etc/localtime points.
+fn set_host_timezone(config: &Path) -> Result<(), String> {
+    let Ok(target) = fs::read_link("/etc/localtime") else { return Ok(()) };
+    let target = target.to_string_lossy().into_owned();
+    let Some((_, zone)) = target.split_once("zoneinfo/") else { return Ok(()) };
+    let contents = fs::read_to_string(config).map_err(|e| format!("reading {}: {e}", config.display()))?;
+    let contents = contents.replace("\ntimezone = UTC\n", &format!("\ntimezone = {zone}\n"));
+    fs::write(config, contents).map_err(|e| format!("writing {}: {e}", config.display()))
 }
 
 /// Compiles the C programs in `user/c` with the host's C compiler, as

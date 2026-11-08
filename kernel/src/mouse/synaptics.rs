@@ -4,9 +4,9 @@
 //! all, and two-finger scrolling is impossible. Absolute mode reports where
 //! the finger is, how hard it presses, how many fingers there are, and the
 //! pad's own button; this module turns that back into what the rest of the
-//! system expects from a mouse: relative movement (scaled to the basic
-//! protocol's 8 counts per millimetre, so the desktop's acceleration feels
-//! the same), buttons and wheel steps.
+//! system expects from a mouse: relative movement (scaled to 6 counts per
+//! millimetre, a little under the basic protocol's 8, so the desktop's
+//! acceleration feels about the same), buttons and wheel steps.
 //!
 //! The protocol is Synaptics' "PS/2 TouchPad Interfacing Guide": queries
 //! and the mode byte are sent as a "special command" (an argument spelled
@@ -74,8 +74,10 @@ const CAP_10_STICK_BUTTONS: u32 = 1 << 16;
 /// Pressure from which a finger counts as touching (libinput's default
 /// for Synaptics pads; resting fingers hover around 10-20).
 const TOUCH_PRESSURE: u8 = 30;
-/// Movement the basic protocol reports per millimetre (resolution 3).
-const COUNTS_PER_MM: i32 = 8;
+/// Movement reported per millimetre of finger travel: a quarter less than
+/// the basic protocol's 8 (resolution 3), which overshot small movements
+/// on the T440p's pad.
+const COUNTS_PER_MM: i32 = 6;
 /// Units per millimetre if the touchpad doesn't say (typical of Lenovo's).
 const DEFAULT_UNITS_PER_MM: i32 = 42;
 /// Two fingers moving this many millimetres scroll one wheel step.
@@ -443,13 +445,13 @@ mod tests {
     crate::ktest! {
         fn finger_movement_becomes_counts() {
             let mut decoder = Decoder::new(touchpad());
-            // Landing reports nothing; then 5 mm right and 2.5 mm up are 40
-            // and 20 counts (up is negative on the screen).
+            // Landing reports nothing; then 5 mm right and 2.5 mm up are 30
+            // and 15 counts (up is negative on the screen).
             assert!(feed(&mut decoder, touch(3000, 3000, 60, 6, false)).is_empty());
-            assert_eq!(feed(&mut decoder, touch(3200, 3100, 60, 6, false)), [(EV_REL, REL_X, 40), (EV_REL, REL_Y, -20)]);
-            // Fractions carry over: 3 units are 0.6 counts each time.
-            assert!(feed(&mut decoder, touch(3203, 3100, 60, 6, false)).is_empty());
-            assert_eq!(feed(&mut decoder, touch(3206, 3100, 60, 6, false)), [(EV_REL, REL_X, 1)]);
+            assert_eq!(feed(&mut decoder, touch(3200, 3100, 60, 6, false)), [(EV_REL, REL_X, 30), (EV_REL, REL_Y, -15)]);
+            // Fractions carry over: 4 units are 0.6 counts each time.
+            assert!(feed(&mut decoder, touch(3204, 3100, 60, 6, false)).is_empty());
+            assert_eq!(feed(&mut decoder, touch(3208, 3100, 60, 6, false)), [(EV_REL, REL_X, 1)]);
             // Lifting the finger and landing elsewhere doesn't jump.
             assert!(feed(&mut decoder, touch(0, 0, 0, 6, false)).is_empty());
             assert!(feed(&mut decoder, touch(1500, 1500, 60, 6, false)).is_empty());

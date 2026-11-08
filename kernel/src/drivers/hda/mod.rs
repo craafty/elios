@@ -399,10 +399,16 @@ impl Controller {
     /// Mutes the speakers while headphones are plugged in, checking every
     /// half second (jack interrupts would need unsolicited responses).
     fn watch_jacks(self: Arc<Self>) {
+        info!("hda: {}: headphone jacks: {}", self.name, self.command(|codec, link| codec.describe_jacks(link)));
         loop {
             let plugged = self.command(|codec, link| codec.headphones_plugged(link));
             if plugged != self.headphones.swap(plugged, Ordering::Relaxed) {
-                info!("hda: headphones {}", if plugged { "plugged in" } else { "unplugged" });
+                info!(
+                    "hda: headphones {}: speakers {} ({})",
+                    if plugged { "plugged in" } else { "unplugged" },
+                    if plugged { "off" } else { "on" },
+                    self.command(|codec, link| codec.describe_jacks(link))
+                );
                 self.command(|codec, link| codec.set_speakers(link, !plugged));
             }
             crate::task::sleep_ms(500);

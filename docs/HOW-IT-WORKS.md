@@ -1872,8 +1872,9 @@ The decoder turns that back into what programs expect of a mouse, so
 nothing above the driver changes:
 
 - one finger's movement becomes relative movement, scaled from the pad's
-  units (about 40 per millimetre) to the 8 counts per millimetre of the
-  basic protocol so the desktop's acceleration feels the same; landing,
+  units (about 40 per millimetre) to 6 counts per millimetre, a quarter
+  under the basic protocol's 8 (at 8 the pad felt too fast for small
+  movements), so the desktop's acceleration feels about the same; landing,
   lifting, changing the finger count and implausible jumps (over 15 mm
   in a packet) reset the position instead of moving the pointer;
 - pressing the pad is the left button, or the right with two fingers
@@ -2223,8 +2224,12 @@ generic codec driver, eliOS searches the graph for a route from each
 useful output pin back to a DAC and from a microphone to an ADC, then
 powers, unmutes and selects along it. So basic sound needs no per-laptop
 tables. Speakers and headphones are both driven, and a thread watches the
-headphone jack's presence detection to mute the speaker while headphones
-are plugged in. The route search is tested against a simulated ALC292
+headphone jacks' presence detection (starting each reading on pins that
+need a trigger) to mute the speaker while headphones are plugged in. Muting
+turns off both the speaker pin's output and its own amplifier: on the
+T440p the speaker and the headphone jack hang off the same mixer and DAC,
+so nothing earlier on the route can tell them apart. The jacks' pin
+capabilities and readings are logged at boot and at every change. The route search is tested against a simulated ALC292
 laid out like the T440p's.
 
 **The interface** (`sound/`) is Linux's ALSA, so `libasound`, and with it
@@ -3465,6 +3470,20 @@ is set up (a fresh live system gets the image's default configuration and
 a first generation), links `/etc/system.conf` and `/etc/shadow` into it,
 mounts `/data/home` on `/home`, and activates the current generation (or
 the one picked in eliboot's menu, from `generation=N` on the command line).
+
+**The time zone.** The hardware clock keeps UTC, and `timezone =` in
+system.conf (an IANA name like `America/New_York`, or a POSIX rule like
+`EST5EDT,M3.2.0,M11.1.0`) says what to show. Activation writes
+`/etc/localtime`, the TZif file every Linux program reads (musl and glibc,
+so Firefox and BusyBox's `date` agree with ours): Alpine's own file for
+the zone if `tzdata` is installed, otherwise a small one eli makes itself,
+holding just the zone's current rule (TZif files end with such a rule for
+times past their table of changes, and with one change at 1970 the rule
+covers everything since). `libeli`'s `zone` module parses those rules,
+knows about seventy common zones' current ones (checked against the
+host's tz database over two years of times), and gives our programs
+(the bar's clock, `date`, `ls -l`, `files`) local time. Development
+images take the zone of the machine that built them.
 
 `adduser` and `deluser` change `system.conf` and apply it on such a system,
 so accounts last; `passwd` writes through the `/etc/shadow` link. The shell

@@ -257,7 +257,7 @@ fn print_entry(name: &str, full: &str, names: Option<&crate::accounts::Names>) {
         FileType::Socket => 's',
         _ => '-',
     };
-    let date = DateTime::from_unix(metadata.modified.max(0) as u64);
+    let date = DateTime::local(metadata.modified);
     let target = if metadata.kind == FileType::Symlink {
         fs::read_link(full).map(|target| format!(" -> {target}")).unwrap_or_default()
     } else {
@@ -456,7 +456,7 @@ fn stat(arguments: &[String]) -> i32 {
     for path in &arguments[1..] {
         match fs::symlink_metadata(path) {
             Ok(metadata) => {
-                let date = DateTime::from_unix(metadata.modified.max(0) as u64);
+                let date = DateTime::local(metadata.modified);
                 println!("  File: {path}");
                 println!("  Type: {:?}", metadata.kind);
                 println!("  Size: {} bytes", metadata.size);
@@ -697,9 +697,9 @@ fn sleep(arguments: &[String]) -> i32 {
 fn date(_: &[String]) -> i32 {
     const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    let now = DateTime::from_unix(time::unix_time());
+    let (now, zone) = DateTime::in_zone(time::unix_time() as i64, &time::local_zone());
     println!(
-        "{} {} {:2} {:02}:{:02}:{:02} UTC {}",
+        "{} {} {:2} {:02}:{:02}:{:02} {zone} {}",
         DAYS[now.weekday as usize],
         MONTHS[now.month as usize - 1],
         now.day,

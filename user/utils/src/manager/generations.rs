@@ -116,7 +116,7 @@ fn write_boot_menu() {
     let mut text = String::new();
     for number in list().into_iter().rev().take(9) {
         let Ok(generation) = load(number) else { continue };
-        let date = time::DateTime::from_unix(generation.created);
+        let date = time::DateTime::local(generation.created as i64);
         let mark = if Some(number) == current { " (current)" } else { "" };
         text.push_str(&format!(
             "{number}\t{:04}-{:02}-{:02} {:02}:{:02}  {}{mark}\n",
@@ -140,9 +140,26 @@ pub fn activate(generation: &Generation) -> Result<(), String> {
     let _ = fs::write("/etc/hostname", format!("{name}\n").as_bytes());
     let _ = system::set_hostname(name);
     link_packages(&generation.packages)?;
+    set_timezone(&generation.config.timezone);
     run_triggers(&generation.packages);
     let _ = fs::write(&format!("{RUN}/generation"), format!("{}\n", generation.number).as_bytes());
     Ok(())
+}
+
+/// Writes /etc/localtime for a zone: Alpine's file for it if `tzdata` is
+/// installed (linked into /usr by now), otherwise one made from the rule
+/// libeli knows for it.
+fn set_timezone(setting: &str) {
+    let installed = format!("/usr/share/zoneinfo/{setting}");
+    let file = fs::read(&installed).ok().filter(|file| eli::zone::rule_of_tzif(file).is_some()).or_else(|| {
+        let rule = eli::zone::rule_for(setting)?;
+        Some(eli::zone::Zone::parse(rule)?.tzif(rule))
+    });
+    let file = file.unwrap_or_else(|| {
+        eprintln!("eli: unknown time zone {setting} (add the tzdata package for every zone); using UTC");
+        eli::zone::Zone::utc().tzif("UTC0")
+    });
+    let _ = fs::write("/etc/localtime", &file);
 }
 
 /// Runs the packages' triggers: scripts that rebuild caches from what

@@ -84,6 +84,8 @@ pub struct Desktop {
     pub running: bool,
     children: Vec<u32>,
     clock: String,
+    /// The time zone the clock shows, looked at again every few seconds.
+    zone: eli::time::Zone,
     /// The data source on the clipboard: (client, source id).
     selection: Option<(u32, u32)>,
     menu: Option<AppMenu>,
@@ -142,6 +144,7 @@ impl Desktop {
             running: true,
             children: Vec::new(),
             clock: String::new(),
+            zone: eli::time::local_zone(),
         }
     }
 
@@ -910,14 +913,15 @@ impl Desktop {
 
     /// Called ~60 times a second.
     pub fn tick(&mut self) {
-        let now = eli::time::unix_time();
-        let clock = format!("{:02}:{:02}", now / 3600 % 24, now / 60 % 60);
+        let now = eli::time::DateTime::in_zone(eli::time::unix_time() as i64, &self.zone).0;
+        let clock = format!("{:02}:{:02}", now.hour, now.minute);
         if clock != self.clock {
             self.clock = clock;
             self.screen.damage(Rect::new(self.screen.width - 80, 0, 80, BAR_HEIGHT));
         }
         self.ticks = self.ticks.wrapping_add(1);
         if self.ticks.is_multiple_of(120) {
+            self.zone = eli::time::local_zone();
             let installed = browser_path().is_some();
             let status = apps::network_status();
             if installed != self.browser_installed || status != self.status {

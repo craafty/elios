@@ -1,6 +1,7 @@
 //! Clocks and sleeping.
 
 use crate::sys;
+pub use crate::zone::Zone;
 
 fn clock(id: usize) -> u64 {
     let mut timespec = [0u64; 2];
@@ -47,7 +48,30 @@ pub fn system_info() -> SystemInfo {
     }
 }
 
-/// A calendar date and time (UTC).
+/// The system's time zone: `TZ` if it's set (a rule, or `:path` or a path
+/// to a TZif file, as musl and glibc take it), else /etc/localtime; UTC if
+/// neither says. Programs showing the time for long should look again now
+/// and then, so a changed setting shows.
+pub fn local_zone() -> Zone {
+    let from_file = |path: &str| {
+        let file = crate::fs::read(path).ok()?;
+        Zone::parse(crate::zone::rule_of_tzif(&file)?)
+    };
+    if let Some(tz) = crate::env::var("TZ").filter(|tz| !tz.is_empty()) {
+        let path = tz.strip_prefix(':').unwrap_or(&tz);
+        let zone = if path.starts_with('/') {
+            from_file(path)
+        } else {
+            Zone::parse(&tz).or_else(|| from_file(&alloc::format!("/usr/share/zoneinfo/{path}")))
+        };
+        if let Some(zone) = zone {
+            return zone;
+        }
+    }
+    from_file("/etc/localtime").unwrap_or_else(Zone::utc)
+}
+
+/// A calendar date and time.
 pub struct DateTime {
     pub year: i64,
     pub month: u32,
@@ -60,19 +84,26 @@ pub struct DateTime {
 }
 
 impl DateTime {
+    /// In UTC.
     pub fn from_unix(seconds: u64) -> Self {
-        let days = (seconds / 86_400) as i64;
-        let rest = seconds % 86_400;
-        // Howard Hinnant's civil_from_days.
-        let z = days + 719_468;
-        let era = z.div_euclid(146_097);
-        let day_of_era = z - era * 146_097;
-        let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-        let month_index = (5 * day_of_year + 2) / 153;
-        let day = (day_of_year - (153 * month_index + 2) / 5 + 1) as u32;
-        let month = if month_index < 10 { month_index + 3 } else { month_index - 9 } as u32;
-        let year = year_of_era + era * 400 + i64::from(month <= 2);
+        Self::from_seconds(seconds as i64)
+    }
+
+    /// In the system's time zone ([`local_zone`]).
+    pub fn local(seconds: i64) -> Self {
+        Self::in_zone(seconds, &local_zone()).0
+    }
+
+    /// In a time zone, with the zone's abbreviation ("EST").
+    pub fn in_zone(seconds: i64, zone: &Zone) -> (Self, alloc::string::String) {
+        let (offset, name) = zone.at(seconds);
+        (Self::from_seconds(seconds + offset), name.into())
+    }
+
+    fn from_seconds(seconds: i64) -> Self {
+        let days = seconds.div_euclid(86_400);
+        let rest = seconds.rem_euclid(86_400);
+        let (year, month, day) = crate::zone::civil_from_days(days);
         Self {
             year,
             month,
