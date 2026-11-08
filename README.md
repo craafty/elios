@@ -45,7 +45,8 @@ The first build installs the nightly Rust toolchain eliOS uses and takes a
 few minutes. A QEMU window opens and eliOS boots to its login screen.
 Development builds come with an account to try them with: user `test`,
 password `1234` (an administrator: it can use `sudo`). Left and Right on
-the *session* line choose between the text console and the desktop;
+the *session* line choose between the desktop (the default) and the text
+console, and the choice is remembered for each person;
 Enter logs in, and logging out comes back to the login screen (`root`,
 which has no password on the live system, works too). You can type in
 the window, or in the terminal you ran the command from (the serial port

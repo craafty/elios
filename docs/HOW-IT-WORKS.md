@@ -1321,7 +1321,7 @@ shell. Every later session asks.
 The greeter is a box in the middle of the console, in the style of the
 `ly` display manager: three fields, *session*, *login* and *password*.
 Up and Down (or Tab) move between them; Left and Right on *session*
-choose Text or Desktop; Enter logs in; F1 powers off and F2 reboots. The
+choose Desktop (the default) or Text, remembered per person; Enter logs in; F1 powers off and F2 reboots. The
 session is chosen at login, not at boot, so there's no boot menu or
 countdown to wait through, and a broken desktop never locks you out: Text
 still gets a shell.

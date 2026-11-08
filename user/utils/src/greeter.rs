@@ -3,7 +3,8 @@
 //!
 //! A box in the middle of the screen asks for a name and a password, and
 //! has a third field, the session: Up and Down (or Tab) move between the
-//! fields, Left and Right pick the text console or the desktop, Enter logs
+//! fields, Left and Right pick the text console or the desktop (the
+//! default, until someone picks the console), Enter logs
 //! in. It's drawn with escape sequences, so it works on the framebuffer
 //! console and over a serial line alike, and needs nothing graphical: if
 //! the desktop is broken, Text still gets you a shell.
@@ -258,8 +259,11 @@ impl Screen {
             return;
         }
         self.session_for = self.name.clone();
+        // The desktop, unless they chose the console last time (or the
+        // desktop isn't there).
         self.session = match memory.session_of(&self.name) {
-            Some(Session::Desktop) if fs::exists(DESKTOP) => Session::Desktop,
+            Some(Session::Text) => Session::Text,
+            _ if fs::exists(DESKTOP) => Session::Desktop,
             _ => Session::Text,
         };
     }
