@@ -34,6 +34,8 @@ const BAR_COLOR: u32 = 0xFF0B_1026;
 const BAR_LINE: u32 = 0xFF2A_3466;
 const TEXT: u32 = 0xFFD8_DAE5;
 const DIM_TEXT: u32 = 0xFF8D_93B0;
+/// The status when the battery is running low.
+const LOW_BATTERY: u32 = 0xFFE0_6C6C;
 const HIGHLIGHT: u32 = 0xFF3A_4D9A;
 const BUTTON: u32 = 0xFF1E_2750;
 
@@ -112,6 +114,8 @@ pub struct Desktop {
     ticks: u32,
     /// The status area left of the clock (the network and battery).
     status: String,
+    /// Whether the battery is low (the status turns red).
+    battery_low: bool,
 }
 
 /// A row of a menu.
@@ -149,6 +153,7 @@ const MENU_PADDING: i32 = 6;
 impl Desktop {
     pub fn new(screen: Screen, font: Font) -> Self {
         apps::restore_brightness();
+        let (status, battery_low) = apps::status();
         let pointer = (f64::from(screen.width) / 2.0, f64::from(screen.height) / 2.0);
         Self {
             screen,
@@ -163,7 +168,8 @@ impl Desktop {
             super_alone: false,
             browser_installed: browser_path().is_some(),
             ticks: 0,
-            status: apps::status(),
+            status,
+            battery_low,
             pointer,
             pointer_focus: None,
             cursor: None,
@@ -788,7 +794,8 @@ impl Desktop {
             x += tab_width;
         }
         let status_x = right - clock_width - status_width + 8;
-        self.screen.text(&mut self.font, status_x, text_y, &status, DIM_TEXT, clip);
+        let color = if self.battery_low { LOW_BATTERY } else { DIM_TEXT };
+        self.screen.text(&mut self.font, status_x, text_y, &status, color, clip);
         if !status.is_empty() {
             self.bar.push((Rect::new(status_x - 8, 4, status_width, BAR_HEIGHT - 8), BarItem::Status));
         }
@@ -1009,8 +1016,9 @@ impl Desktop {
         if self.ticks.is_multiple_of(120) {
             self.zone = eli::time::local_zone();
             let installed = browser_path().is_some();
-            let status = apps::status();
-            if installed != self.browser_installed || status != self.status {
+            let (status, battery_low) = apps::status();
+            if installed != self.browser_installed || status != self.status || battery_low != self.battery_low {
+                self.battery_low = battery_low;
                 self.browser_installed = installed;
                 self.status = status;
                 self.screen.damage(Rect::new(0, 0, self.screen.width, BAR_HEIGHT));

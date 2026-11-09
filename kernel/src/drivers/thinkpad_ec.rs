@@ -24,7 +24,12 @@
 //! input-full and output-full bits. Only Lenovo firmware is trusted to
 //! have this layout; elsewhere nothing is touched.
 //!
-//! A thread reads the battery every few seconds. Programs see it as
+//! A thread reads the battery every few seconds. When the battery runs
+//! down to 3% on its own, it shuts down as `poweroff` does (disks
+//! written and marked clean), as Linux desktops do. Only after watching it
+//! fall there, though: a battery that already reads empty at boot may be
+//! a layout this doesn't understand, and powering off then would make the
+//! machine unusable. Programs see it as
 //! Linux's `/sys/class/power_supply/BAT0` and `AC` (see `fs/sysfs.rs`).
 
 use alloc::format;
@@ -47,6 +52,11 @@ const PAGE: u8 = 0x81;
 const PAGE_DATA: u8 = 0xA0;
 
 const READ_EVERY_MS: u64 = 5000;
+/// At or below this percentage on battery, the machine is powered off
+/// cleanly before it dies with the disks half written.
+const CRITICAL_PERCENT: u32 = 3;
+/// Readings in a row that must agree before that happens.
+const CRITICAL_READINGS: u32 = 3;
 /// How long the EC may take with one byte. It usually answers within
 /// microseconds; the firmware's own code allows a millisecond or more.
 const TIMEOUT_US: u64 = 5000;
@@ -178,6 +188,10 @@ impl Ec {
         let mut failures = 0u32;
         let mut logged: Option<(Option<State>, u32, bool)> = None;
         let mut logged_at = 0;
+        // Whether the battery has been seen above critical, and critical
+        // readings in a row since.
+        let mut seen_above_critical = false;
+        let mut critical = 0;
         loop {
             match measure(&self, first) {
                 Ok(reading) => {
@@ -195,6 +209,22 @@ impl Ec {
                         logged = Some(key);
                         logged_at = now;
                         log(&reading);
+                    }
+                    match reading.battery {
+                        Some(battery) if battery.percent() > CRITICAL_PERCENT || reading.plugged_in => {
+                            seen_above_critical |= battery.percent() > CRITICAL_PERCENT;
+                            critical = 0;
+                        }
+                        Some(battery) if battery.state == State::Discharging && seen_above_critical => {
+                            critical += 1;
+                            if critical >= CRITICAL_READINGS {
+                                warn!("battery: {}% left: powering off", battery.percent());
+                                crate::logfile::flush();
+                                crate::fs::mount::shut_down();
+                                crate::power::power_off();
+                            }
+                        }
+                        _ => critical = 0,
                     }
                 }
                 Err(error) => {

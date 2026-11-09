@@ -3188,8 +3188,14 @@ A thread reads it every five seconds and logs changes ("battery: 83%,
 Discharging at 9500 mW, ..."). Programs see Linux's
 `/sys/class/power_supply/AC` and `BAT0` (`status`, `capacity`,
 `energy_now`, `power_now`, ...), and the desktop's bar shows "Battery 83%"
-or "Charging 83%" next to the network. QEMU has no EC, so the test runs
-the reading code against a pretend register file.
+or "Charging 83%" next to the network, in red at 10% or less on
+battery. At 3% (three readings in a row, on battery) the thread shuts down
+as `poweroff` does, with the disks written and marked clean, rather than
+letting the laptop die mid-write. It only does that after seeing the
+battery above 3% first: a battery that reads empty from the start might be
+an EC this code misreads, and powering off at every boot would leave the
+machine unusable. QEMU has no EC, so the test runs the reading code
+against a pretend register file.
 
 ## 21. Userland
 

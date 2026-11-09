@@ -117,29 +117,35 @@ pub fn restore_brightness() {
     let _ = eli::fs::write(&alloc::format!("{BACKLIGHT}/brightness"), alloc::format!("{value}").as_bytes());
 }
 
-/// The bar's status area: the network, then the battery if there is one.
-pub fn status() -> String {
+/// The bar's status area: the network, then the battery if there is one,
+/// and whether the battery is running low (shown in red).
+pub fn status() -> (String, bool) {
     let network = network_status();
     match battery_status() {
-        Some(battery) => alloc::format!("{network}   {battery}"),
-        None => network,
+        Some((battery, low)) => (alloc::format!("{network}   {battery}"), low),
+        None => (network, false),
     }
 }
 
+/// On battery at or below this, the bar's status turns red.
+const LOW_BATTERY_PERCENT: u32 = 10;
+
 /// "Battery 83%", "Charging 83%" or "Plugged in 100%", from Linux's
-/// `/sys/class/power_supply/BAT0`.
-fn battery_status() -> Option<String> {
+/// `/sys/class/power_supply/BAT0`, and whether that's low.
+fn battery_status() -> Option<(String, bool)> {
     let read = |name: &str| {
         let text = eli::fs::read(&alloc::format!("/sys/class/power_supply/BAT0/{name}")).ok()?;
         Some(String::from_utf8_lossy(&text).trim().to_string())
     };
     let capacity = read("capacity")?;
-    let label = match read("status")?.as_str() {
+    let status = read("status")?;
+    let label = match status.as_str() {
         "Charging" => "Charging",
         "Discharging" => "Battery",
         _ => "Plugged in",
     };
-    Some(alloc::format!("{label} {capacity}%"))
+    let low = status == "Discharging" && capacity.parse::<u32>().is_ok_and(|percent| percent <= LOW_BATTERY_PERCENT);
+    Some((alloc::format!("{label} {capacity}%"), low))
 }
 
 /// The network status: the Wi-Fi network's name, "Wired", or "Offline",
