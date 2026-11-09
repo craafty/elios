@@ -3543,7 +3543,34 @@ very large package collection instead of a new one.
 
 Everything that should last is under `/data`: the data partition on an
 installed system (the kernel mounts it from `data=PARTUUID=...` on the
-command line), or a directory in memory on the live system.
+command line), or, on the live system, a partition of its own USB stick
+when there's room there, and a directory in memory when there isn't.
+
+**The live stick's data partition** (`manager/live.rs`). Writing the image
+to a stick with `dd` uses its first 130 MB and leaves the rest unused, so
+everything done on the live system (packages, Wi-Fi networks, the Firefox
+profile and its sign-ins) used to be gone at the next boot. Now, before
+anything else, `eli boot` on a live system (no `root=` or `data=` on the
+command line) reads the GPT of the disk holding `/disk` and looks for a
+partition of eliOS's data type. If there's none, it moves the table's end
+to the disk's real end (the image's table ends where the image does), and
+if at least 1 GiB is free from 1 GiB in, it adds a partition there (16 GiB
+at most, so formatting, which writes every inode table, stays quick on a
+slow stick), formats it ext2 and mounts it at `/data`. The kernel rereads
+the table with a mounted partition on the same disk, which it allows as
+long as no mounted partition moves or shrinks.
+
+It starts at a fixed place, 1 GiB in, so the image must stay smaller than
+that: writing a newer image over the stick then replaces the table (which
+no longer lists the partition) but not the file system. The next boot
+finds an ext2 superblock labelled "eliOS data" at 1 GiB, lists the
+partition again at the size the superblock gives, and mounts it without
+formatting: the packages, settings and homes are still there. Caches stay
+in memory (the desktop sets `XDG_CACHE_HOME` to the runtime directory on a
+live system) because Firefox writes hundreds of megabytes of video cache
+and USB sticks are slow to write. `cargo xtask run --big-stick` tries all
+this: a 4 GiB stick (`target/big-stick.img`) that lasts between runs, the
+image written over its start each time as `dd` would.
 
 | Path | What |
 |------|------|

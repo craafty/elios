@@ -45,6 +45,8 @@ options:
                put there, without the live disk
   --usb-stick  attach the disk image as a USB stick instead of a SATA disk
                (as when eliOS is started from a stick on a real PC)
+  --big-stick  a USB stick of 4 GiB that lasts between runs (target/big-stick.img),
+               the image written over its start each time, as `dd` does
   --usb-hub    put the USB keyboard (and stick) behind a USB hub
   --login-screen  session: boot to the login screen instead of a root shell
   --audio-wav FILE  record what eliOS plays to FILE.wav (otherwise the
@@ -54,6 +56,7 @@ options:
 const DEFAULT_CPUS: usize = 4;
 /// The size of the empty disk `--second-disk` attaches.
 const SECOND_DISK_BYTES: u64 = 2 << 30;
+const BIG_STICK_BYTES: u64 = 4 << 30;
 
 const BOOTLOADER_TARGET: &str = "x86_64-unknown-uefi";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
@@ -101,6 +104,8 @@ struct Options {
     usb_stick: bool,
     /// USB devices go through a hub.
     usb_hub: bool,
+    /// The image written over the start of a bigger, lasting stick.
+    big_stick: bool,
     /// Sessions start at the login screen, not logged in as root.
     login_screen: bool,
     /// Use a throwaway copy of the firmware's variables (for tests).
@@ -172,6 +177,10 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options, Stri
             "--installed" => options.installed = true,
             "--usb-stick" => options.usb_stick = true,
             "--usb-hub" => options.usb_hub = true,
+            "--big-stick" => {
+                options.big_stick = true;
+                options.usb_stick = true;
+            }
             "--login-screen" => options.login_screen = true,
             "--audio-wav" => options.audio_wav = Some(args.next().ok_or("--audio-wav needs a file name")?.into()),
             "--cpus" => {
@@ -213,7 +222,29 @@ fn build(options: &Options, command_line: &str) -> Result<PathBuf, String> {
     cargo(&["build", "--package", "elikernel", "--target", KERNEL_TARGET], options.release, &[])?;
     let kernel = workspace_root().join("target").join(KERNEL_TARGET).join(profile(options.release)).join("elikernel");
     let initrd = build_initrd()?;
-    make_disk_image("eliOS.img", &bootloader, &kernel, &initrd, command_line, options.fresh)
+    let image = make_disk_image("eliOS.img", &bootloader, &kernel, &initrd, command_line, options.fresh)?;
+    if options.big_stick { big_stick(&image) } else { Ok(image) }
+}
+
+/// What writing the image to a 4 GiB USB stick does (`dd`): the image
+/// replaces the stick's start, and the rest keeps what was there, such as
+/// the data partition a live system makes there (target/big-stick.img;
+/// delete it to start again with an empty stick).
+fn big_stick(image: &Path) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let path = workspace_root().join("target/big-stick.img");
+    let bytes = fs::read(image).map_err(|e| format!("reading {}: {e}", image.display()))?;
+    let mut stick = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("opening {}: {e}", path.display()))?;
+    stick.write_all(&bytes).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    if stick.metadata().map_err(|e| e.to_string())?.len() < BIG_STICK_BYTES {
+        stick.set_len(BIG_STICK_BYTES).map_err(|e| format!("sizing {}: {e}", path.display()))?;
+    }
+    Ok(path)
 }
 
 fn test(options: &Options) -> Result<(), String> {

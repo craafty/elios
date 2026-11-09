@@ -98,6 +98,12 @@ fn main() -> i32 {
     eli::env::set_var("XDG_SESSION_TYPE", "wayland");
     eli::env::set_var("GDK_BACKEND", "wayland");
     eli::env::set_var("MOZ_ENABLE_WAYLAND", "1");
+    // A live system's home is on the USB stick, slow to write: caches
+    // (Firefox's is hundreds of megabytes of video) stay in memory.
+    let command_line = eli::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    if !command_line.split_whitespace().any(|word| word.starts_with("root=")) {
+        eli::env::set_var("XDG_CACHE_HOME", &format!("{runtime}/cache"));
+    }
 
     let Ok(epoll) = sys::Epoll::new() else {
         eprintln!("desktop: no epoll");

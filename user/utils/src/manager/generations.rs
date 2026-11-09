@@ -430,6 +430,8 @@ fn link_packages(packages: &[String]) -> Result<(), String> {
 /// configuration and a first generation) and activates the current
 /// generation, or the one picked in eliboot's menu.
 pub fn boot() -> Result<(), String> {
+    // On a live stick, /data on the stick itself rather than in memory.
+    super::live::mount_data();
     for directory in [DATA, &format!("{DATA}/etc"), &format!("{DATA}/home"), GENERATIONS] {
         let _ = fs::create_dir(directory);
     }

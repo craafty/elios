@@ -15,6 +15,7 @@
 
 mod config;
 mod generations;
+mod live;
 mod store;
 
 use alloc::format;
