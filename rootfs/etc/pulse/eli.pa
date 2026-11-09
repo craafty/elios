@@ -7,7 +7,8 @@
 load-module module-alsa-sink device=hw:0
 load-module module-alsa-source device=hw:0
 load-module module-native-protocol-unix
-# Let go of the sound card after a few quiet seconds, so programs that use
-# it directly (speaker-test, aplay) work while nothing plays through
-# PulseAudio.
-load-module module-suspend-on-idle
+# Let go of the sound card after a quiet second, so programs that use it
+# directly (speaker-test, aplay) work while nothing plays through
+# PulseAudio, and a Bluetooth headset isn't asked for its microphone just
+# because PulseAudio started.
+load-module module-suspend-on-idle timeout=1

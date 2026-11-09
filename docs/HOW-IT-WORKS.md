@@ -2357,9 +2357,11 @@ default startup script finds sound cards through udev, which eliOS
 lacks: it starts with no speakers and plays everything into silence. So
 eliOS ships its own script, `/etc/pulse/eli.pa`, naming the first card's
 sink and source, the native socket in `$XDG_RUNTIME_DIR/pulse`, and
-`module-suspend-on-idle`. The last lets go of the card after a few quiet
-seconds, so `speaker-test` and `aplay`, which open the card directly
-(one program at a time), work while PulseAudio is idle.
+`module-suspend-on-idle`. The last lets go of the card after a quiet
+second, so `speaker-test` and `aplay`, which open the card directly
+(one program at a time), work while PulseAudio is idle (and a
+Bluetooth headset isn't asked for its microphone just because
+PulseAudio started and opened it).
 
 The desktop starts PulseAudio with that script when the session starts.
 It also checks again before it starts any program, because a PulseAudio
@@ -2835,8 +2837,10 @@ comes on a synchronous link (SCO, or eSCO with retransmissions): slots
 the radio keeps every few milliseconds. We ask for one (Setup
 Synchronous Connection: eSCO with HFP's "S3" settings, then plain SCO
 if the headset won't) when the headset's service level connection is
-up and something records from card 0 (`arecord`, or PulseAudio for
-Firefox: its suspend-on-idle closes the device when nobody records),
+up and something has been recording from card 0 for 1.5 seconds
+(`arecord`, or PulseAudio for Firefox: its suspend-on-idle closes the
+device when nobody records, and the wait skips its moments of
+recording as it starts),
 accept a headset's own request when it has a hands-free connection,
 and close the link 3 seconds after recording stops, so a program
 reopening the microphone doesn't flip the headset between modes. The

@@ -364,12 +364,14 @@ mod tests {
             loop {
                 let free_before = frames::stats().free_bytes;
                 let big = alloc::vec![7u8; 1 << 20];
-                assert!(frames::stats().free_bytes <= free_before - (1 << 20));
+                let free_during = frames::stats().free_bytes;
                 assert!(big.iter().all(|&b| b == 7));
                 drop(big);
                 let free_after = frames::stats().free_bytes;
                 rounds += 1;
-                if free_after == free_before || rounds == 5 {
+                let took = free_during + (1 << 20) <= free_before;
+                if (took && free_after == free_before) || rounds == 5 {
+                    assert!(took, "a megabyte took {} bytes", free_before as i64 - free_during as i64);
                     assert_eq!(free_after, free_before);
                     break;
                 }

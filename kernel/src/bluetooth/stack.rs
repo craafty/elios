@@ -108,6 +108,11 @@ const AUDIO_BACKLOG: usize = 12;
 /// and reopening the microphone shouldn't flap the headset between modes).
 const VOICE_CHECK_MS: u64 = 250;
 const VOICE_LINGER_MS: u64 = 3000;
+/// How long something must have been recording before a link opens: a
+/// sound server opening the microphone for a moment as it starts, or
+/// before suspending it when idle, shouldn't take headphones out of
+/// their stereo mode.
+const VOICE_SETTLE_MS: u64 = 1500;
 
 /// A connection's voice link, which opens while card 0 records and the
 /// device is a hands-free headset (see `voice.rs`).
@@ -188,8 +193,10 @@ pub(super) struct Stack {
     acl_waiting: VecDeque<(u16, Vec<u8>)>,
     /// Keys typed on Bluetooth keyboards, for the terminal.
     typed: Vec<Key>,
-    /// When voice links were last looked at.
+    /// When voice links were last looked at, and since when card 0 has
+    /// been recording.
     voice_checked: u64,
+    recording_since: Option<u64>,
 }
 
 enum Work {
@@ -213,6 +220,7 @@ impl Stack {
             acl_waiting: VecDeque::new(),
             typed: Vec::new(),
             voice_checked: 0,
+            recording_since: None,
         }
     }
 
@@ -340,13 +348,15 @@ impl Stack {
     /// give its microphone; closes it a while after recording stops.
     fn check_voice(&mut self, now: u64) {
         let recording = sound::find_pcm(0, sound::Direction::Capture).is_some_and(|pcm| pcm.running());
+        self.recording_since = if recording { Some(self.recording_since.unwrap_or(now)) } else { None };
+        let settled = self.recording_since.is_some_and(|since| now >= since + VOICE_SETTLE_MS);
         // Only one link at a time (the transport has one stream).
         let busy = self.connections.iter().any(|c| c.voice != Voice::Off && c.voice != Voice::Failed);
         for index in 0..self.connections.len() {
             let connection = &mut self.connections[index];
             let ready = connection.encrypted && connection.hands_free.as_ref().is_some_and(Gateway::ready);
             match connection.voice {
-                Voice::Off if recording && ready && !busy => {
+                Voice::Off if settled && ready && !busy => {
                     let handle = connection.handle;
                     info!(
                         "bluetooth: opening a voice link to {} {}",
