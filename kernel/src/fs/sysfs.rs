@@ -61,8 +61,10 @@ fn value(text: impl ToString) -> Arc<dyn Inode> {
 fn disk_directory(disk: Arc<dyn Disk>) -> Arc<dyn Inode> {
     directory(move || {
         let model: String = disk.model().into();
+        let name: String = disk.name().into();
         let mut entries: Listing = alloc::vec![
             ("size".into(), value(disk.sectors())),
+            ("stat".into(), generated(move || block::statistics_text(&name))),
             ("removable".into(), value(u8::from(disk.removable()))),
             ("ro".into(), value(0)),
             ("dev".into(), value(device_text(&Partition::whole(&disk)))),

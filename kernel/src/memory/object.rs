@@ -16,6 +16,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -23,6 +24,13 @@ use super::{PAGE_SIZE, frames, phys_to_virt};
 use crate::errno::{Errno, Result};
 use crate::fs::Inode;
 use crate::sync::SpinLock;
+
+/// Pages read from a file at a time when a page of it is needed: the
+/// aligned 128 KiB around it, as Linux reads around faults in mapped
+/// files. Libraries are mapped and paged in by faults; one 4 KiB request
+/// each made Firefox's start 30,000 requests, which on a USB stick takes
+/// a minute.
+const READ_AROUND_PAGES: u64 = 32;
 
 pub struct MemoryObject {
     /// Page index -> frame.
@@ -59,38 +67,69 @@ impl MemoryObject {
     /// zeroed, or read from the source file. The caller gets its own
     /// reference to the frame, and must [`frames::free`] it when done.
     ///
+    /// From a file, the pages around it are read too, in one request (see
+    /// [`READ_AROUND_PAGES`]).
+    ///
     /// May read from a disk, so it must not be called with spinlocks held.
     pub fn page(&self, index: u64) -> Result<u64> {
         if let Some(frame) = self.existing_page(index) {
             return Ok(frame);
         }
-        let frame = frames::allocate_zeroed().ok_or(Errno::ENOMEM)?;
-        if let Some(source) = &self.source {
-            // SAFETY: a fresh frame, ours alone.
-            let buffer = unsafe { core::slice::from_raw_parts_mut(phys_to_virt(frame), PAGE_SIZE as usize) };
-            let mut done = 0;
-            while done < buffer.len() {
-                match source.read_at(index * PAGE_SIZE + done as u64, &mut buffer[done..]) {
-                    Ok(0) => break,
-                    Ok(count) => done += count,
-                    Err(error) => {
-                        frames::free(frame);
-                        return Err(error);
-                    }
-                }
+        let Some(source) = &self.source else {
+            let frame = frames::allocate_zeroed().ok_or(Errno::ENOMEM)?;
+            return Ok(self.insert(index, frame));
+        };
+        // The aligned window around the page, up to the end of the file
+        // (but always the page itself).
+        let size_pages = self.size().div_ceil(PAGE_SIZE).max(index + 1);
+        let first = index - index % READ_AROUND_PAGES;
+        let end = (first + READ_AROUND_PAGES).min(size_pages);
+        let mut data = vec![0u8; ((end - first) * PAGE_SIZE) as usize];
+        let mut done = 0;
+        while done < data.len() {
+            match source.read_at(first * PAGE_SIZE + done as u64, &mut data[done..]) {
+                Ok(0) => break,
+                Ok(count) => done += count,
+                Err(error) => return Err(error),
             }
         }
+        let mut wanted = None;
+        for (number, bytes) in (first..end).zip(data.chunks(PAGE_SIZE as usize)) {
+            if number != index && self.pages.lock().contains_key(&number) {
+                continue;
+            }
+            let Some(frame) = frames::allocate_zeroed() else {
+                if number == index {
+                    return Err(Errno::ENOMEM);
+                }
+                continue;
+            };
+            // SAFETY: a fresh frame, ours alone.
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), phys_to_virt(frame), bytes.len()) };
+            let frame = self.insert(number, frame);
+            if number == index {
+                wanted = Some(frame);
+            } else {
+                frames::free(frame);
+            }
+        }
+        wanted.ok_or(Errno::ENOMEM)
+    }
+
+    /// Adds a new page's frame (unless someone else made the page
+    /// meanwhile, then that one is used); returns it with a reference for
+    /// the caller.
+    fn insert(&self, index: u64, frame: u64) -> u64 {
         let mut pages = self.pages.lock();
         if let Some(&existing) = pages.get(&index) {
-            // Someone else made it meanwhile.
             frames::share(existing);
             drop(pages);
             frames::free(frame);
-            return Ok(existing);
+            return existing;
         }
         pages.insert(index, frame);
         frames::share(frame);
-        Ok(frame)
+        frame
     }
 
     /// Page `index` if it exists, with a reference for the caller.

@@ -4,6 +4,7 @@
 //! (`sda`, `nvme0n1`, ...) with a node per partition (`sda1`, `nvme0n1p1`),
 //! named as on Linux so tools and habits carry over.
 
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -30,6 +31,29 @@ pub trait Disk: Send + Sync {
 }
 
 static DISKS: SpinLock<Vec<Arc<dyn Disk>>> = SpinLock::new(Vec::new());
+
+/// Requests and sectors read and written, by disk name: Linux's
+/// `/sys/block/NAME/stat`, which shows whether I/O comes in few big
+/// requests or many small ones (what a USB stick is slowest at).
+static STATISTICS: SpinLock<BTreeMap<String, [u64; 4]>> = SpinLock::new(BTreeMap::new());
+
+fn count(disk: &str, write: bool, bytes: usize) {
+    let mut statistics = STATISTICS.lock();
+    let counts = match statistics.get_mut(disk) {
+        Some(counts) => counts,
+        None => statistics.entry(disk.into()).or_default(),
+    };
+    let at = if write { 2 } else { 0 };
+    counts[at] += 1;
+    counts[at + 1] += (bytes / 512) as u64;
+}
+
+/// `/sys/block/NAME/stat`'s line: reads, merged, sectors, time, writes,
+/// merged, sectors, time, then the queue fields (only the counts are kept).
+pub fn statistics_text(disk: &str) -> String {
+    let [reads, read_sectors, writes, written_sectors] = STATISTICS.lock().get(disk).copied().unwrap_or_default();
+    format!("{reads} 0 {read_sectors} 0 {writes} 0 {written_sectors} 0 0 0 0 0 0 0 0 0 0\n")
+}
 /// The next letter for an `sd` disk (SATA or USB, as on Linux).
 static NEXT_SD: AtomicUsize = AtomicUsize::new(0);
 
@@ -112,6 +136,7 @@ impl Partition {
         if sector + (buffer.len() / 512) as u64 > self.sectors {
             return Err("past the end of the partition");
         }
+        count(self.disk.name(), false, buffer.len());
         self.disk.read(self.start + sector, buffer)
     }
 
@@ -119,6 +144,7 @@ impl Partition {
         if sector + (data.len() / 512) as u64 > self.sectors {
             return Err("past the end of the partition");
         }
+        count(self.disk.name(), true, data.len());
         self.disk.write(self.start + sector, data)
     }
 }

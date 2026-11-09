@@ -315,7 +315,12 @@ struct Link {
     /// Rates, best first, and where in that list the firmware starts.
     rates: Vec<u32>,
     first_rate: usize,
-    successes: u32,
+    /// Frames sent since the window started, how many needed two or more
+    /// tries, and how many weren't sent at all.
+    window_frames: u32,
+    window_struggled: u32,
+    window_failed: u32,
+    window_start: u64,
     last_rate_change: u64,
 }
 
@@ -333,12 +338,26 @@ struct Radio<'a> {
     auto_join: bool,
     next_auto_join: u64,
     auto_join_wait: u64,
+    /// Refusals in a row, for retrying those soon.
+    auto_join_refusals: u32,
 }
 
 /// Between tries at joining a saved network while none is in range: from
 /// half a minute, doubling, up to five minutes.
 const AUTO_JOIN_FIRST_WAIT_MS: u64 = 30_000;
 const AUTO_JOIN_LONGEST_WAIT_MS: u64 = 300_000;
+/// After an access point refuses a join: soon, a few times. The first
+/// join after a restart is refused (reason 8, "leaving") by access points
+/// that still hold the last boot's association; the refusal clears it,
+/// and the next try works.
+const AUTO_JOIN_REFUSED_WAIT_MS: u64 = 2_000;
+const AUTO_JOIN_QUICK_RETRIES: u32 = 3;
+/// Rate control windows: this many data frames, or this long with at
+/// least a few.
+const RATE_WINDOW_FRAMES: u32 = 32;
+const RATE_WINDOW_NANOS: u64 = 250_000_000;
+/// How long a starting rate is kept before trying one step higher anyway.
+const RATE_PROBE_NANOS: u64 = 2_000_000_000;
 
 /// Brings up the runtime firmware and serves requests until the card
 /// fails.
@@ -356,6 +375,7 @@ pub fn run(card: &mut Transport, firmware: &Firmware, init: InitResults) -> Resu
         auto_join: true,
         next_auto_join: u64::MAX,
         auto_join_wait: AUTO_JOIN_FIRST_WAIT_MS,
+        auto_join_refusals: 0,
     };
     radio.start()?;
     // Once: after a firmware error the card starts over, with the same
@@ -639,37 +659,53 @@ impl Radio<'_> {
             );
         }
         if queue == cmd::DATA_QUEUE {
-            self.adapt_rate(success && retries == 0, !success || retries >= 2)?;
+            self.adapt_rate(success, retries)?;
         }
         Ok(())
     }
 
-    /// Simple rate control: start lower after failures, try higher after a
-    /// run of first-time successes. The firmware falls back down the list
-    /// on its own for each frame.
-    fn adapt_rate(&mut self, clean: bool, struggled: bool) -> Result<(), Error> {
+    /// Rate control: which rate the firmware tries first for each frame
+    /// (it falls back down the list by itself when that fails).
+    ///
+    /// Judged over windows of frames, not frame by frame: on a busy network
+    /// some frames need retries at any rate, and reacting to each one (as
+    /// this first did) only ever stepped down, leaving the link at 6.5 or
+    /// 12 Mbps where it could do 130. So: step down when most of a window's
+    /// frames struggled or many failed outright, up when few struggled, and
+    /// try one step up every couple of seconds anyway, in case conditions
+    /// got better (a bad try costs a few retries, which the firmware's
+    /// fallback absorbs).
+    fn adapt_rate(&mut self, success: bool, retries: u8) -> Result<(), Error> {
         let Some(link) = &mut self.link else { return Ok(()) };
         let now = time::uptime_nanos();
-        let mut changed = false;
-        if struggled {
-            link.successes = 0;
-            if link.first_rate + 1 < link.rates.len() && now - link.last_rate_change > 50_000_000 {
-                link.first_rate += 1;
-                changed = true;
-            }
-        } else if clean {
-            link.successes += 1;
-            if link.successes >= 32 && link.first_rate > 0 && now - link.last_rate_change > 500_000_000 {
-                link.first_rate -= 1;
-                link.successes = 0;
-                changed = true;
-            }
+        if link.window_frames == 0 {
+            link.window_start = now;
         }
-        if changed {
+        link.window_frames += 1;
+        link.window_struggled += u32::from(!success || retries >= 2);
+        link.window_failed += u32::from(!success);
+        let frames = link.window_frames;
+        let full = frames >= RATE_WINDOW_FRAMES || (frames >= 4 && now - link.window_start > RATE_WINDOW_NANOS);
+        if !full {
+            return Ok(());
+        }
+        let struggled = link.window_struggled * 100 / frames;
+        let failed = link.window_failed * 100 / frames;
+        link.window_frames = 0;
+        link.window_struggled = 0;
+        link.window_failed = 0;
+        let since_change = now - link.last_rate_change;
+        let first = link.first_rate;
+        if struggled > 50 || failed > 20 {
+            link.first_rate = (first + 1).min(link.rates.len() - 1);
+        } else if first > 0 && (struggled < 20 || since_change > RATE_PROBE_NANOS) {
+            link.first_rate = first - 1;
+        }
+        if link.first_rate != first {
             link.last_rate_change = now;
             let rates = link.rates[link.first_rate..].to_vec();
             let mimo = link.bss.ht.is_some_and(|ht| ht.two_streams);
-            debug!("wifi: starting rate now {:#x}", rates[0]);
+            debug!("wifi: starting rate now {:#x} ({struggled}% of {frames} frames retried, {failed}% lost)", rates[0]);
             self.command(cmd::LINK_QUALITY, &cmd::link_quality(cmd::AP_STATION, &rates, mimo))?;
         }
         Ok(())
@@ -861,7 +897,10 @@ impl Radio<'_> {
             dtim_known: false,
             rates: alloc::vec![basic],
             first_rate: 0,
-            successes: 0,
+            window_frames: 0,
+            window_struggled: 0,
+            window_failed: 0,
+            window_start: 0,
             last_rate_change: 0,
         });
         let authentication = wlan::authentication(&bss.bssid, &mac);
@@ -1364,6 +1403,7 @@ impl Radio<'_> {
             .filter_map(|bss| Some((bss.signal, self.saved.list.iter().find(|known| known.ssid == bss.ssid)?)))
             .max_by_key(|&(signal, _)| signal)
             .map(|(_, network)| network.clone());
+        let mut refused = false;
         let joined = match best {
             None => {
                 debug!("wifi: no saved network in range");
@@ -1377,6 +1417,7 @@ impl Radio<'_> {
                     Err(JoinError::Card(error)) => return Err(error),
                     Err(JoinError::Failed(message)) => {
                         warn!("wifi: joining a saved network: {message}");
+                        refused = true;
                         self.start()?;
                         set_state("idle");
                         false
@@ -1386,6 +1427,11 @@ impl Radio<'_> {
         };
         if joined {
             self.auto_join_wait = AUTO_JOIN_FIRST_WAIT_MS;
+            self.auto_join_refusals = 0;
+        } else if refused && self.auto_join_refusals < AUTO_JOIN_QUICK_RETRIES {
+            self.auto_join_refusals += 1;
+            info!("wifi: trying again in {} s", AUTO_JOIN_REFUSED_WAIT_MS / 1000);
+            self.next_auto_join = time::ticks() + AUTO_JOIN_REFUSED_WAIT_MS;
         } else {
             self.next_auto_join = time::ticks() + self.auto_join_wait;
             self.auto_join_wait = (self.auto_join_wait * 2).min(AUTO_JOIN_LONGEST_WAIT_MS);

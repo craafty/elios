@@ -711,10 +711,15 @@ address spaces and also read and written like a file. One object backs
 several things at once: an in-memory file's data lives in one (so `read`,
 `write` and every `MAP_SHARED` mapping see the same bytes); `memfd_create`
 and `MAP_SHARED | MAP_ANONYMOUS` memory are objects without a file; and a
-file on a disk gets one as its **page cache**, read from the file a page at
-a time when first needed and shared by every program that maps it (a
+file on a disk gets one as its **page cache**, read from the file when
+first needed and shared by every program that maps it (a
 browser's 100 MB library is in memory once, not once per process). Pages
-are made on first use: zeroed, or read from the file. When a disk file is
+are made on first use: zeroed, or read from the file, together with the
+rest of the aligned 128 KiB around the page in one request (Linux's
+*read-around*). A program's libraries are paged in by faults, and one
+4 KiB request each made Firefox's start about 30,000 disk requests: no
+matter on an NVMe disk, but more than a minute on a USB stick, long
+enough to look broken. Read around, it is about 3,500. When a disk file is
 written or truncated its page cache is forgotten, so later mappings see
 the change (mappings that already exist keep the old pages, a
 simplification compared with Linux).
@@ -1726,7 +1731,10 @@ partition files (refused while one is mounted).
 
 `/sys/block` describes each disk as Linux does: `size`, `removable`,
 `device/model`, and per partition `partition`, `start`, `size` and its GPT
-`uuid`. `lsblk` and the installer read it.
+`uuid`. `lsblk` and the installer read it. `stat` counts each disk's
+reads and writes (requests and sectors, in Linux's column order; the time
+columns are 0), which is how to tell whether something is slow because
+of the disk.
 
 `/sys/firmware/efi/efivars` exists on UEFI systems (that's how programs
 tell) and holds the firmware's variables in Linux's **efivarfs** format: a
@@ -2666,9 +2674,14 @@ idea some servers send as a TLV) is ignored.
 header carries the Ethernet type), with QoS headers when the network has
 WMM; incoming ones are decrypted, A-MSDUs split, and handed to the stack
 as Ethernet frames, so DHCP, TCP and the rest don't know it's Wi-Fi. A
-simple rate control moves the firmware's starting rate down after
-retries and back up after a run of clean first tries; the firmware falls
-back down the list by itself for each frame.
+rate control picks where in the list of rates (MCS 15 at 130 Mbit/s down
+to 12 Mbit/s) the firmware starts; it falls back down the list by itself
+for each frame. It judges windows of 32 frames (or a quarter second): it
+steps down when more than half needed two or more tries or a fifth were
+lost, steps up when under a fifth needed retries, and tries one step up
+every two seconds regardless. The first version reacted to every single
+frame that needed retries, which on a busy campus network ratcheted the
+link down to 6.5 or 12 Mbit/s for good: downloads of a minute took twenty.
 
 **Leaving** (asked to, deauthenticated, or 20 beacons missed) sends a
 deauthentication and restarts the runtime firmware, which clears all of
@@ -2694,7 +2707,10 @@ password, and the boot partition is FAT, with no permissions. Once the
 file is read (the thread looks for `/data` every few seconds for two
 minutes, as a live stick mounts its own late), and whenever the
 connection drops after missed beacons, the thread scans and joins the
-saved network with the strongest signal; with none in range it tries
+saved network with the strongest signal. The access point often refuses
+the first join after a reboot (a deauthentication, reason 8, "leaving":
+it still has the previous boot's association), so a refused join is
+tried again after 2 s, up to three times. With none in range it tries
 again after half a minute, doubling up to five minutes. `wifi disconnect`
 stops that until the next join. `wifi connect NAME` with an empty
 password uses the saved one, `wifi forget NAME` drops it, and
