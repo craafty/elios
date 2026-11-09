@@ -31,8 +31,10 @@ use super::keys::{Keys, Paired};
 use super::l2cap::{self, L2cap};
 use super::rfcomm;
 use super::sdp;
+use super::voice;
 use super::*;
 use crate::keyboard::{self, Key};
+use crate::sound;
 
 /// How long pairing may take, the user typing a passkey included.
 const PAIRING_TIMEOUT_MS: u64 = 60_000;
@@ -56,6 +58,9 @@ const USER_CONFIRMATION_REQUEST_REPLY: u16 = 0x042C;
 const USER_CONFIRMATION_REQUEST_NEGATIVE_REPLY: u16 = 0x042D;
 const USER_PASSKEY_REQUEST_NEGATIVE_REPLY: u16 = 0x042F;
 const IO_CAPABILITY_REQUEST_NEGATIVE_REPLY: u16 = 0x0434;
+const SETUP_SYNCHRONOUS_CONNECTION: u16 = 0x0428;
+const ACCEPT_SYNCHRONOUS_CONNECTION_REQUEST: u16 = 0x0429;
+const REJECT_SYNCHRONOUS_CONNECTION_REQUEST: u16 = 0x042A;
 
 // Events.
 const EVENT_CONNECTION_COMPLETE: u8 = 0x03;
@@ -73,12 +78,15 @@ const EVENT_USER_CONFIRMATION_REQUEST: u8 = 0x33;
 const EVENT_USER_PASSKEY_REQUEST: u8 = 0x34;
 const EVENT_SIMPLE_PAIRING_COMPLETE: u8 = 0x36;
 const EVENT_USER_PASSKEY_NOTIFICATION: u8 = 0x3B;
+const EVENT_SYNCHRONOUS_CONNECTION_COMPLETE: u8 = 0x2C;
 
 /// Disconnection reasons.
 const REMOTE_USER_ENDED: u8 = 0x13;
 const AUTHENTICATION_FAILURE: u8 = 0x05;
 /// Why a connection from an unknown device is refused.
 const UNACCEPTABLE_ADDRESS: u8 = 0x0F;
+/// Why a voice link is refused when there's no hands-free connection.
+const LIMITED_RESOURCES: u8 = 0x0D;
 /// Why pairing is refused when nobody asked for it.
 const PAIRING_NOT_ALLOWED: u8 = 0x18;
 
@@ -94,6 +102,32 @@ const SERVED: &[u16] = &[sdp::PSM, rfcomm::PSM, hid::CONTROL, hid::INTERRUPT, l2
 /// Unsent audio packets allowed to wait for the controller; past this the
 /// link isn't keeping up and audio is dropped rather than delayed.
 const AUDIO_BACKLOG: usize = 12;
+
+/// How often to look whether a voice link should open or close, and how
+/// long one stays open after nothing records any more (a program closing
+/// and reopening the microphone shouldn't flap the headset between modes).
+const VOICE_CHECK_MS: u64 = 250;
+const VOICE_LINGER_MS: u64 = 3000;
+
+/// A connection's voice link, which opens while card 0 records and the
+/// device is a hands-free headset (see `voice.rs`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Voice {
+    Off,
+    /// Asked for: with eSCO parameters (`true`), or plain SCO after those
+    /// failed.
+    Opening(bool),
+    /// The device asked for one and we accepted.
+    Accepting,
+    Open {
+        handle: u16,
+        /// When capture stopped, if it has.
+        idle_since: Option<u64>,
+    },
+    Closing(u16),
+    /// Neither kind would open: not tried again until capture stops.
+    Failed,
+}
 
 /// Headphones, speakers and the like: the audio/video major class, or the
 /// audio service bit.
@@ -115,6 +149,7 @@ struct Connection {
     audio: Option<Audio>,
     /// The hands-free connection (a headset's microphone and buttons).
     hands_free: Option<Gateway>,
+    voice: Voice,
     /// ACL packets sent that the controller hasn't reported done.
     in_flight: u16,
     /// An L2CAP frame arriving in pieces.
@@ -153,6 +188,8 @@ pub(super) struct Stack {
     acl_waiting: VecDeque<(u16, Vec<u8>)>,
     /// Keys typed on Bluetooth keyboards, for the terminal.
     typed: Vec<Key>,
+    /// When voice links were last looked at.
+    voice_checked: u64,
 }
 
 enum Work {
@@ -175,6 +212,7 @@ impl Stack {
             acl_size: usize::from(size.max(27)),
             acl_waiting: VecDeque::new(),
             typed: Vec::new(),
+            voice_checked: 0,
         }
     }
 
@@ -236,12 +274,19 @@ impl Stack {
             .chain(self.keys.next_try())
             .chain(self.connections.iter().filter_map(|c| c.audio.as_ref()?.deadline()))
             .chain(self.connections.iter().filter_map(|c| c.hands_free.as_ref()?.deadline()))
+            .chain(self.voice_wanted().then_some(self.voice_checked + VOICE_CHECK_MS))
             .min()
     }
 
     /// Sends what the sound card played to the headsets streaming it.
     fn play(&mut self) {
         let Some((rate, samples)) = a2dp::take() else { return };
+        if self.hci.adapter.voice_open() {
+            // On a call: the earpiece gets it (the A2DP stream, fed
+            // nothing, suspends).
+            self.hci.adapter.play_voice(rate, &samples);
+            return;
+        }
         for index in 0..self.connections.len() {
             let handle = self.connections[index].handle;
             let room = self.acl_waiting.iter().filter(|(h, _)| *h == handle).count() < AUDIO_BACKLOG;
@@ -277,6 +322,161 @@ impl Stack {
         if self.scan.as_ref().is_some_and(|s| now >= s.deadline) {
             self.finish_scan(Some(String::from("the scan didn't finish")));
         }
+        if self.voice_wanted() && now >= self.voice_checked + VOICE_CHECK_MS {
+            self.voice_checked = now;
+            self.check_voice(now);
+        }
+    }
+
+    // Voice links.
+
+    /// Whether voice links need looking at: some connection has a
+    /// hands-free connection up, or a link.
+    fn voice_wanted(&self) -> bool {
+        self.connections.iter().any(|c| c.voice != Voice::Off || c.hands_free.as_ref().is_some_and(Gateway::ready))
+    }
+
+    /// Opens a voice link when something records and a headset could
+    /// give its microphone; closes it a while after recording stops.
+    fn check_voice(&mut self, now: u64) {
+        let recording = sound::find_pcm(0, sound::Direction::Capture).is_some_and(|pcm| pcm.running());
+        // Only one link at a time (the transport has one stream).
+        let busy = self.connections.iter().any(|c| c.voice != Voice::Off && c.voice != Voice::Failed);
+        for index in 0..self.connections.len() {
+            let connection = &mut self.connections[index];
+            let ready = connection.encrypted && connection.hands_free.as_ref().is_some_and(Gateway::ready);
+            match connection.voice {
+                Voice::Off if recording && ready && !busy => {
+                    let handle = connection.handle;
+                    info!(
+                        "bluetooth: opening a voice link to {} {}",
+                        format_address(&connection.address),
+                        connection.name
+                    );
+                    connection.voice = Voice::Opening(true);
+                    if let Err(error) = self.setup_voice(handle, true) {
+                        warn!("bluetooth: {error}");
+                        self.connections[index].voice = Voice::Failed;
+                    }
+                    return;
+                }
+                Voice::Open { handle, idle_since } => {
+                    let idle_since = if recording { None } else { Some(idle_since.unwrap_or(now)) };
+                    connection.voice = Voice::Open { handle, idle_since };
+                    if idle_since.is_some_and(|since| now >= since + VOICE_LINGER_MS) || !ready {
+                        connection.voice = Voice::Closing(handle);
+                        debug!("bluetooth: closing the voice link (nothing records)");
+                        let [low, high] = handle.to_le_bytes();
+                        if let Err(error) = self.hci.command_status(DISCONNECT, &[low, high, REMOTE_USER_ENDED]) {
+                            warn!("bluetooth: {error}");
+                        }
+                    }
+                }
+                Voice::Failed if !recording => connection.voice = Voice::Off,
+                _ => {}
+            }
+        }
+    }
+
+    /// Asks for a voice link on ACL link `handle`: eSCO (retransmitted,
+    /// the "S3" settings HFP gives) or plain SCO (HV3 packets).
+    fn setup_voice(&mut self, handle: u16, esco: bool) -> Result<(), String> {
+        let (latency, retransmission, packets): (u16, u8, u16) =
+            if esco { (0x000A, 0x01, 0x0388) } else { (0xFFFF, 0xFF, 0x03C4) };
+        let mut parameters = Vec::with_capacity(17);
+        parameters.extend_from_slice(&handle.to_le_bytes());
+        parameters.extend_from_slice(&8000u32.to_le_bytes());
+        parameters.extend_from_slice(&8000u32.to_le_bytes());
+        parameters.extend_from_slice(&latency.to_le_bytes());
+        parameters.extend_from_slice(&voice::SETTING.to_le_bytes());
+        parameters.push(retransmission);
+        parameters.extend_from_slice(&packets.to_le_bytes());
+        self.hci.command_status(SETUP_SYNCHRONOUS_CONNECTION, &parameters)
+    }
+
+    /// A device asking for a voice link (a headset's button, or its own
+    /// idea): accepted if it has a hands-free connection with us.
+    fn voice_request(&mut self, address: [u8; 6]) -> Result<(), String> {
+        let busy = self.connections.iter().any(|c| c.voice != Voice::Off && c.voice != Voice::Failed);
+        let connection = self.connections.iter_mut().find(|c| c.address == address);
+        match connection {
+            Some(connection) if !busy && connection.hands_free.as_ref().is_some_and(Gateway::ready) => {
+                info!("bluetooth: {} {} opens a voice link", format_address(&address), connection.name);
+                connection.voice = Voice::Accepting;
+                let mut parameters = Vec::with_capacity(21);
+                parameters.extend_from_slice(&address);
+                parameters.extend_from_slice(&8000u32.to_le_bytes());
+                parameters.extend_from_slice(&8000u32.to_le_bytes());
+                parameters.extend_from_slice(&0xFFFFu16.to_le_bytes());
+                parameters.extend_from_slice(&voice::SETTING.to_le_bytes());
+                parameters.push(0xFF);
+                parameters.extend_from_slice(&0x003Fu16.to_le_bytes());
+                self.hci.command_status(ACCEPT_SYNCHRONOUS_CONNECTION_REQUEST, &parameters)
+            }
+            _ => {
+                info!("bluetooth: refused a voice link from {}", format_address(&address));
+                let parameters = [&address[..], &[LIMITED_RESOURCES]].concat();
+                self.hci.command_status(REJECT_SYNCHRONOUS_CONNECTION_REQUEST, &parameters)
+            }
+        }
+    }
+
+    fn voice_complete(&mut self, parameters: &[u8]) -> Result<(), String> {
+        let (status, handle) = (parameters[0], word_at(parameters, 1) & 0x0FFF);
+        let address = address_at(parameters, 3).ok_or_else(short)?;
+        let link_type = parameters.get(9).copied().unwrap_or(0);
+        let Some(index) = self.connections.iter().position(|c| c.address == address) else { return Ok(()) };
+        let state = self.connections[index].voice;
+        if status != 0 {
+            warn!("bluetooth: no voice link: {}", error_text(status));
+            if state == Voice::Opening(true) {
+                self.connections[index].voice = Voice::Opening(false);
+                let acl = self.connections[index].handle;
+                if self.setup_voice(acl, false).is_ok() {
+                    return Ok(());
+                }
+            }
+            self.connections[index].voice = Voice::Failed;
+            return Ok(());
+        }
+        let connection = &mut self.connections[index];
+        connection.voice = Voice::Open { handle, idle_since: None };
+        info!(
+            "bluetooth: voice link to {} {} open ({}, handle {handle:#05x}, {}-byte packets, air mode {})",
+            format_address(&address),
+            connection.name,
+            if link_type == 2 { "eSCO" } else { "SCO" },
+            word_at(parameters, 14),
+            parameters.get(16).copied().unwrap_or(0)
+        );
+        self.hci.adapter.set_voice(Some(handle));
+        a2dp::sink_added();
+        Ok(())
+    }
+
+    /// The voice link `handle` closed (returns false if that's no voice
+    /// link).
+    fn voice_closed(&mut self, handle: u16, reason: u8) -> bool {
+        let Some(connection) = self
+            .connections
+            .iter_mut()
+            .find(|c| matches!(c.voice, Voice::Open { handle: h, .. } | Voice::Closing(h) if h == handle))
+        else {
+            return false;
+        };
+        info!("bluetooth: voice link to {} closed: {}", connection.name, error_text(reason));
+        connection.voice = Voice::Off;
+        self.voice_stopped();
+        true
+    }
+
+    /// The transport stops the voice stream and the card records its own
+    /// microphone again.
+    fn voice_stopped(&mut self) {
+        let (received, sent, silent) = self.hci.adapter.voice_counts().unwrap_or_default();
+        info!("bluetooth: the voice link carried {received} packets in, {sent} out ({silent} of them silence)");
+        self.hci.adapter.set_voice(None);
+        a2dp::sink_removed();
     }
 
     /// Shows paired devices and their connections in `/proc/bluetooth`.
@@ -297,6 +497,14 @@ impl Stack {
                         if let Some(hands_free) = hands_free {
                             state.push_str(", ");
                             state.push_str(&hands_free.describe());
+                        }
+                        if let Some((received, sent, _)) = self
+                            .hci
+                            .adapter
+                            .voice_counts()
+                            .filter(|_| connection.is_some_and(|c| matches!(c.voice, Voice::Open { .. })))
+                        {
+                            state.push_str(&format!(", microphone on ({received} in, {sent} out)"));
                         }
                         state
                     }
@@ -355,6 +563,7 @@ impl Stack {
             }
             EVENT_CONNECTION_REQUEST => self.connection_request(parameters),
             EVENT_CONNECTION_COMPLETE => self.connection_complete(parameters),
+            EVENT_SYNCHRONOUS_CONNECTION_COMPLETE => self.voice_complete(parameters),
             EVENT_DISCONNECTION_COMPLETE => {
                 self.disconnection_complete(parameters);
                 Ok(())
@@ -553,6 +762,9 @@ impl Stack {
         let address = address_at(parameters, 0).ok_or_else(short)?;
         let link_type = parameters.get(9).copied().unwrap_or(0);
         let wanted = self.keys.find(&address).is_some() || self.pairing.as_ref().is_some_and(|p| p.address == address);
+        if link_type == 0 || link_type == 2 {
+            return self.voice_request(address);
+        }
         if link_type == 1 && wanted {
             info!("bluetooth: {} is connecting", format_address(&address));
             // Remain the peripheral (as Linux does by default).
@@ -592,6 +804,7 @@ impl Stack {
             hid: None,
             audio: None,
             hands_free: None,
+            voice: Voice::Off,
             in_flight: 0,
             partial: Vec::new(),
         });
@@ -610,9 +823,16 @@ impl Stack {
         }
         let handle = word_at(parameters, 1) & 0x0FFF;
         let reason = parameters.get(3).copied().unwrap_or(0);
+        if self.voice_closed(handle, reason) {
+            return;
+        }
         let Some(index) = self.connections.iter().position(|c| c.handle == handle) else { return };
         // Dropping it removes its input devices.
         let connection = self.connections.remove(index);
+        if matches!(connection.voice, Voice::Open { .. } | Voice::Closing(_)) {
+            // Its voice link went with it.
+            self.voice_stopped();
+        }
         self.credits += connection.in_flight;
         self.acl_waiting.retain(|(waiting, _)| *waiting != handle);
         info!(

@@ -129,8 +129,15 @@ const EVENT_TRBS: usize = RING_TRBS * EVENT_RING_PAGES;
 /// Isochronous transfers kept queued for a camera: 16 ms at one a
 /// microframe.
 const VIDEO_TRANSFERS: usize = 128;
+/// Isochronous transfers kept queued each way for a Bluetooth voice link
+/// (a packet a millisecond): 24 ms.
+const VOICE_TRANSFERS: usize = 24;
+/// The smallest voice packet size that carries one 16-bit link (17 bytes
+/// a millisecond: three make a 51-byte SCO packet of 3 ms).
+const VOICE_PACKET: u16 = 17;
 
 // Endpoint types in endpoint contexts.
+const ENDPOINT_ISOCH_OUT: u32 = 1;
 const ENDPOINT_BULK_OUT: u32 = 2;
 const ENDPOINT_ISOCH_IN: u32 = 5;
 const ENDPOINT_CONTROL: u32 = 4;
@@ -303,6 +310,59 @@ struct BluetoothEndpoints {
     /// most the endpoint's size; HCI headers say how long the whole is).
     event_bytes: Vec<u8>,
     acl_bytes: Vec<u8>,
+    /// The voice interface's alternate settings, and the stream while a
+    /// voice link is open.
+    voice_settings: Vec<super::VoiceSetting>,
+    voice: Option<VoiceStream>,
+    /// Set when starting voice failed, so it isn't retried until the link
+    /// closes.
+    voice_failed: bool,
+}
+
+/// A Bluetooth voice link's isochronous endpoints: one packet per
+/// transfer each way, each into a 32-byte slot of a page.
+struct VoiceStream {
+    setting: super::VoiceSetting,
+    input: VoiceRing,
+    output: VoiceRing,
+    /// SCO packets arriving in pieces, and those to send cut into pieces.
+    received: Vec<u8>,
+    sending: VecDeque<u8>,
+}
+
+struct VoiceRing {
+    /// Device context index.
+    index: u8,
+    ring: Ring,
+    buffer: Dma,
+    /// TRBs queued (their addresses) and their slots' offsets.
+    in_flight: VecDeque<(u64, usize)>,
+    queued: u64,
+}
+
+impl VoiceRing {
+    fn new(index: u8) -> Option<Self> {
+        let ring = Ring::new()?;
+        let Some(buffer) = Dma::new(1) else {
+            frames::free(ring.memory.phys);
+            return None;
+        };
+        Some(Self { index, ring, buffer, in_flight: VecDeque::new(), queued: 0 })
+    }
+
+    fn queue(&mut self, offset: usize, length: u32, input: bool) {
+        // An interrupt every fourth transfer.
+        let block = if self.queued % 4 == 3 { 0 } else { TRB_BLOCK_EVENT_INTERRUPT };
+        let short = if input { TRB_INTERRUPT_ON_SHORT } else { 0 };
+        let control = TRB_ISOCH << 10 | TRB_INTERRUPT_ON_COMPLETION | TRB_START_ASAP | short | block;
+        let trb = self.ring.push(self.buffer.phys + offset as u64, length, control);
+        self.in_flight.push_back((trb, offset));
+        self.queued += 1;
+    }
+
+    fn pages(&self) -> [u64; 2] {
+        [self.ring.memory.phys, self.buffer.phys]
+    }
 }
 
 /// An endpoint with several transfers queued at once, each into a slot of
@@ -1192,7 +1252,12 @@ impl Controller {
             acl_out,
             event_bytes: Vec::new(),
             acl_bytes: Vec::new(),
+            voice_settings: found.voice.clone(),
+            voice: None,
+            voice_failed: false,
         };
+        let sizes: Vec<u16> = found.voice.iter().map(|setting| setting.packet_size).collect();
+        debug!("bluetooth: voice interface packet sizes {sizes:?}");
         while endpoints.events.free() {
             endpoints.events.queue(u32::from(packet_size), true);
         }
@@ -1213,6 +1278,10 @@ impl Controller {
     fn on_bluetooth(&mut self, event: &Event) -> bool {
         let Some(device) = self.devices.get_mut(&event.slot) else { return false };
         let Some(bt) = device.bluetooth.as_mut() else { return false };
+        if bt.voice.as_ref().is_some_and(|v| event.endpoint == v.input.index || event.endpoint == v.output.index) {
+            self.on_voice(event);
+            return true;
+        }
         let ok = matches!(event.completion, COMPLETION_SUCCESS | COMPLETION_SHORT_PACKET);
         if event.endpoint == bt.acl_out.index {
             bt.acl_out.complete();
@@ -1288,7 +1357,164 @@ impl Controller {
                 }
             }
             self.send_bluetooth(slot);
+            self.service_voice(slot);
         }
+    }
+
+    /// Starts or stops a controller's voice stream when the stack opened
+    /// or closed a link.
+    fn service_voice(&mut self, slot: u8) {
+        let Some(bt) = self.devices.get_mut(&slot).and_then(|device| device.bluetooth.as_mut()) else { return };
+        let open = bt.adapter.voice_open();
+        if !open {
+            bt.voice_failed = false;
+        }
+        if open == bt.voice.is_some() || (open && bt.voice_failed) {
+            return;
+        }
+        if open {
+            if let Err(error) = self.start_voice(slot) {
+                warn!("bluetooth: can't start the voice stream: {error}");
+                if let Some(bt) = self.devices.get_mut(&slot).and_then(|device| device.bluetooth.as_mut()) {
+                    bt.voice_failed = true;
+                }
+            }
+        } else {
+            self.stop_voice(slot);
+        }
+    }
+
+    /// Picks the voice interface's alternate setting for one link, sets
+    /// up its endpoints and queues transfers both ways.
+    fn start_voice(&mut self, slot: u8) -> Result<(), String> {
+        let bt = self.devices.get(&slot).and_then(|device| device.bluetooth.as_ref()).ok_or("no such device")?;
+        let setting = *bt
+            .voice_settings
+            .iter()
+            .filter(|setting| setting.packet_size >= VOICE_PACKET)
+            .min_by_key(|setting| setting.packet_size)
+            .ok_or("the controller has no voice endpoints")?;
+        let speed = self.devices[&slot].speed;
+        let packet = u32::from(setting.packet_size & 0x7FF);
+        let interval_field = u32::from(setting.interval.clamp(1, 16)) - 1;
+        let interval_field = if matches!(speed, SPEED_LOW | SPEED_FULL) { interval_field + 3 } else { interval_field };
+        let words = |kind: u32| [interval_field << 16, kind << 3 | packet << 16, packet << 16 | packet];
+        let input = VoiceRing::new((setting.input_address & 0xF) * 2 + 1).ok_or("out of memory")?;
+        let Some(output) = VoiceRing::new((setting.output_address & 0xF) * 2) else {
+            input.pages().into_iter().for_each(frames::free);
+            return Err("out of memory".into());
+        };
+        let configured = self
+            .control_transfer(slot, uvc::set_interface(setting.interface, setting.alternate), None)
+            .and_then(|_| {
+                self.configure_isochronous(slot, input.index, Some((words(ENDPOINT_ISOCH_IN), input.ring.start())))
+            })
+            .and_then(|_| {
+                self.configure_isochronous(slot, output.index, Some((words(ENDPOINT_ISOCH_OUT), output.ring.start())))
+            });
+        if let Err(error) = configured {
+            let _ = self.configure_isochronous(slot, input.index, None);
+            let _ = self.control_transfer(slot, uvc::set_interface(setting.interface, 0), None);
+            input.pages().into_iter().chain(output.pages()).for_each(frames::free);
+            return Err(error);
+        }
+        let mut stream = VoiceStream { setting, input, output, received: Vec::new(), sending: VecDeque::new() };
+        let bt = self.devices.get_mut(&slot).and_then(|device| device.bluetooth.as_mut()).ok_or("no such device")?;
+        for transfer in 0..VOICE_TRANSFERS {
+            stream.input.queue(transfer * 32, packet, true);
+            Self::queue_voice_out(&bt.adapter, &mut stream, transfer * 32);
+        }
+        let (input_index, output_index) = (stream.input.index, stream.output.index);
+        bt.voice = Some(stream);
+        self.ring_doorbell(slot, input_index);
+        self.ring_doorbell(slot, output_index);
+        info!(
+            "bluetooth: voice stream on interface {} alternate {} ({packet}-byte packets, endpoints {:#04x} and {:#04x})",
+            setting.interface, setting.alternate, setting.input_address, setting.output_address
+        );
+        Ok(())
+    }
+
+    fn stop_voice(&mut self, slot: u8) {
+        let Some(bt) = self.devices.get_mut(&slot).and_then(|device| device.bluetooth.as_mut()) else { return };
+        let Some(stream) = bt.voice.take() else { return };
+        for index in [stream.input.index, stream.output.index] {
+            if let Err(error) = self.configure_isochronous(slot, index, None) {
+                warn!("bluetooth: can't stop the voice endpoint {index}: {error}");
+            }
+        }
+        let _ = self.control_transfer(slot, uvc::set_interface(stream.setting.interface, 0), None);
+        info!("bluetooth: voice stream stopped");
+        stream.input.pages().into_iter().chain(stream.output.pages()).for_each(frames::free);
+    }
+
+    /// Fills an OUT slot with the next piece of the SCO packets to send
+    /// (silence-filled ones when nothing plays) and queues it.
+    fn queue_voice_out(adapter: &bluetooth::Adapter, stream: &mut VoiceStream, offset: usize) {
+        let packet = usize::from(stream.setting.packet_size & 0x7FF).min(32);
+        while stream.sending.len() < packet {
+            let Some(sco) = adapter.voice_packet() else { break };
+            stream.sending.extend(sco);
+        }
+        let length = stream.sending.len().min(packet);
+        let slot = phys_to_virt(stream.output.buffer.phys + offset as u64);
+        for (index, byte) in stream.sending.drain(..length).enumerate() {
+            // SAFETY: the slot is 32 bytes inside the buffer's page, and
+            // the controller is done with it until it's queued.
+            unsafe { slot.add(index).write(byte) };
+        }
+        stream.output.queue(offset, length as u32, false);
+    }
+
+    /// A voice transfer finished: received bytes go to the stack as whole
+    /// SCO packets, and the slot is queued again.
+    fn on_voice(&mut self, event: &Event) {
+        let slot = event.slot;
+        let Some(bt) = self.devices.get_mut(&slot).and_then(|device| device.bluetooth.as_mut()) else { return };
+        let Some(stream) = bt.voice.as_mut() else { return };
+        let input = event.endpoint == stream.input.index;
+        let ring = if input { &mut stream.input } else { &mut stream.output };
+        let Some(position) = ring.in_flight.iter().position(|&(trb, _)| trb == event.parameter) else {
+            if !matches!(event.completion, COMPLETION_RING_UNDERRUN | COMPLETION_RING_OVERRUN) {
+                debug!("bluetooth: voice event for no transfer (completion code {})", event.completion);
+            }
+            return;
+        };
+        let packet = u32::from(stream.setting.packet_size & 0x7FF);
+        let mut done = Vec::new();
+        let mut data: &[u8] = &[];
+        for index in 0..=position {
+            let Some((_, offset)) = ring.in_flight.pop_front() else { break };
+            if input && index == position && matches!(event.completion, COMPLETION_SUCCESS | COMPLETION_SHORT_PACKET) {
+                let length = packet.saturating_sub(event.residual).min(32) as usize;
+                // SAFETY: as in `queue_voice_out`; the slot isn't queued
+                // again before the bytes are copied below.
+                data = unsafe { core::slice::from_raw_parts(ring.buffer.pointer::<u8>(offset), length) };
+            }
+            done.push(offset);
+        }
+        stream.received.extend_from_slice(data);
+        if input {
+            // A SCO packet's header is its handle and an 8-bit length.
+            while let [_, _, length, ..] = stream.received[..] {
+                let whole = 3 + usize::from(length);
+                if stream.received.len() < whole {
+                    break;
+                }
+                let rest = stream.received.split_off(whole);
+                let packet = core::mem::replace(&mut stream.received, rest);
+                bt.adapter.voice_received(&packet);
+            }
+            for offset in done {
+                stream.input.queue(offset, packet, true);
+            }
+        } else {
+            for offset in done {
+                Self::queue_voice_out(&bt.adapter, stream, offset);
+            }
+        }
+        let index = if input { stream.input.index } else { stream.output.index };
+        self.ring_doorbell(slot, index);
     }
 
     fn send_bluetooth(&mut self, slot: u8) {
@@ -1938,6 +2164,9 @@ impl Controller {
                 bluetooth.adapter.remove();
                 for pipe in [bluetooth.events, bluetooth.acl_in, bluetooth.acl_out] {
                     pages.extend([pipe.ring.memory.phys, pipe.buffer.phys]);
+                }
+                if let Some(voice) = bluetooth.voice {
+                    pages.extend(voice.input.pages().into_iter().chain(voice.output.pages()));
                 }
             }
             if let Some(hub) = device.hub {

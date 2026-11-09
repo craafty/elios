@@ -665,7 +665,8 @@ impl Resampler {
     }
 }
 
-// What the card plays, on its way to the Bluetooth thread.
+// What the card plays, on its way to the Bluetooth thread (for A2DP
+// streams and voice links, which are both "sinks" here).
 
 struct Feed {
     /// Streams ready for audio.
@@ -677,7 +678,7 @@ struct Feed {
 static FEED: SpinLock<Feed> = SpinLock::new(Feed { sinks: 0, rate: 0, samples: Vec::new() });
 static TAP_STARTED: AtomicBool = AtomicBool::new(false);
 
-fn sink_added() {
+pub(super) fn sink_added() {
     let first = {
         let mut feed = FEED.lock();
         feed.sinks += 1;
@@ -691,7 +692,7 @@ fn sink_added() {
     }
 }
 
-fn sink_removed() {
+pub(super) fn sink_removed() {
     let last = {
         let mut feed = FEED.lock();
         feed.sinks = feed.sinks.saturating_sub(1);

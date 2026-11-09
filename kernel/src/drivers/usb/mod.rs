@@ -91,6 +91,7 @@ pub struct Descriptors {
 
 struct Interface {
     number: u8,
+    alternate: u8,
     class: u8,
     subclass: u8,
     protocol: u8,
@@ -122,6 +123,21 @@ pub struct BluetoothInterface {
     pub input_packet_size: u16,
     pub output_address: u8,
     pub output_packet_size: u16,
+    /// The voice interface's alternate settings with isochronous
+    /// endpoints (each a different packet size, for more voice links).
+    pub voice: alloc::vec::Vec<VoiceSetting>,
+}
+
+/// One alternate setting of a Bluetooth controller's voice interface: an
+/// isochronous endpoint each way, for SCO data.
+#[derive(Clone, Copy)]
+pub struct VoiceSetting {
+    pub interface: u8,
+    pub alternate: u8,
+    pub input_address: u8,
+    pub output_address: u8,
+    pub packet_size: u16,
+    pub interval: u8,
 }
 
 /// An interface's interrupt IN endpoint (a keyboard's reports, a hub's
@@ -152,6 +168,7 @@ impl Descriptors {
                 DESCRIPTOR_CONFIGURATION if length >= 9 => descriptors.configuration = d[5],
                 DESCRIPTOR_INTERFACE if length >= 9 => descriptors.interfaces.push(Interface {
                     number: d[2],
+                    alternate: d[3],
                     class: d[5],
                     subclass: d[6],
                     protocol: d[7],
@@ -227,12 +244,33 @@ impl Descriptors {
             interface.endpoints.iter().find(|e| e.attributes & 0x3 == 2 && (e.address & 0x80 != 0) == input)
         };
         let (input, output) = (bulk(true)?, bulk(false)?);
+        // The voice interface: the next one, with the same class.
+        let voice = self
+            .interfaces
+            .iter()
+            .filter(|i| i.number != interface.number && wanted(i))
+            .filter_map(|i| {
+                let iso = |input: bool| {
+                    i.endpoints.iter().find(|e| e.attributes & 0x3 == 1 && (e.address & 0x80 != 0) == input)
+                };
+                let (input, output) = (iso(true)?, iso(false)?);
+                Some(VoiceSetting {
+                    interface: i.number,
+                    alternate: i.alternate,
+                    input_address: input.address,
+                    output_address: output.address,
+                    packet_size: input.packet_size.min(output.packet_size),
+                    interval: input.interval,
+                })
+            })
+            .collect();
         Some(BluetoothInterface {
             events,
             input_address: input.address,
             input_packet_size: input.packet_size,
             output_address: output.address,
             output_packet_size: output.packet_size,
+            voice,
         })
     }
 

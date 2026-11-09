@@ -533,6 +533,9 @@ impl Pcm {
         }
         runtime.last_position = position;
         runtime.last_update = now;
+        if self.direction == Direction::Capture && self.card == 0 && moved > 0 {
+            self.record_remote(runtime.hw_ptr % runtime.buffer, moved.min(runtime.buffer), runtime);
+        }
         runtime.hw_ptr = (runtime.hw_ptr + moved) % runtime.boundary;
 
         let queued = runtime.queued(self.direction);
@@ -560,6 +563,25 @@ impl Pcm {
             return Then::Stop;
         }
         Then::Nothing
+    }
+
+    /// Overwrites `count` frames just recorded, from `offset` in the ring,
+    /// with a microphone somewhere else, if there is one ([`super::remote`]).
+    fn record_remote(&self, offset: u64, count: u64, runtime: &Runtime) {
+        let mut bytes = alloc::vec![0u8; (count * FRAME_BYTES) as usize];
+        if !super::remote::fill(runtime.rate, &mut bytes) {
+            return;
+        }
+        let first = (count.min(runtime.buffer - offset) * FRAME_BYTES) as usize;
+        self.hardware.write_buffer((offset * FRAME_BYTES) as usize, &bytes[..first]);
+        if first < bytes.len() {
+            self.hardware.write_buffer(0, &bytes[first..]);
+        }
+    }
+
+    /// Whether the stream is recording or playing now.
+    pub fn running(&self) -> bool {
+        matches!(self.runtime.lock().state, State::Running | State::Draining)
     }
 
     fn act(&self, then: Then) {

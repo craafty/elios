@@ -14,6 +14,7 @@
 
 pub mod control;
 pub mod pcm;
+pub mod remote;
 pub mod timer;
 
 use alloc::string::String;

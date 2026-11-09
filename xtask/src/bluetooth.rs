@@ -24,6 +24,15 @@
 //! AVDTP's questions (one SBC sink endpoint), checks every audio packet's
 //! SBC frames, and writes them to target/headset.sbc, which ffmpeg can
 //! decode (`ffmpeg -f sbc -i target/headset.sbc out.wav`).
+//!
+//! The headset is a hands-free headset too (`handsfree.rs`). When the
+//! host asks for a voice link (Setup Synchronous Connection), the
+//! controller opens one, and its voice interface (interface 1, whose
+//! alternate settings give isochronous endpoints of 9 to 49 bytes as
+//! Intel's do) carries it: the "microphone" sends a 500 Hz tone in SCO
+//! packets, and what the host sends the earpiece goes to
+//! target/headset-voice.raw (8 kHz mono 16-bit:
+//! `ffmpeg -f s16le -ar 8000 -ac 1 -i target/headset-voice.raw out.wav`).
 
 use std::collections::VecDeque;
 use std::io::{self, Read};
@@ -46,6 +55,9 @@ const CONFIGURATION_STATUS: u32 = 8;
 const SET_ALT_SETTING: u32 = 9;
 const GET_ALT_SETTING: u32 = 10;
 const ALT_SETTING_STATUS: u32 = 11;
+const START_ISO_STREAM: u32 = 12;
+const STOP_ISO_STREAM: u32 = 13;
+const ISO_STREAM_STATUS: u32 = 14;
 const START_INTERRUPT_RECEIVING: u32 = 15;
 const STOP_INTERRUPT_RECEIVING: u32 = 16;
 const INTERRUPT_RECEIVING_STATUS: u32 = 17;
@@ -53,6 +65,7 @@ const CANCEL_DATA_PACKET: u32 = 21;
 const CONTROL_PACKET: u32 = 100;
 const BULK_PACKET: u32 = 101;
 const INTERRUPT_PACKET: u32 = 103;
+const ISO_PACKET: u32 = 102;
 
 const STATUS_SUCCESS: u8 = 0;
 const STATUS_CANCELLED: u8 = 1;
@@ -62,6 +75,13 @@ const EVENTS: u8 = 0x81;
 const ACL_IN: u8 = 0x82;
 const ACL_OUT: u8 = 0x02;
 const PACKET_SIZE: u16 = 64;
+const VOICE_IN: u8 = 0x83;
+const VOICE_OUT: u8 = 0x03;
+/// The voice endpoints' packet sizes in alternate settings 0 to 5 (the
+/// 7260's).
+const VOICE_SIZES: [u16; 6] = [0, 9, 17, 25, 33, 49];
+/// The microphone's tone, in Hz.
+const TONE: f64 = 500.0;
 
 /// What Intel's "read version" says: hardware 37.7.10, firmware
 /// 1.80.2.3.d (the T440p's).
@@ -195,6 +215,21 @@ struct State {
     reconnected: Vec<usize>,
     /// Where the headset writes the SBC frames it receives.
     audio_file: PathBuf,
+    /// The voice link: its handle, the ACL link's, and what it carried.
+    voice: Option<Voice>,
+    voice_alternate: u8,
+    voice_streaming: bool,
+}
+
+struct Voice {
+    handle: u16,
+    link: u16,
+    /// SCO packets sent (the microphone) and received (the earpiece).
+    sent: u64,
+    received: u64,
+    /// Received bytes not yet a whole packet, and the loudest sample.
+    partial: Vec<u8>,
+    loudest: i16,
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -251,7 +286,7 @@ fn serve(stream: UnixStream, steps: Vec<Step>, audio_file: PathBuf) -> io::Resul
     let writer: Writer = Arc::new(Mutex::new(stream));
     hello(&writer, &mut reader, "eliOS Bluetooth")?;
     send(&writer, INTERFACE_INFO, 0, &interface_info(), &[])?;
-    send(&writer, EP_INFO, 0, &ep_info(), &[])?;
+    send(&writer, EP_INFO, 0, &ep_info(0), &[])?;
     // Full speed, class 0xE0/1/1 (Bluetooth), Intel's vendor and the
     // 7260's product, version 0.01.
     let mut connect = vec![1, 0xE0, 1, 1];
@@ -274,6 +309,9 @@ fn serve(stream: UnixStream, steps: Vec<Step>, audio_file: PathBuf) -> io::Resul
         next_handle: 0x0B,
         reconnected: Vec::new(),
         audio_file,
+        voice: None,
+        voice_alternate: 0,
+        voice_streaming: false,
     }));
     loop {
         let mut header = [0u8; 16];
@@ -294,10 +332,48 @@ fn serve(stream: UnixStream, steps: Vec<Step>, audio_file: PathBuf) -> io::Resul
                 send(&writer, CONFIGURATION_STATUS, id, &[STATUS_SUCCESS, configuration], &[])?;
             }
             SET_ALT_SETTING => {
-                let status = if body[1] == 0 { STATUS_SUCCESS } else { STATUS_STALL };
-                send(&writer, ALT_SETTING_STATUS, id, &[status, body[0], body[1]], &[])?;
+                let (interface, alternate) = (body[0], body[1]);
+                let ok = alternate == 0 || (interface == 1 && usize::from(alternate) < VOICE_SIZES.len());
+                if ok && interface == 1 {
+                    let mut locked = state.lock().unwrap();
+                    locked.voice_alternate = alternate;
+                    if alternate == 0 {
+                        locked.voice_streaming = false;
+                    }
+                    drop(locked);
+                    send(&writer, EP_INFO, 0, &ep_info(alternate), &[])?;
+                }
+                let status = if ok { STATUS_SUCCESS } else { STATUS_STALL };
+                send(&writer, ALT_SETTING_STATUS, id, &[status, interface, alternate], &[])?;
             }
-            GET_ALT_SETTING => send(&writer, ALT_SETTING_STATUS, id, &[STATUS_SUCCESS, body[0], 0], &[])?,
+            GET_ALT_SETTING => {
+                let alternate = if body[0] == 1 { state.lock().unwrap().voice_alternate } else { 0 };
+                send(&writer, ALT_SETTING_STATUS, id, &[STATUS_SUCCESS, body[0], alternate], &[])?;
+            }
+            START_ISO_STREAM => {
+                let endpoint = body[0];
+                let mut locked = state.lock().unwrap();
+                let ok = (endpoint == VOICE_IN || endpoint == VOICE_OUT) && locked.voice_alternate != 0;
+                if ok && endpoint == VOICE_IN && !locked.voice_streaming {
+                    locked.voice_streaming = true;
+                    let (state, writer) = (state.clone(), writer.clone());
+                    thread::spawn(move || {
+                        let _ = stream_voice(&state, &writer);
+                    });
+                }
+                drop(locked);
+                let status = if ok { STATUS_SUCCESS } else { STATUS_STALL };
+                send(&writer, ISO_STREAM_STATUS, id, &[status, endpoint], &[])?;
+            }
+            STOP_ISO_STREAM => {
+                if body[0] == VOICE_IN {
+                    state.lock().unwrap().voice_streaming = false;
+                }
+                send(&writer, ISO_STREAM_STATUS, id, &[STATUS_SUCCESS, body[0]], &[])?;
+            }
+            ISO_PACKET if body.len() >= 4 && body[0] == VOICE_OUT => {
+                voice_from_host(&mut state.lock().unwrap(), &body[4..]);
+            }
             START_INTERRUPT_RECEIVING => {
                 send(&writer, INTERRUPT_RECEIVING_STATUS, id, &[STATUS_SUCCESS, body[0]], &[])?;
                 let mut locked = state.lock().unwrap();
@@ -680,10 +756,50 @@ fn link_command(
             }
             Ok(())
         }
+        // Setup Synchronous Connection on a link to the headset, and
+        // Accept Synchronous Connection Request (not asked for here, but
+        // accepted all the same).
+        0x0428 | 0x0429 if parameters.len() >= 17 => {
+            let link = if opcode == 0x0428 {
+                by_handle.filter(|&index| locked.links[index].device == HEADSET).map(|index| locked.links[index].handle)
+            } else {
+                locked.links.iter().find(|link| link.device == HEADSET).map(|link| link.handle)
+            };
+            let Some(link) = link.filter(|_| locked.voice.is_none()) else {
+                return queue_event(locked, writer, status_event(0x0C));
+            };
+            let at = if opcode == 0x0428 { 12 } else { 16 };
+            let setting = u16::from_le_bytes([parameters[at], parameters[at + 1]]);
+            queue_event(locked, writer, status_event(0))?;
+            let handle = locked.next_handle;
+            locked.next_handle += 1;
+            let address = DEVICES[HEADSET].address;
+            if setting != 0x0060 {
+                eprintln!("xtask: pretend headset: voice setting {setting:#06x}, not 16-bit linear");
+            }
+            // eSCO (link type 2), 6-slot interval, 60-byte packets each way,
+            // CVSD (air mode 2).
+            let mut event = vec![0x2C, 17, 0];
+            event.extend_from_slice(&handle.to_le_bytes());
+            event.extend_from_slice(&address);
+            event.extend_from_slice(&[2, 6, 2, 60, 0, 60, 0, 2]);
+            println!("xtask: pretend headset: voice link open (handle {handle:#05x})");
+            locked.voice = Some(Voice { handle, link, sent: 0, received: 0, partial: Vec::new(), loudest: 0 });
+            let _ = std::fs::remove_file(voice_file(locked));
+            queue_event(locked, writer, event)
+        }
+        // Disconnect of the voice link.
+        0x0406 if locked.voice.as_ref().is_some_and(|voice| voice.handle == handle) => {
+            queue_event(locked, writer, status_event(0))?;
+            close_voice(locked, writer)
+        }
         // Disconnect. A keyboard or mouse comes back once, a second later.
         0x0406 => {
             let Some(index) = by_handle else { return queue_event(locked, writer, status_event(0x02)) };
             queue_event(locked, writer, status_event(0))?;
+            if locked.voice.as_ref().is_some_and(|voice| voice.link == handle) {
+                close_voice(locked, writer)?;
+            }
             let link = locked.links.remove(index);
             let [low, high] = handle.to_le_bytes();
             queue_event(locked, writer, vec![0x05, 4, 0, low, high, 0x16])?;
@@ -1072,22 +1188,27 @@ fn send_event(writer: &Writer, event: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// One interface, 0: Bluetooth (class 0xE0/1/1).
+/// Two interfaces, both Bluetooth (class 0xE0/1/1): HCI, and voice.
 fn interface_info() -> Vec<u8> {
     let mut info = vec![0u8; 4 + 32 * 4];
-    info[0] = 1;
-    info[4 + 32] = 0xE0;
-    info[4 + 64] = 1;
-    info[4 + 96] = 1;
+    info[0] = 2;
+    for interface in 0..2 {
+        info[4 + interface] = interface as u8;
+        info[4 + 32 + interface] = 0xE0;
+        info[4 + 64 + interface] = 1;
+        info[4 + 96 + interface] = 1;
+    }
     info
 }
 
 /// Endpoint types (0 control, 2 bulk, 3 interrupt), intervals,
 /// interfaces and packet sizes, indexed OUT 0-15 then IN 16-31.
-fn ep_info() -> Vec<u8> {
+/// The voice endpoints are isochronous, on interface 1, sized by its
+/// alternate setting.
+fn ep_info(alternate: u8) -> Vec<u8> {
     let mut types = [255u8; 32];
     let mut intervals = [0u8; 32];
-    let interfaces = [0u8; 32];
+    let mut interfaces = [0u8; 32];
     let mut sizes = [0u16; 32];
     for (index, kind) in [(0, 0), (16, 0), (16 + usize::from(EVENTS & 0xF), 3), (16 + usize::from(ACL_IN & 0xF), 2)]
         .into_iter()
@@ -1097,6 +1218,12 @@ fn ep_info() -> Vec<u8> {
         sizes[index] = PACKET_SIZE;
     }
     intervals[16 + usize::from(EVENTS & 0xF)] = 1;
+    for index in [usize::from(VOICE_OUT), 16 + usize::from(VOICE_IN & 0xF)] {
+        types[index] = 1;
+        intervals[index] = 1;
+        interfaces[index] = 1;
+        sizes[index] = VOICE_SIZES[usize::from(alternate)];
+    }
     let mut info = Vec::new();
     info.extend_from_slice(&types);
     info.extend_from_slice(&intervals);
@@ -1115,15 +1242,108 @@ fn device_descriptor() -> Vec<u8> {
 }
 
 /// One configuration: the HCI interface with its event endpoint and bulk
-/// endpoints (the real one also has an interface for voice, unused here).
+/// endpoints, and the voice interface's six alternate settings.
 fn configuration_descriptor() -> Vec<u8> {
-    let mut d = vec![9, 2, 0, 0, 1, 1, 0, 0xE0, 50];
+    let mut d = vec![9, 2, 0, 0, 2, 1, 0, 0xE0, 50];
     d.extend_from_slice(&[9, 4, 0, 0, 3, 0xE0, 1, 1, 0]);
     let size = PACKET_SIZE.to_le_bytes();
     d.extend_from_slice(&[7, 5, EVENTS, 3, size[0], size[1], 1]);
     d.extend_from_slice(&[7, 5, ACL_IN, 2, size[0], size[1], 0]);
     d.extend_from_slice(&[7, 5, ACL_OUT, 2, size[0], size[1], 0]);
+    for (alternate, size) in VOICE_SIZES.into_iter().enumerate() {
+        let size = size.to_le_bytes();
+        d.extend_from_slice(&[9, 4, 1, alternate as u8, 2, 0xE0, 1, 1, 0]);
+        d.extend_from_slice(&[7, 5, VOICE_IN, 1, size[0], size[1], 1]);
+        d.extend_from_slice(&[7, 5, VOICE_OUT, 1, size[0], size[1], 1]);
+    }
     let total = (d.len() as u16).to_le_bytes();
     d[2..4].copy_from_slice(&total);
     d
+}
+
+/// Sends the microphone's packets on the voice IN endpoint, one a
+/// millisecond while it streams: SCO packets of 24 samples of the tone,
+/// cut to the alternate setting's packet size (empty packets while no
+/// link is open).
+fn stream_voice(state: &Mutex<State>, writer: &Writer) -> io::Result<()> {
+    let start = std::time::Instant::now();
+    let mut sent: u64 = 0;
+    let mut sample: u64 = 0;
+    let mut pending: VecDeque<u8> = VecDeque::new();
+    loop {
+        let due = start.elapsed().as_millis() as u64;
+        while sent < due {
+            sent += 1;
+            let mut locked = state.lock().unwrap();
+            if !locked.voice_streaming {
+                return Ok(());
+            }
+            let size = usize::from(VOICE_SIZES[usize::from(locked.voice_alternate)]);
+            let Some(voice) = locked.voice.as_mut() else {
+                pending.clear();
+                drop(locked);
+                send(writer, ISO_PACKET, sent, &[VOICE_IN, STATUS_SUCCESS, 0, 0], &[])?;
+                continue;
+            };
+            while pending.len() < size {
+                pending.extend(voice.handle.to_le_bytes());
+                pending.push_back(48);
+                for _ in 0..24 {
+                    let phase = sample as f64 * TONE / 8000.0 * std::f64::consts::TAU;
+                    pending.extend(((phase.sin() * 8000.0) as i16).to_le_bytes());
+                    sample += 1;
+                }
+                voice.sent += 1;
+            }
+            drop(locked);
+            let chunk: Vec<u8> = pending.drain(..size).collect();
+            let mut header = [VOICE_IN, STATUS_SUCCESS, 0, 0];
+            header[2..4].copy_from_slice(&(chunk.len() as u16).to_le_bytes());
+            send(writer, ISO_PACKET, sent, &header, &chunk)?;
+        }
+        thread::sleep(Duration::from_micros(500));
+    }
+}
+
+/// Bytes from the host on the voice OUT endpoint: whole SCO packets are
+/// checked and their samples kept.
+fn voice_from_host(locked: &mut State, data: &[u8]) {
+    let file = voice_file(locked);
+    let Some(voice) = locked.voice.as_mut() else { return };
+    voice.partial.extend_from_slice(data);
+    while let [low, high, length, ..] = voice.partial[..] {
+        let whole = 3 + usize::from(length);
+        if voice.partial.len() < whole {
+            break;
+        }
+        let packet: Vec<u8> = voice.partial.drain(..whole).collect();
+        if u16::from_le_bytes([low, high]) & 0x0FFF != voice.handle {
+            eprintln!("xtask: pretend headset: a voice packet for handle {:#05x}", u16::from_le_bytes([low, high]));
+            voice.partial.clear();
+            return;
+        }
+        voice.received += 1;
+        for pair in packet[3..].as_chunks::<2>().0 {
+            voice.loudest = voice.loudest.max(i16::from_le_bytes([pair[0], pair[1]]).saturating_abs());
+        }
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&file) {
+            let _ = file.write_all(&packet[3..]);
+        }
+    }
+}
+
+fn voice_file(locked: &State) -> PathBuf {
+    locked.audio_file.with_file_name("headset-voice.raw")
+}
+
+/// Ends the voice link (the host disconnected it, or its ACL link).
+fn close_voice(locked: &mut State, writer: &Writer) -> io::Result<()> {
+    let Some(voice) = locked.voice.take() else { return Ok(()) };
+    println!(
+        "xtask: pretend headset: voice link closed: {} packets to the host, {} from it (loudest sample {})",
+        voice.sent, voice.received, voice.loudest
+    );
+    let [low, high] = voice.handle.to_le_bytes();
+    queue_event(locked, writer, vec![0x05, 4, 0, low, high, 0x16])
 }

@@ -2791,9 +2791,9 @@ version, firmware, devices found, paired devices and their connections,
 pairing under way); `bluetooth scan` writes `scan` to it and waits;
 `bluetooth pair DEVICE` (an address or a name the scan showed) writes
 `pair ADDRESS` and follows the pairing, showing the passkey;
-`connect`, `disconnect` and `forget` the same way. Not yet: the
-headset microphone's audio (HFP's SCO link; the control side is
-below), Bluetooth Low Energy.
+`connect`, `disconnect` and `forget` the same way. Not yet: wideband
+speech (mSBC, which needs HFP's codec negotiation), Bluetooth Low
+Energy.
 
 **Service discovery** (`sdp.rs`). Headsets look up what we offer after
 connecting, and some give up on a host that doesn't answer. SDP is a
@@ -2828,8 +2828,42 @@ when told we take them, report their battery (`AT+IPHONEACCEV`), which
 `/proc/bluetooth` shows. Calls, voice recognition and the like are
 answered `ERROR`. A headset that connects to us usually opens RFCOMM
 itself; when we connected, or after 3 seconds without, we ask its SDP
-server and open its channel. The audio itself (a SCO link carrying
-the microphone) is the next step.
+server and open its channel.
+
+**Voice links** (`voice.rs`, `sound/remote.rs`). The microphone's sound
+comes on a synchronous link (SCO, or eSCO with retransmissions): slots
+the radio keeps every few milliseconds. We ask for one (Setup
+Synchronous Connection: eSCO with HFP's "S3" settings, then plain SCO
+if the headset won't) when the headset's service level connection is
+up and something records from card 0 (`arecord`, or PulseAudio for
+Firefox: its suspend-on-idle closes the device when nobody records),
+accept a headset's own request when it has a hands-free connection,
+and close the link 3 seconds after recording stops, so a program
+reopening the microphone doesn't flip the headset between modes. The
+voice setting (0x0060) makes the link carry 8 kHz mono 16-bit samples,
+which the controller turns into CVSD on the air. Over USB they don't
+go with the ACL data: the controller's second interface has two
+isochronous endpoints whose packet size its alternate settings choose
+(9, 17, 25, 33 or 49 bytes: one, two or three links). For one 16-bit
+link we pick 17 (alternate 2, as Linux does): three of the packets that
+come each millisecond make one SCO packet (a 3-byte header and 24
+samples, 3 ms). The samples skip the stack's thread, which would wake
+every 3 ms otherwise: the xHCI driver takes what to send from the
+adapter as each OUT transfer finishes (silence when nothing plays) and
+gives it what arrives, whole packets put back together from the header
+lengths. While the link is open, what card 0 plays goes to the earpiece
+(averaged down to 8 kHz mono) instead of the A2DP stream, which
+suspends; that's what phones do too, as a headset can't do both at once.
+
+Programs don't need to know about the headset: card 0's capture stream
+keeps running on the sound card, which keeps its clock and period
+events, and as its position passes newly recorded frames (before
+anyone can read them) they are replaced with the headset's samples,
+interpolated up to the stream's rate and copied to both channels. The
+headset's clock and the card's differ a little, so 30 ms are buffered
+before playing, past 150 ms the oldest are dropped, and running dry
+gives silence until the buffer fills again (the count goes to the log
+when the link closes).
 
 **Headphones** (`a2dp.rs`, and the `sbc/` crate). A2DP streams audio
 over AVDTP, which uses two L2CAP channels to PSM 0x19: the first for
@@ -2903,7 +2937,14 @@ other): its SDP server lists hands-free on channel 2, it answers RFCOMM
 when the host opens that, and when it connects back by itself it asks
 the host's SDP server for the gateway and opens it. Either way it sends
 the AT commands a headset sends, its battery included, and logs the
-answers (`xtask: pretend headset: hands-free connected: ...`).
+answers (`xtask: pretend headset: hands-free connected: ...`). Its
+controller has the 7260's voice interface too (six alternate settings),
+opens voice links when asked, sends a 500 Hz tone as the microphone at
+the USB frame pace, and writes what reaches the earpiece to
+`target/headset-voice.raw` (8 kHz mono, `ffmpeg -f s16le -ar 8000 -ac 1
+-i target/headset-voice.raw out.wav`). So `arecord -f S16_LE -r 48000
+-c 2 x.wav` with the headset paired records the tone, and
+`speaker-test` meanwhile reaches the file.
 
 ### The stack (`net/mod.rs`)
 

@@ -244,8 +244,9 @@ may work too, but QEMU is the one eliOS is tested on.
   T440p and still being tried there), the 7260's Bluetooth (Intel's
   firmware patch, scanning, Secure Simple Pairing with kept link keys,
   L2CAP, keyboards and mice, and headphones: A2DP audio with eliOS's own
-  SBC encoder, and the hands-free profile's control side over RFCOMM,
-  with the `bluetooth` command), ACPI power management.
+  SBC encoder, and the hands-free profile over RFCOMM with SCO voice
+  links, so a headset's microphone records like the laptop's own, with
+  the `bluetooth` command), ACPI power management.
 - **Networking:** eliOS's own TCP/IP stack (Ethernet, ARP, IPv4, ICMP, UDP,
   TCP), DHCP, loopback, and the Linux socket API, so programs like
   BusyBox's `wget` and `netstat` work unmodified.
@@ -375,8 +376,10 @@ for web pages.
       and HID keyboards and mice, and A2DP audio to headphones (SDP,
       AVDTP, our own SBC encoder; the sound card's output follows the
       headset; the hands-free profile's RFCOMM and AT commands, which
-      give the headset's battery), checked against a pretend controller
-      in QEMU; next, the headset's microphone (HFP's SCO audio link)),
+      give the headset's battery, and its SCO voice link: the headset's
+      microphone stands in for card 0's while something records, and the
+      earpiece plays meanwhile), checked against a pretend controller
+      in QEMU),
       and CPU speed control (turbo on, the same as Linux's "performance")
 - [x] **Desktop groundwork:** copy-on-write `fork`, shared memory
       (`memfd`, `MAP_SHARED`, a page cache), `epoll`, `eventfd`,

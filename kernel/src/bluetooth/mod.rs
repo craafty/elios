@@ -25,6 +25,7 @@ mod l2cap;
 mod rfcomm;
 mod sdp;
 mod stack;
+mod voice;
 
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -72,6 +73,8 @@ pub struct Adapter {
     /// Packets from the controller, for the stack's thread.
     incoming: SpinLock<VecDeque<Packet>>,
     requests: SpinLock<VecDeque<Request>>,
+    /// The voice link, whose packets the transport moves itself.
+    voice: SpinLock<Option<voice::Link>>,
     /// Wakes the stack's thread: packets or requests arrived.
     arrived: WaitQueue,
     /// Wakes the transport: there's something to send.
@@ -88,6 +91,7 @@ impl Adapter {
             acl_out: SpinLock::new(VecDeque::new()),
             incoming: SpinLock::new(VecDeque::new()),
             requests: SpinLock::new(VecDeque::new()),
+            voice: SpinLock::new(None),
             arrived: WaitQueue::new(),
             wake_transport,
             removed: AtomicBool::new(false),
@@ -292,6 +296,9 @@ fn start(hci: &mut Hci) -> Result<(), String> {
     hci.command(WRITE_INQUIRY_MODE, &[2])?;
     // A laptop computer (major class 1, minor 3).
     hci.command(WRITE_CLASS_OF_DEVICE, &[0x0C, 0x01, 0x00])?;
+    // Voice links carry 16-bit linear samples (the controller does the
+    // air coding, CVSD).
+    hci.command(WRITE_VOICE_SETTING, &voice::SETTING.to_le_bytes())?;
     let mut name = [0u8; 248];
     name[..5].copy_from_slice(b"eliOS");
     hci.command(WRITE_LOCAL_NAME, &name)?;
@@ -505,6 +512,7 @@ const WRITE_LOCAL_NAME: u16 = 0x0C13;
 const WRITE_CLASS_OF_DEVICE: u16 = 0x0C24;
 const WRITE_INQUIRY_MODE: u16 = 0x0C45;
 const WRITE_SIMPLE_PAIRING_MODE: u16 = 0x0C56;
+const WRITE_VOICE_SETTING: u16 = 0x0C26;
 const READ_LOCAL_VERSION: u16 = 0x1001;
 const READ_BUFFER_SIZE: u16 = 0x1005;
 const READ_BD_ADDR: u16 = 0x1009;

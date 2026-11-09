@@ -109,6 +109,12 @@ impl Gateway {
         text
     }
 
+    /// Whether the service level connection is up (so a voice link may
+    /// open).
+    pub fn ready(&self) -> bool {
+        self.step == Step::Ready
+    }
+
     pub fn deadline(&self) -> Option<u64> {
         match self.step {
             Step::Waiting(at) => Some(at),
