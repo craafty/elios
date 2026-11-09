@@ -358,6 +358,14 @@ pub fn statx(dirfd: u64, path: u64, flags: u64, _mask: u64, buffer: u64) -> Resu
     Ok(0)
 }
 
+/// `fsync` and `fdatasync`: writes back the volume the file is on (all
+/// of its changes, not just the file's: simpler, and on a flash stick one
+/// merged write costs about what a few small ones do).
+pub fn fsync(fd: u64) -> Result<u64> {
+    fs::mount::sync_filesystem(file(fd)?.inode.filesystem());
+    Ok(0)
+}
+
 pub fn fstat(fd: u64, stat: u64) -> Result<u64> {
     write_stat(&file(fd)?.inode, stat)
 }

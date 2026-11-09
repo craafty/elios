@@ -48,6 +48,9 @@ options:
                (as when eliOS is started from a stick on a real PC)
   --big-stick  a USB stick of 4 GiB that lasts between runs (target/big-stick.img),
                the image written over its start each time, as `dd` does
+  --slow-stick  like --big-stick, but as slow as a cheap USB 2.0 flash
+               stick (QEMU's throttling: about 30 MB/s and 1000 requests a
+               second reading, 10 MB/s and 20 requests a second writing)
   --usb-hub    put the USB keyboard (and stick) behind a USB hub
   --login-screen  session: boot to the login screen instead of a root shell
   --audio-wav FILE  record what eliOS plays to FILE.wav (otherwise the
@@ -107,6 +110,8 @@ struct Options {
     usb_hub: bool,
     /// The image written over the start of a bigger, lasting stick.
     big_stick: bool,
+    /// The stick is throttled to a real flash stick's speed.
+    slow_stick: bool,
     /// Sessions start at the login screen, not logged in as root.
     login_screen: bool,
     /// Use a throwaway copy of the firmware's variables (for tests).
@@ -179,6 +184,11 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options, Stri
             "--usb-stick" => options.usb_stick = true,
             "--usb-hub" => options.usb_hub = true,
             "--big-stick" => {
+                options.big_stick = true;
+                options.usb_stick = true;
+            }
+            "--slow-stick" => {
+                options.slow_stick = true;
                 options.big_stick = true;
                 options.usb_stick = true;
             }
@@ -685,7 +695,16 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
         // It's first in the boot order, so the firmware starts it even if
         // the second disk has eliOS installed (as a PC would with its USB
         // stick put first).
-        qemu.arg("-drive").arg(format!("if=none,id=live,format=raw,file={}", disk.display()));
+        // A flash stick is slowest at small requests, writes above all
+        // (each rewrites a whole erase block): QEMU's throttling limits
+        // requests a second as well as bytes.
+        let throttle = if options.slow_stick {
+            ",throttling.bps-read=31457280,throttling.iops-read=1000,\
+             throttling.bps-write=10485760,throttling.iops-write=20"
+        } else {
+            ""
+        };
+        qemu.arg("-drive").arg(format!("if=none,id=live,format=raw,file={}{throttle}", disk.display()));
         if !options.usb_stick {
             qemu.args(["-device", "ide-hd,drive=live,bus=ide.0,bootindex=0"]);
         }

@@ -276,8 +276,7 @@ fn dispatch(number: u64, a: [u64; 6], frame: &mut InterruptFrame) -> Result<u64>
         63 => system::uname(a[0]),
         72 => files::fcntl(a[0], a[1], a[2]),
         73 => files::flock(a[0], a[1]),
-        // fsync, fdatasync: everything is written back.
-        74 | 75 => mounts::sync(),
+        74 | 75 => files::fsync(a[0]),
         76 => files::truncate(a[0], a[1]),
         77 => files::ftruncate(a[0], a[1]),
         79 => files::getcwd(a[0], a[1]),

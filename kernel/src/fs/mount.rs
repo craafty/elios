@@ -22,6 +22,13 @@ use crate::sync::SpinLock;
 pub trait Volume: Send + Sync {
     /// Writes everything changed to the device.
     fn sync(&self) -> Result<()>;
+    /// What `fsync` asks for: by default the same as [`sync`](Self::sync).
+    /// A volume on slow storage may instead have the changes written
+    /// within a moment, so a program calling it many times a second
+    /// doesn't pay for a write each time.
+    fn fsync(&self) -> Result<()> {
+        self.sync()
+    }
     /// Writes everything back and marks the volume cleanly unmounted.
     /// Fails with `EBUSY` if files on it are still in use.
     fn unmount(&self) -> Result<()>;
@@ -163,6 +170,23 @@ pub fn sync_all() {
     let volumes: Vec<Arc<dyn Volume>> = MOUNTS.lock().iter().filter_map(|mount| mount.volume.clone()).collect();
     for volume in volumes {
         if let Err(error) = volume.sync() {
+            warn!("fs: sync failed: {error:?}");
+        }
+    }
+}
+
+/// Writes back the volume holding files of file system `filesystem` (see
+/// [`Inode::filesystem`]), for `fsync`: one file's changes shouldn't wait
+/// for every other disk's. Nothing to do for in-memory file systems.
+pub fn sync_filesystem(filesystem: usize) {
+    let volumes: Vec<Arc<dyn Volume>> = MOUNTS
+        .lock()
+        .iter()
+        .filter(|mount| mount.root.filesystem() == filesystem)
+        .filter_map(|mount| mount.volume.clone())
+        .collect();
+    for volume in volumes {
+        if let Err(error) = volume.fsync() {
             warn!("fs: sync failed: {error:?}");
         }
     }

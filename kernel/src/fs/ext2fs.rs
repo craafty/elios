@@ -16,8 +16,8 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 
+use super::blockcache::{self, BlockCache};
 use super::mount::{self, MountRequest};
-use super::writeback::{self, WriteBack};
 use super::{Attributes, FileKind, Inode, Metadata};
 use crate::drivers::block::Partition;
 use crate::errno::{Errno, Result};
@@ -25,7 +25,7 @@ use crate::process::credentials::{Gid, Uid};
 use crate::sync::{Mutex, SpinLock};
 use crate::time;
 
-type FileSystem = ext2::FileSystem<WriteBack>;
+type FileSystem = ext2::FileSystem<BlockCache>;
 
 pub struct Volume {
     fs: Mutex<FileSystem>,
@@ -33,6 +33,11 @@ pub struct Volume {
     /// Inodes with no names left whose last node has gone: freed by the
     /// next operation.
     orphans: SpinLock<Vec<u32>>,
+    /// On a USB stick: `fsync` leaves the writing to the block cache's
+    /// thread (within a second), as each separate small write costs flash
+    /// tens of milliseconds and SQLite (Firefox) calls it many times a
+    /// second.
+    removable: bool,
 }
 
 pub struct Node {
@@ -75,12 +80,14 @@ fn kind_of(kind: ext2::FileType) -> FileKind {
 /// Mounts the ext2 volume on a partition.
 pub fn mount(partition: Partition, source: String, read_only: bool) -> Result<MountRequest> {
     let disk = String::from(partition.disk.name());
-    let fs = FileSystem::mount(WriteBack::new(partition), time::unix_time, read_only).map_err(error)?;
-    writeback::start_flushing();
+    let removable = partition.disk.removable();
+    let fs = FileSystem::mount(BlockCache::new(partition), time::unix_time, read_only).map_err(error)?;
+    blockcache::start();
     let volume = Arc::new(Volume {
         fs: Mutex::new(fs),
         nodes: SpinLock::new(BTreeMap::new()),
         orphans: SpinLock::new(Vec::new()),
+        removable,
     });
     let root = {
         let mut fs = volume.fs.lock();
@@ -166,6 +173,15 @@ impl Drop for Node {
 impl mount::Volume for Volume {
     fn sync(&self) -> Result<()> {
         self.lock().sync().map_err(error)
+    }
+
+    fn fsync(&self) -> Result<()> {
+        if !self.removable {
+            return self.sync();
+        }
+        self.lock().flush().map_err(error)?;
+        blockcache::write_soon();
+        Ok(())
     }
 
     fn unmount(&self) -> Result<()> {

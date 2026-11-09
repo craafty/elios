@@ -88,7 +88,7 @@ pub fn umount(target: u64, flags: u64) -> Result<u64> {
     mount::unmount(&fs::normalize(&cwd, &target), flags & (MNT_FORCE | MNT_DETACH) != 0).map(|_| 0)
 }
 
-/// `sync`, `syncfs`, `fsync` and `fdatasync`: writes everything back.
+/// `sync` and `syncfs`: writes everything back.
 pub fn sync() -> Result<u64> {
     mount::sync_all();
     Ok(0)

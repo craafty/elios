@@ -95,6 +95,7 @@ cargo xtask run --forward 8080:80  # reach port 80 in eliOS at localhost:8080
 cargo xtask run --second-disk # an empty 2 GiB disk to format, mount, install to
 cargo xtask run --usb-stick   # start from a (virtual) USB stick, as on a real PC
 cargo xtask run --big-stick   # a 4 GiB stick that keeps its data partition between runs
+cargo xtask run --slow-stick  # the same, throttled to a cheap USB 2 stick's speed
 cargo xtask test              # boot a test kernel and run its tests
 cargo xtask image             # a fresh bootable disk image, target/eliOS.img
 ```

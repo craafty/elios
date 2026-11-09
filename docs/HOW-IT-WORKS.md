@@ -2261,17 +2261,32 @@ Implementation choices:
   directories, indirect blocks) go through a cache of up to 2048 blocks;
   every operation hands its changes to the device before returning. File
   data bypasses that cache and moves in runs of up to 64 contiguous blocks.
-  In the kernel the "device" is a write-back cache (`fs/writeback.rs`):
-  writing a file 4 KiB at a time rewrites the same bitmap, inode and
-  superblock blocks five or six times a write, and on a USB flash stick
-  (the live system's data partition) each small write costs tens of
-  milliseconds, which made downloads twenty times slower. Writes wait there
-  in 4 KiB pages, each kept once however often it changes, and go to the
-  disk sorted and merged into runs of up to 1 MiB: on `sync`/`fsync`,
-  every 5 seconds (a `writeback` thread), past 32 MiB waiting, and at
-  unmount and shutdown. A crash loses at most those seconds, as with
-  Linux's page cache; reads see what's waiting. In QEMU, `dd bs=4096` to
-  the stick went from 3 MB/s to over 500.
+  In the kernel the "device" is the block cache (`fs/blockcache.rs`), the
+  equivalent of Linux's page cache for the disk itself, in 4 KiB pages.
+  Reads stay there: the ext2 code looks up directories, inodes and block
+  maps on the disk on every operation, and on a USB stick (the live
+  system's data partition, where Firefox lives) each request costs a
+  millisecond or more, so Firefox's start made thousands of them every
+  time. The cache takes at most a quarter of the RAM, stops growing while
+  less than an eighth is free, and gives back least recently used clean
+  pages (checked every second) when memory runs short. Writes wait there
+  too: writing a file 4 KiB at a time rewrites the same bitmap, inode and
+  superblock blocks five or six times a write, and a flash stick pays tens
+  of milliseconds for each small write, which made downloads twenty times
+  slower. Each page is kept once however often it changes, and goes to the
+  disk sorted and merged into runs of up to 1 MiB: on `sync`, every 5
+  seconds (the `blockcache` thread), past 32 MiB waiting, and at unmount
+  and shutdown. `fsync` writes back only the file's own volume; on a USB
+  stick it asks the thread to write within a second instead, because
+  SQLite (Firefox's profile) calls it several times a second and each one
+  was five to ten separate writes. A crash loses at most those seconds,
+  as with Linux's page cache; reads see what's waiting. Measured in QEMU
+  on a stick throttled like a real one (`cargo xtask run --slow-stick`:
+  30 MB/s and 1000 requests a second reading, 10 MB/s and 20 a second
+  writing): `dd bs=4096` went from 3 MB/s to over 500; booting makes half
+  the read requests (2,800); Firefox's second start reads 8 requests
+  instead of 5,900; its very first start (making the profile) went from
+  1,032 writes and 20-40 s to 422 writes and a window within 12 s.
 - **Allocation:** a file's blocks are taken starting just after its
   previous block (so files stay contiguous); new directories go to the
   group with the most free inodes (spreading the tree out), new files to
@@ -3913,6 +3928,9 @@ boots that disk alone, as a PC would after the USB stick is removed.
 `--usb-stick` attaches the image as a USB stick instead of a SATA disk (the
 firmware boots from USB, and eliOS must find its boot partition over USB,
 as on a real PC), and `--usb-hub` puts the stick and keyboard behind a hub.
+`--slow-stick` is `--big-stick` throttled to a cheap USB 2 stick's speed
+(30 MB/s and 1000 requests a second reading, 10 MB/s and 20 requests a
+second writing), for measuring what the live system does to one.
 
 A raw disk image rather than an ISO: written to a USB stick it becomes an
 ordinary, writable disk, and QEMU boots it directly.

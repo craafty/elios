@@ -9,6 +9,7 @@
 //! flags. File descriptors point at open files, and `dup` and `fork` share
 //! them, so the position is shared too, as on Linux.
 
+pub mod blockcache;
 pub mod cpio;
 pub mod devfs;
 pub mod efivarfs;
@@ -23,7 +24,6 @@ pub mod pipe;
 pub mod procfs;
 pub mod ramfs;
 pub mod sysfs;
-pub mod writeback;
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
