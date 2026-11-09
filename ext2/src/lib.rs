@@ -96,6 +96,11 @@ pub trait BlockDevice {
     fn read(&mut self, sector: u64, buffer: &mut [u8]) -> Result<()>;
     fn write(&mut self, sector: u64, data: &[u8]) -> Result<()>;
     fn sectors(&self) -> u64;
+    /// Makes writes so far reach the storage itself, for a device that
+    /// holds them back (a write-back cache).
+    fn sync(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// A directory entry.
@@ -243,7 +248,14 @@ impl<D: BlockDevice> FileSystem<D> {
         }
         self.superblock.state = STATE_CLEAN;
         self.superblock_dirty = true;
-        self.flush()
+        self.sync()
+    }
+
+    /// Writes everything back, through any cache the device keeps too
+    /// ([`flush`](Self::flush) only hands it to the device).
+    pub fn sync(&mut self) -> Result<()> {
+        self.flush()?;
+        self.device.sync()
     }
 
     pub fn is_read_only(&self) -> bool {

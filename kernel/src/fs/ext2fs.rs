@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 
 use super::mount::{self, MountRequest};
+use super::writeback::{self, WriteBack};
 use super::{Attributes, FileKind, Inode, Metadata};
 use crate::drivers::block::Partition;
 use crate::errno::{Errno, Result};
@@ -24,7 +25,7 @@ use crate::process::credentials::{Gid, Uid};
 use crate::sync::{Mutex, SpinLock};
 use crate::time;
 
-type FileSystem = ext2::FileSystem<Partition>;
+type FileSystem = ext2::FileSystem<WriteBack>;
 
 pub struct Volume {
     fs: Mutex<FileSystem>,
@@ -74,7 +75,8 @@ fn kind_of(kind: ext2::FileType) -> FileKind {
 /// Mounts the ext2 volume on a partition.
 pub fn mount(partition: Partition, source: String, read_only: bool) -> Result<MountRequest> {
     let disk = String::from(partition.disk.name());
-    let fs = FileSystem::mount(partition, time::unix_time, read_only).map_err(error)?;
+    let fs = FileSystem::mount(WriteBack::new(partition), time::unix_time, read_only).map_err(error)?;
+    writeback::start_flushing();
     let volume = Arc::new(Volume {
         fs: Mutex::new(fs),
         nodes: SpinLock::new(BTreeMap::new()),
@@ -163,7 +165,7 @@ impl Drop for Node {
 
 impl mount::Volume for Volume {
     fn sync(&self) -> Result<()> {
-        self.lock().flush().map_err(error)
+        self.lock().sync().map_err(error)
     }
 
     fn unmount(&self) -> Result<()> {
@@ -171,7 +173,7 @@ impl mount::Volume for Volume {
         // The mount table holds the root's node; anything else alive is in
         // use.
         let live = self.nodes.lock().values().filter(|node| node.strong_count() > 0).count();
-        fs.flush().map_err(error)?;
+        fs.sync().map_err(error)?;
         if live > 1 {
             return Err(Errno::EBUSY);
         }
@@ -353,7 +355,7 @@ impl Inode for Node {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -364,8 +366,8 @@ mod tests {
     use crate::drivers::block::Disk;
 
     /// A disk in memory.
-    struct MemoryDisk {
-        data: SpinLock<Vec<u8>>,
+    pub(in crate::fs) struct MemoryDisk {
+        pub data: SpinLock<Vec<u8>>,
     }
 
     impl Disk for MemoryDisk {

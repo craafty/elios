@@ -2251,10 +2251,19 @@ Implementation choices:
   are refused or mounted read-only.
 - **Caching and consistency:** metadata blocks (bitmaps, inode tables,
   directories, indirect blocks) go through a cache of up to 2048 blocks;
-  every operation writes its changes back before returning, so the disk is
-  never more than one operation behind (no write-back cache to lose in a
-  crash). File data bypasses the cache and moves in runs of up to 64
-  contiguous blocks per device request.
+  every operation hands its changes to the device before returning. File
+  data bypasses that cache and moves in runs of up to 64 contiguous blocks.
+  In the kernel the "device" is a write-back cache (`fs/writeback.rs`):
+  writing a file 4 KiB at a time rewrites the same bitmap, inode and
+  superblock blocks five or six times a write, and on a USB flash stick
+  (the live system's data partition) each small write costs tens of
+  milliseconds, which made downloads twenty times slower. Writes wait there
+  in 4 KiB pages, each kept once however often it changes, and go to the
+  disk sorted and merged into runs of up to 1 MiB: on `sync`/`fsync`,
+  every 5 seconds (a `writeback` thread), past 32 MiB waiting, and at
+  unmount and shutdown. A crash loses at most those seconds, as with
+  Linux's page cache; reads see what's waiting. In QEMU, `dd bs=4096` to
+  the stick went from 3 MB/s to over 500.
 - **Allocation:** a file's blocks are taken starting just after its
   previous block (so files stay contiguous); new directories go to the
   group with the most free inodes (spreading the tree out), new files to

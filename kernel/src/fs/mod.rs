@@ -23,6 +23,7 @@ pub mod pipe;
 pub mod procfs;
 pub mod ramfs;
 pub mod sysfs;
+pub mod writeback;
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
