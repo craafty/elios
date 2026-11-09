@@ -2737,7 +2737,12 @@ we have a key for them, and they're authenticated with it.
 **Link keys** (`keys.rs`) are kept in `bluetooth/keys` (mode 0600) on the
 data partition, or on the boot partition of a live USB stick: one line a
 device, `ADDRESS KEY TYPE CLASS NAME`. The thread starts before file
-systems are mounted, so it looks every two seconds until one is.
+systems are mounted, so it looks every two seconds until one is. A live
+stick with its own data partition (section on where things live) keeps
+them in both: its boot partition is mounted first, but writing a newer
+image replaces that one, while the data partition, mounted a little later
+by `eli boot`, lasts. Both files are read once mounted and merged, and if
+one lacks keys the other has, both are written again.
 
 **ACL data and L2CAP** (`l2cap.rs`). A connection carries ACL packets,
 up to the controller's buffer size (1021 bytes for the 7260), and the

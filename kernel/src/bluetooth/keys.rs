@@ -8,9 +8,13 @@
 //!
 //! Keys are kept in `bluetooth/keys` on the data partition (an installed
 //! system) or else on the boot partition (the live USB stick), one line a
-//! device: address, key, key type, class of device, name. The file is
-//! read once one of those is mounted (the Bluetooth thread starts before
-//! the file systems are).
+//! device: address, key, key type, class of device, name. A live stick
+//! with a data partition of its own (mounted by `eli boot`, after the
+//! boot partition) keeps them in both: the boot partition's copy is
+//! there from the start, the data partition's outlasts writing a newer
+//! image. Each file is read once its file system is mounted (the
+//! Bluetooth thread starts before the file systems are), and the two are
+//! merged.
 
 use alloc::format;
 use alloc::string::String;
@@ -36,18 +40,27 @@ pub(super) struct Paired {
 
 pub(super) struct Keys {
     pub list: Vec<Paired>,
-    /// Whether the saved keys have been read (or there's nowhere to save
-    /// them), and when that was last tried.
+    /// The places whose saved keys have been read, whether to stop
+    /// looking for more, and when that was last tried.
+    /// (place, how many keys its file had)
+    read_from: Vec<(&'static str, usize)>,
     loaded: bool,
     tried_at: u64,
 }
+
+/// Where keys may be kept, the preferred first.
+const PLACES: [&str; 2] = ["/data", "/disk"];
+/// A live stick's data partition is mounted within this long of booting
+/// (the first boot formats it, slowly on a slow stick),
+/// if it has one.
+const DATA_WAIT_MS: u64 = 120_000;
 
 /// How often to look for somewhere to keep keys until there is one.
 pub(super) const RETRY_MS: u64 = 2000;
 
 impl Keys {
     pub fn new() -> Self {
-        Self { list: Vec::new(), loaded: false, tried_at: 0 }
+        Self { list: Vec::new(), read_from: Vec::new(), loaded: false, tried_at: 0 }
     }
 
     pub fn find(&self, address: &[u8; 6]) -> Option<&Paired> {
@@ -66,23 +79,45 @@ impl Keys {
             return;
         }
         self.tried_at = now;
-        let Some(base) = base_directory() else { return };
-        self.loaded = true;
+        let mut read = false;
+        for base in PLACES {
+            if self.read_from.iter().any(|&(place, _)| place == base) || !fs::mount::is_mounted(base) {
+                continue;
+            }
+            let count = self.read(base);
+            self.read_from.push((base, count));
+            read = true;
+        }
+        // An installed system has both from the start; a live stick may
+        // get its data partition a little later, or never.
+        self.loaded = self.read_from.len() == PLACES.len() || (!self.read_from.is_empty() && now > DATA_WAIT_MS);
+        // Keys only one place had go to the other too.
+        if read && self.read_from.len() > 1 && self.read_from.iter().any(|&(_, count)| count < self.list.len()) {
+            self.save();
+        }
+    }
+
+    /// Merges one place's saved keys; returns how many its file has.
+    fn read(&mut self, base: &str) -> usize {
         let Ok(file) = fs::lookup("/", &format!("{base}/bluetooth/keys"), true) else {
             debug!("bluetooth: no saved keys in {base}/bluetooth");
-            return;
+            return 0;
         };
         let text = read_all(&file);
+        let (before, mut count) = (self.list.len(), 0);
         for line in text.lines() {
+            count += usize::from(parse_line(line).is_some());
             match parse_line(line) {
-                // Learned before the file was read: newer.
+                // Learned before the file was read (newer), or read first
+                // from the preferred place.
                 Some(paired) if self.find(&paired.address).is_some() => {}
                 Some(paired) => self.list.push(paired),
                 None if line.trim().is_empty() => {}
                 None => warn!("bluetooth: can't read {base}/bluetooth/keys line {line:?}"),
             }
         }
-        info!("bluetooth: {} paired devices in {base}/bluetooth/keys", self.list.len());
+        info!("bluetooth: {count} paired devices in {base}/bluetooth/keys ({} new)", self.list.len() - before);
+        count
     }
 
     /// Keeps a new key (replacing any old one for the device) and saves.
@@ -105,10 +140,11 @@ impl Keys {
 
     /// Writes the file afresh (it's a few lines).
     fn save(&self) {
-        let Some(base) = base_directory() else {
+        let places = save_places();
+        if places.is_empty() {
             warn!("bluetooth: nowhere to save keys (no /data or /disk); pairing lasts until shutdown");
             return;
-        };
+        }
         let mut text = String::new();
         for paired in &self.list {
             let _ = write!(text, "{} ", format_address(&paired.address));
@@ -117,31 +153,40 @@ impl Keys {
             }
             let _ = writeln!(text, " {:02x} {:06x} {}", paired.key_type, paired.class, paired.name);
         }
-        let result = (|| {
-            let base = fs::lookup("/", base, true)?;
-            let directory = match base.lookup("bluetooth") {
-                Ok(directory) => directory,
-                Err(_) => base.create("bluetooth", FileKind::Directory, Attributes::root(0o700))?,
-            };
-            let file = match directory.lookup("keys") {
-                Ok(file) => file,
-                Err(_) => directory.create("keys", FileKind::Regular, Attributes::root(0o600))?,
-            };
-            file.truncate(0)?;
-            file.write_at(0, text.as_bytes())?;
-            Ok::<(), crate::errno::Errno>(())
-        })();
-        match result {
-            Ok(()) => debug!("bluetooth: saved {} keys in {base}/bluetooth/keys", self.list.len()),
-            Err(error) => warn!("bluetooth: can't save keys in {base}/bluetooth: {error:?}"),
+        for base in places {
+            let result = (|| {
+                let directory = fs::lookup("/", base, true)?;
+                let directory = match directory.lookup("bluetooth") {
+                    Ok(directory) => directory,
+                    Err(_) => directory.create("bluetooth", FileKind::Directory, Attributes::root(0o700))?,
+                };
+                let file = match directory.lookup("keys") {
+                    Ok(file) => file,
+                    Err(_) => directory.create("keys", FileKind::Regular, Attributes::root(0o600))?,
+                };
+                file.truncate(0)?;
+                file.write_at(0, text.as_bytes())?;
+                Ok::<(), crate::errno::Errno>(())
+            })();
+            match result {
+                Ok(()) => debug!("bluetooth: saved {} keys in {base}/bluetooth/keys", self.list.len()),
+                Err(error) => warn!("bluetooth: can't save keys in {base}/bluetooth: {error:?}"),
+            }
         }
     }
 }
 
-/// Where keys are kept: the data partition if there is one, else the boot
-/// partition.
-fn base_directory() -> Option<&'static str> {
-    ["/data", "/disk"].into_iter().find(|path| fs::mount::is_mounted(path))
+/// Where keys are saved: the data partition if there is one, and the boot
+/// partition if there isn't or this is a live stick (no `data=` on the
+/// command line), whose boot partition is read before its data partition
+/// is mounted.
+fn save_places() -> Vec<&'static str> {
+    let data = fs::mount::is_mounted("/data");
+    let live = crate::cmdline::get("data").is_none();
+    PLACES
+        .into_iter()
+        .filter(|&place| if place == "/data" { data } else { (live || !data) && fs::mount::is_mounted(place) })
+        .collect()
 }
 
 fn read_all(file: &Arc<dyn Inode>) -> String {
