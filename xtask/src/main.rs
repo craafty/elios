@@ -2,6 +2,7 @@
 
 mod bluetooth;
 mod camera;
+mod handsfree;
 mod image;
 mod mirror;
 mod session;

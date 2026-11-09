@@ -17,10 +17,12 @@
 //! the `bluetooth` command, as `/proc/wifi` does for Wi-Fi.
 
 mod a2dp;
+mod hfp;
 mod hid;
 mod intel;
 mod keys;
 mod l2cap;
+mod rfcomm;
 mod sdp;
 mod stack;
 

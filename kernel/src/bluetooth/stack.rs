@@ -25,9 +25,11 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use super::a2dp::{self, Audio};
+use super::hfp::Gateway;
 use super::hid::{self, Control, Hid};
 use super::keys::{Keys, Paired};
 use super::l2cap::{self, L2cap};
+use super::rfcomm;
 use super::sdp;
 use super::*;
 use crate::keyboard::{self, Key};
@@ -87,7 +89,7 @@ const DISPLAY_YES_NO: u8 = 0x01;
 const GENERAL_BONDING_MITM: u8 = 0x05;
 
 /// The services devices may open channels to.
-const SERVED: &[u16] = &[sdp::PSM, hid::CONTROL, hid::INTERRUPT, l2cap::AVDTP, l2cap::AVDTP_MEDIA];
+const SERVED: &[u16] = &[sdp::PSM, rfcomm::PSM, hid::CONTROL, hid::INTERRUPT, l2cap::AVDTP, l2cap::AVDTP_MEDIA];
 
 /// Unsent audio packets allowed to wait for the controller; past this the
 /// link isn't keeping up and audio is dropped rather than delayed.
@@ -111,6 +113,8 @@ struct Connection {
     l2cap: L2cap,
     hid: Option<Hid>,
     audio: Option<Audio>,
+    /// The hands-free connection (a headset's microphone and buttons).
+    hands_free: Option<Gateway>,
     /// ACL packets sent that the controller hasn't reported done.
     in_flight: u16,
     /// An L2CAP frame arriving in pieces.
@@ -231,6 +235,7 @@ impl Stack {
             .chain(self.scan.as_ref().map(|s| s.deadline))
             .chain(self.keys.next_try())
             .chain(self.connections.iter().filter_map(|c| c.audio.as_ref()?.deadline()))
+            .chain(self.connections.iter().filter_map(|c| c.hands_free.as_ref()?.deadline()))
             .min()
     }
 
@@ -259,7 +264,10 @@ impl Stack {
         }
         self.typed.drain(..).for_each(keyboard::send_key);
         for index in 0..self.connections.len() {
-            if self.connections[index].audio.as_ref().and_then(Audio::deadline).is_some_and(|d| now >= d) {
+            let connection = &self.connections[index];
+            if connection.audio.as_ref().and_then(Audio::deadline).is_some_and(|d| now >= d)
+                || connection.hands_free.as_ref().and_then(Gateway::deadline).is_some_and(|d| now >= d)
+            {
                 self.service(index);
             }
         }
@@ -284,8 +292,13 @@ impl Stack {
                     Some(Connection { hid: Some(hid), .. }) => {
                         format!("connected, {}, {} reports", hid.kinds(), hid.reports)
                     }
-                    Some(Connection { audio: Some(audio), encrypted: true, .. }) => {
-                        format!("connected, {}, {} packets", audio.describe(), audio.packets)
+                    Some(Connection { audio: Some(audio), encrypted: true, hands_free, .. }) => {
+                        let mut state = format!("connected, {}, {} packets", audio.describe(), audio.packets);
+                        if let Some(hands_free) = hands_free {
+                            state.push_str(", ");
+                            state.push_str(&hands_free.describe());
+                        }
+                        state
                     }
                     Some(connection) if connection.encrypted => String::from("connected"),
                     Some(_) => String::from("connecting"),
@@ -578,6 +591,7 @@ impl Stack {
             l2cap: L2cap::new(SERVED),
             hid: None,
             audio: None,
+            hands_free: None,
             in_flight: 0,
             partial: Vec::new(),
         });
@@ -657,6 +671,7 @@ impl Stack {
             if is_audio(connection.class) {
                 set_pairing_step(&address, "connecting audio");
                 connection.audio = Some(Audio::new(!connection.incoming));
+                connection.hands_free = Some(Gateway::new(!connection.incoming));
             }
             // Paired; audio (if it's for audio) sets itself up from here.
             if self.pairing.as_ref().is_some_and(|p| p.address == address) {
@@ -828,6 +843,14 @@ impl Stack {
                     self.typed.drain(..).for_each(keyboard::send_key);
                 }
                 (Some(sdp::PSM), _) => connection.l2cap.send(sdp::PSM, sdp::respond(payload)),
+                (Some(l2cap::SDP_CLIENT), _) => {
+                    if let Some(hands_free) = connection.hands_free.as_mut() {
+                        hands_free.sdp_answer(&mut connection.l2cap, payload);
+                    }
+                }
+                (Some(rfcomm::PSM), _) => {
+                    connection.hands_free.get_or_insert_with(|| Gateway::new(false)).receive(payload);
+                }
                 (Some(l2cap::AVDTP), _) => {
                     let audio = connection.audio.get_or_insert_with(|| Audio::new(false));
                     audio.signal(&mut connection.l2cap, payload);
@@ -870,6 +893,20 @@ impl Stack {
         {
             audio.service(&mut connection.l2cap);
         }
+        if connection.hands_free.is_none() && connection.l2cap.channel(rfcomm::PSM).is_some() {
+            connection.hands_free = Some(Gateway::new(false));
+        }
+        let mut errors = errors;
+        if let Some(hands_free) = connection.hands_free.as_mut()
+            && connection.encrypted
+        {
+            hands_free.service(&mut connection.l2cap);
+            // Not fatal: the headset still plays.
+            for error in hands_free.errors.drain(..) {
+                warn!("bluetooth: {}: hands-free: {error}", format_address(&address));
+            }
+        }
+        errors.append(&mut connection.l2cap.errors);
         let handle = connection.handle;
         let outbox: Vec<(u16, Vec<u8>)> = core::mem::take(&mut connection.l2cap.outbox);
         for (cid, payload) in outbox {

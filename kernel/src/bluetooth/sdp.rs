@@ -1,7 +1,10 @@
 //! SDP, the service discovery protocol: how a device finds out what the
 //! other end offers. Headsets look us up after connecting (to see that we
 //! can send audio, and how); without an answer some give up on the
-//! connection. We answer with one service record, an A2DP audio source.
+//! connection. We answer with two service records, an A2DP audio source
+//! and a hands-free audio gateway (what a phone is to a headset), and ask
+//! headsets for theirs to find the RFCOMM channel of their hands-free
+//! service.
 //!
 //! SDP speaks in "data elements": a header byte (type in the top five
 //! bits, size in the low three), then the value. A record is a list of
@@ -30,11 +33,16 @@ const INVALID_CONTINUATION: u16 = 0x0005;
 /// UUIDs (16-bit forms of the Bluetooth base UUID).
 const AUDIO_SOURCE: u16 = 0x110A;
 const ADVANCED_AUDIO_DISTRIBUTION: u16 = 0x110D;
+const HANDS_FREE: u16 = 0x111E;
+const HANDS_FREE_GATEWAY: u16 = 0x111F;
+const GENERIC_AUDIO: u16 = 0x1203;
 const L2CAP: u16 = 0x0100;
+const RFCOMM: u16 = 0x0003;
 const AVDTP: u16 = 0x0019;
 const PUBLIC_BROWSE_ROOT: u16 = 0x1002;
 
 const A2DP_SOURCE_HANDLE: u32 = 0x0001_0001;
+const GATEWAY_HANDLE: u32 = 0x0001_0002;
 
 /// The 16-bit forms of UUIDs that are short forms of the base UUID
 /// 0000xxxx-0000-1000-8000-00805F9B34FB.
@@ -42,6 +50,7 @@ const BASE_UUID_TAIL: [u8; 12] = [0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0x80
 
 /// A data element value.
 enum Element {
+    U8(u8),
     U16(u16),
     U32(u32),
     Uuid(u16),
@@ -51,6 +60,7 @@ enum Element {
 impl Element {
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
+            Element::U8(value) => out.extend_from_slice(&[0x08, *value]),
             Element::U16(value) => {
                 out.push(0x09);
                 out.extend_from_slice(&value.to_be_bytes());
@@ -93,8 +103,14 @@ fn sequence(body: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(body);
 }
 
-/// Our one record, attribute by attribute, in ID order.
-fn a2dp_source() -> Vec<(u16, Element)> {
+type Record = Vec<(u16, Element)>;
+
+/// Our records: handle, then attributes in ID order.
+fn records() -> [(u32, Record); 2] {
+    [(A2DP_SOURCE_HANDLE, a2dp_source()), (GATEWAY_HANDLE, gateway())]
+}
+
+fn a2dp_source() -> Record {
     use Element::*;
     alloc::vec![
         (0x0000, U32(A2DP_SOURCE_HANDLE)),
@@ -107,6 +123,26 @@ fn a2dp_source() -> Vec<(u16, Element)> {
         (0x0009, List(alloc::vec![List(alloc::vec![Uuid(ADVANCED_AUDIO_DISTRIBUTION), U16(0x0103)])])),
         // Supported features: a player.
         (0x0311, U16(0x0001)),
+    ]
+}
+
+/// The hands-free audio gateway, on RFCOMM channel `hfp::CHANNEL`.
+fn gateway() -> Record {
+    use Element::*;
+    alloc::vec![
+        (0x0000, U32(GATEWAY_HANDLE)),
+        (0x0001, List(alloc::vec![Uuid(HANDS_FREE_GATEWAY), Uuid(GENERIC_AUDIO)])),
+        (
+            0x0004,
+            List(alloc::vec![List(alloc::vec![Uuid(L2CAP)]), List(alloc::vec![Uuid(RFCOMM), U8(super::hfp::CHANNEL)])]),
+        ),
+        (0x0005, List(alloc::vec![Uuid(PUBLIC_BROWSE_ROOT)])),
+        // Hands-free profile 1.7.
+        (0x0009, List(alloc::vec![List(alloc::vec![Uuid(HANDS_FREE), U16(0x0107)])])),
+        // Network: can't reject calls (there are none).
+        (0x0301, U8(0)),
+        // Supported features: none of the optional ones.
+        (0x0311, U16(0)),
     ]
 }
 
@@ -129,32 +165,36 @@ fn pdu_with(code: u8, transaction: [u8; 2], body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn answer(pdu: u8, mut parameters: &[u8]) -> Result<(u8, Vec<u8>), u16> {
-    let record = a2dp_source();
+/// Whether a record holds every UUID of a search pattern.
+fn matches(record: &Record, pattern: &[Option<u16>]) -> bool {
     let mut uuids = Vec::new();
     record.iter().for_each(|(_, value)| value.uuids(&mut uuids));
+    pattern.iter().all(|uuid| uuid.is_some_and(|uuid| uuids.contains(&uuid)))
+}
+
+fn answer(pdu: u8, mut parameters: &[u8]) -> Result<(u8, Vec<u8>), u16> {
+    let records = records();
     match pdu {
         SERVICE_SEARCH_REQUEST => {
             let pattern = read_uuids(&mut parameters)?;
-            let matches = pattern.iter().all(|uuid| uuid.is_some_and(|uuid| uuids.contains(&uuid)));
+            let found: Vec<u32> =
+                records.iter().filter(|(_, record)| matches(record, &pattern)).map(|(handle, _)| *handle).collect();
             let mut body = Vec::new();
-            let count = u16::from(matches);
+            let count = found.len() as u16;
             body.extend_from_slice(&count.to_be_bytes());
             body.extend_from_slice(&count.to_be_bytes());
-            if matches {
-                body.extend_from_slice(&A2DP_SOURCE_HANDLE.to_be_bytes());
+            for handle in found {
+                body.extend_from_slice(&handle.to_be_bytes());
             }
             body.push(0);
             Ok((SERVICE_SEARCH_RESPONSE, body))
         }
         SERVICE_ATTRIBUTE_REQUEST => {
-            let handle = take(&mut parameters, 4)?;
-            if handle != A2DP_SOURCE_HANDLE.to_be_bytes() {
-                return Err(INVALID_RECORD_HANDLE);
-            }
+            let handle = u32::from_be_bytes(take(&mut parameters, 4)?.try_into().unwrap());
+            let (_, record) = records.iter().find(|(h, _)| *h == handle).ok_or(INVALID_RECORD_HANDLE)?;
             let maximum = u16::from_be_bytes(take(&mut parameters, 2)?.try_into().unwrap());
             let ranges = read_ranges(&mut parameters)?;
-            let list = attributes(&record, &ranges);
+            let list = attributes(record, &ranges);
             Ok((SERVICE_ATTRIBUTE_RESPONSE, continued(&list, maximum, parameters)?))
         }
         SERVICE_SEARCH_ATTRIBUTE_REQUEST => {
@@ -162,8 +202,8 @@ fn answer(pdu: u8, mut parameters: &[u8]) -> Result<(u8, Vec<u8>), u16> {
             let maximum = u16::from_be_bytes(take(&mut parameters, 2)?.try_into().unwrap());
             let ranges = read_ranges(&mut parameters)?;
             let mut lists = Vec::new();
-            if pattern.iter().all(|uuid| uuid.is_some_and(|uuid| uuids.contains(&uuid))) {
-                lists = attributes(&record, &ranges);
+            for (_, record) in records.iter().filter(|(_, record)| matches(record, &pattern)) {
+                lists.extend_from_slice(&attributes(record, &ranges));
             }
             let mut all = Vec::new();
             sequence(&lists, &mut all);
@@ -210,6 +250,49 @@ fn continued(whole: &[u8], maximum: u16, mut parameters: &[u8]) -> Result<Vec<u8
         body.push(0);
     }
     Ok(body)
+}
+
+/// A search for the device's hands-free service's protocol list (attribute
+/// 4), continuing an earlier answer if `continuation` (its state) isn't
+/// empty.
+pub(super) fn hands_free_query(transaction: u16, continuation: &[u8]) -> Vec<u8> {
+    let mut body = alloc::vec![0x35, 3, 0x19];
+    body.extend_from_slice(&HANDS_FREE.to_be_bytes());
+    // Up to 0x200 bytes at a time; attribute 4.
+    body.extend_from_slice(&[0x02, 0x00, 0x35, 3, 0x09, 0x00, 0x04]);
+    body.push(continuation.len() as u8);
+    body.extend_from_slice(continuation);
+    pdu_with(SERVICE_SEARCH_ATTRIBUTE_REQUEST, transaction.to_be_bytes(), &body)
+}
+
+pub(super) enum Answer {
+    /// Part of the answer, and the continuation state to ask for the rest.
+    More(Vec<u8>, Vec<u8>),
+    Done(Vec<u8>),
+    Error(u16),
+}
+
+/// The answer to a search: the attribute lists' bytes.
+pub(super) fn read_answer(response: &[u8]) -> Option<Answer> {
+    let [pdu, _, _, _, _, body @ ..] = response else { return None };
+    match *pdu {
+        ERROR_RESPONSE => Some(Answer::Error(u16::from_be_bytes([*body.first()?, *body.get(1)?]))),
+        SERVICE_SEARCH_ATTRIBUTE_RESPONSE => {
+            let count = usize::from(u16::from_be_bytes([*body.first()?, *body.get(1)?]));
+            let lists = body.get(2..2 + count)?.to_vec();
+            let state_length = usize::from(*body.get(2 + count)?);
+            let state = body.get(3 + count..3 + count + state_length)?;
+            Some(if state.is_empty() { Answer::Done(lists) } else { Answer::More(lists, state.to_vec()) })
+        }
+        _ => None,
+    }
+}
+
+/// The RFCOMM channel in a protocol descriptor list: the 8-bit number
+/// after RFCOMM's UUID.
+pub(super) fn rfcomm_channel(lists: &[u8]) -> Option<u8> {
+    let pattern = [0x19, (RFCOMM >> 8) as u8, RFCOMM as u8, 0x08];
+    lists.windows(5).find(|window| window[..4] == pattern).map(|window| window[4])
 }
 
 fn take<'a>(data: &mut &'a [u8], count: usize) -> Result<&'a [u8], u16> {
@@ -319,11 +402,20 @@ mod tests {
             joined.extend_from_slice(&second[7..7 + second_count]);
             assert!(lists.starts_with(&joined));
 
-            // Hands-free (0x111E) isn't offered.
+            // HID (0x1124) isn't offered.
             let mut other = request;
-            other[8..10].copy_from_slice(&[0x11, 0x1E]);
+            other[8..10].copy_from_slice(&[0x11, 0x24]);
             let response = respond(&other);
             assert_eq!(&response[5..9], &[0, 2, 0x35, 0]);
+
+            // The gateway's record says its RFCOMM channel.
+            let mut gateway = request;
+            gateway[8..10].copy_from_slice(&[0x11, 0x1F]);
+            let Some(Answer::Done(lists)) = read_answer(&respond(&gateway)) else { panic!("no answer") };
+            assert_eq!(rfcomm_channel(&lists), Some(super::super::hfp::CHANNEL));
+            // And a query for a hands-free service reads back.
+            let query = hands_free_query(9, &[]);
+            assert_eq!(&query[..5], &[SERVICE_SEARCH_ATTRIBUTE_REQUEST, 0, 9, 0, 13]);
         }
     }
 }

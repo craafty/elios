@@ -2792,15 +2792,44 @@ pairing under way); `bluetooth scan` writes `scan` to it and waits;
 `bluetooth pair DEVICE` (an address or a name the scan showed) writes
 `pair ADDRESS` and follows the pairing, showing the passkey;
 `connect`, `disconnect` and `forget` the same way. Not yet: the
-headset microphone (HFP), Bluetooth Low Energy.
+headset microphone's audio (HFP's SCO link; the control side is
+below), Bluetooth Low Energy.
 
 **Service discovery** (`sdp.rs`). Headsets look up what we offer after
 connecting, and some give up on a host that doesn't answer. SDP is a
 request/response protocol on PSM 1 whose values are "data elements" (a
-type and size byte, then the value); we keep one record, an A2DP audio
-source on AVDTP, and answer searches, attribute requests and the
-combined search-and-attributes request, splitting long answers with
-SDP's continuation state.
+type and size byte, then the value); we keep two records, an A2DP audio
+source on AVDTP and a hands-free audio gateway on RFCOMM channel 1, and
+answer searches, attribute requests and the combined
+search-and-attributes request, splitting long answers with SDP's
+continuation state. We also ask: a headset's hands-free service is on
+whatever RFCOMM channel its SDP server says, so a search for hands-free
+(0x111E) asking for the protocol list (attribute 4) finds it. That
+question goes on our own channel to PSM 1, which L2CAP names by a
+made-up PSM (as with AVDTP's second channel) so it isn't mistaken for
+the headset's channel to our server.
+
+**Hands-free** (`rfcomm.rs`, `hfp.rs`). A headset's microphone comes
+with the hands-free profile, made for phones: we play the phone (the
+"audio gateway"). Its commands are AT commands, as on a modem, over
+RFCOMM: serial ports multiplexed on one L2CAP channel (PSM 3), in GSM
+07.10 frames (address with the DLCI, a control byte, a length, a CRC-8
+over the header). A session starts with SABM/UA on DLCI 0; each
+connection then gets a parameter negotiation (frame size, and
+credit-based flow control: one frame per credit granted, credits
+granted in a byte at the front of a frame), its own SABM/UA, and modem
+status messages both ways. DLCIs are server channel numbers plus a
+direction bit: even for servers on the side that didn't start the
+session. The headset then asks for our features (`AT+BRSF`, none of the
+optional ones), the indicators we have and their values (`AT+CIND`),
+and switches on indicator events (`AT+CMER`): that's the "service level
+connection". Apple's headsets also say who they are (`AT+XAPL`) and,
+when told we take them, report their battery (`AT+IPHONEACCEV`), which
+`/proc/bluetooth` shows. Calls, voice recognition and the like are
+answered `ERROR`. A headset that connects to us usually opens RFCOMM
+itself; when we connected, or after 3 seconds without, we ask its SDP
+server and open its channel. The audio itself (a SCO link carrying
+the microphone) is the next step.
 
 **Headphones** (`a2dp.rs`, and the `sbc/` crate). A2DP streams audio
 over AVDTP, which uses two L2CAP channels to PSM 0x19: the first for
@@ -2863,11 +2892,18 @@ and the mouse moves and clicks. Disconnected by the host, a keyboard,
 mouse or the headset connects back by itself once, a second later. The
 headset is an A2DP sink: it answers AVDTP as one SBC endpoint, checks
 the frames of every audio packet, and appends them to
-`target/headset.sbc`, which `ffmpeg -f sbc -i target/headset.sbc` turns
+`target/headset.sbc` (more below), which `ffmpeg -f sbc -i target/headset.sbc` turns
 back into sound (`speaker-test -t sine` comes back as clean 440 Hz
 tones, left then right). Kernel tests
 check scanning, and pairing both devices, typing, reconnecting with the
 stored key and forgetting (`bluetooth_keyboards_and_mice_pair_and_come_back`).
+The headset is also a hands-free unit (`xtask/src/handsfree.rs`, with
+its own RFCOMM written apart from the kernel's, so each checks the
+other): its SDP server lists hands-free on channel 2, it answers RFCOMM
+when the host opens that, and when it connects back by itself it asks
+the host's SDP server for the gateway and opens it. Either way it sends
+the AT commands a headset sends, its battery included, and logs the
+answers (`xtask: pretend headset: hands-free connected: ...`).
 
 ### The stack (`net/mod.rs`)
 

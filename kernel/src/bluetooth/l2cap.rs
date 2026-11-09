@@ -51,9 +51,17 @@ const FIRST_DYNAMIC_CID: u16 = 0x0040;
 pub(super) const AVDTP: u16 = 0x0019;
 pub(super) const AVDTP_MEDIA: u16 = 0x1018;
 
+/// Our channel to the device's SDP server (we ask it questions) goes by
+/// this made-up PSM, apart from the device's channel to ours.
+pub(super) const SDP_CLIENT: u16 = 0x1001;
+
 /// The PSM a channel is opened to on the air.
 fn wire_psm(psm: u16) -> u16 {
-    if psm == AVDTP_MEDIA { AVDTP } else { psm }
+    match psm {
+        AVDTP_MEDIA => AVDTP,
+        SDP_CLIENT => 0x0001,
+        _ => psm,
+    }
 }
 
 pub(super) struct Channel {

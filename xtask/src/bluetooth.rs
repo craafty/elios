@@ -34,6 +34,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::camera::{Writer, hello, send, string_descriptor};
+use crate::handsfree::{self, HandsFree};
 
 // usbredir packet types (usbredirproto.h).
 const DEVICE_CONNECT: u32 = 1;
@@ -130,6 +131,8 @@ const PSM_INTERRUPT: u16 = 0x13;
 /// which goes by a made-up PSM here.
 const PSM_AVDTP: u16 = 0x19;
 const PSM_MEDIA: u16 = 0x1019;
+const PSM_SDP: u16 = 0x01;
+const PSM_RFCOMM: u16 = 0x03;
 
 /// A connection to one of the devices.
 struct Link {
@@ -145,6 +148,10 @@ struct Link {
     /// Audio packets received, and how many had broken SBC frames.
     audio_packets: u64,
     bad_audio: u64,
+    /// The headset's hands-free side, once RFCOMM is in use.
+    hands_free: Option<HandsFree>,
+    /// The host's gateway channel, from its SDP server.
+    gateway_channel: u8,
 }
 
 /// An L2CAP channel on the device's side: our CID and the host's.
@@ -152,6 +159,10 @@ struct Channel {
     psm: u16,
     ours: u16,
     theirs: u16,
+    /// Whether the device opened it (not the host).
+    outgoing: bool,
+    /// Bit 0: we agreed to the host's configuration; bit 1: it to ours.
+    configured: u8,
 }
 
 /// A patch file step: the command's bytes (opcode, length, parameters)
@@ -576,6 +587,8 @@ fn link_command(
                 typing: false,
                 audio_packets: 0,
                 bad_audio: 0,
+                hands_free: None,
+                gateway_channel: 0,
             });
             queue_event(locked, writer, connection_complete(0, handle, parameters))
         }
@@ -649,6 +662,15 @@ fn link_command(
             let [low, high] = handle.to_le_bytes();
             queue_event(locked, writer, vec![0x08, 4, 0, low, high, 1])?;
             let link = &locked.links[index];
+            if link.incoming && link.device == HEADSET {
+                // A headset coming back sets up hands-free: first it asks
+                // where the host's gateway is.
+                later(state, writer, 100, move |locked, _, writer| {
+                    let Some(link) = locked.links.iter_mut().find(|link| link.handle == handle) else { return Ok(()) };
+                    let request = open_channel(link, PSM_SDP);
+                    send_signal(locked, writer, handle, request)
+                });
+            }
             if link.incoming && DEVICES[link.device].hid != Hid::None {
                 later(state, writer, 100, move |locked, _, writer| {
                     let Some(link) = locked.links.iter_mut().find(|link| link.handle == handle) else { return Ok(()) };
@@ -688,7 +710,7 @@ fn link_command(
 fn open_channel(link: &mut Link, psm: u16) -> Vec<u8> {
     let ours = link.next_cid;
     link.next_cid += 1;
-    link.channels.push(Channel { psm, ours, theirs: 0 });
+    link.channels.push(Channel { psm, ours, theirs: 0, outgoing: true, configured: 0 });
     signal(link, 0x02, &[psm.to_le_bytes(), ours.to_le_bytes()].concat())
 }
 
@@ -753,15 +775,47 @@ fn acl_from_host(locked: &mut State, state: &Shared, writer: &Writer, data: &[u8
     if cid != 0x0001 {
         let channel = link.channels.iter().find(|channel| channel.ours == cid);
         let (psm, theirs) = (channel.map(|channel| channel.psm), channel.map_or(0, |channel| channel.theirs));
+        let outgoing = channel.is_some_and(|channel| channel.outgoing);
+        // What to send: (CID, payload), and signals.
+        let mut sends = Vec::new();
+        let mut signals = Vec::new();
+        let mut start_typing = false;
         // SET_PROTOCOL (boot): handshake "successful", then input.
         if psm == Some(PSM_CONTROL) && payload.first() == Some(&0x70) {
             let control = link.channels.iter().find(|channel| channel.psm == PSM_CONTROL).map_or(0, |c| c.theirs);
-            let start = !link.typing;
+            start_typing = !link.typing;
             link.typing = true;
-            send_l2cap(locked, writer, handle, control, &[0x00])?;
-            if start {
-                type_input(state, writer, handle);
+            sends.push((control, vec![0x00]));
+        }
+        if psm == Some(PSM_SDP) && !outgoing {
+            sends.push((theirs, handsfree::sdp_answer(payload)));
+        }
+        if psm == Some(PSM_SDP) && outgoing {
+            match handsfree::gateway_channel(payload) {
+                Some(channel) => {
+                    link.gateway_channel = channel;
+                    signals.push(open_channel(link, PSM_RFCOMM));
+                }
+                None => eprintln!("xtask: pretend headset: the host's SDP server has no hands-free gateway"),
             }
+        }
+        if psm == Some(PSM_RFCOMM) {
+            let hands_free = link.hands_free.get_or_insert_with(HandsFree::responder);
+            let frames = hands_free.receive(payload);
+            let finished = hands_free.done.then(|| std::mem::take(&mut hands_free.answers));
+            if let Some(answers) = finished.filter(|answers| !answers.is_empty()) {
+                eprintln!("xtask: pretend headset: hands-free connected: {}", answers.join("; "));
+            }
+            sends.extend(frames.into_iter().map(|frame| (theirs, frame)));
+        }
+        for signal in signals {
+            send_signal(locked, writer, handle, signal)?;
+        }
+        for (cid, payload) in sends {
+            send_l2cap(locked, writer, handle, cid, &payload)?;
+        }
+        if start_typing {
+            type_input(state, writer, handle);
         }
         if psm == Some(PSM_AVDTP)
             && let Some(reply) = avdtp_sink(payload)
@@ -789,6 +843,7 @@ fn acl_from_host(locked: &mut State, state: &Shared, writer: &Writer, data: &[u8
     }
     let mut commands = payload;
     let mut replies = Vec::new();
+    let mut data = Vec::new();
     while let [code, ident, low, high, rest @ ..] = commands {
         let length = usize::from(u16::from_le_bytes([*low, *high])).min(rest.len());
         let body = &rest[..length];
@@ -803,7 +858,7 @@ fn acl_from_host(locked: &mut State, state: &Shared, writer: &Writer, data: &[u8
                 }
                 let ours = link.next_cid;
                 link.next_cid += 1;
-                link.channels.push(Channel { psm, ours, theirs });
+                link.channels.push(Channel { psm, ours, theirs, outgoing: false, configured: 0 });
                 replies.push(response(
                     0x03,
                     *ident,
@@ -831,7 +886,10 @@ fn acl_from_host(locked: &mut State, state: &Shared, writer: &Writer, data: &[u8
                 let ours = word(0);
                 let theirs = link.channels.iter().find(|channel| channel.ours == ours).map_or(0, |c| c.theirs);
                 replies.push(response(0x05, *ident, &[theirs.to_le_bytes(), [0, 0], [0, 0]].concat()));
+                configured(link, ours, 1, &mut data);
             }
+            // Configuration response: to ours.
+            0x05 if word(4) == 0 => configured(link, word(0), 2, &mut data),
             // Disconnection request.
             0x06 => {
                 let ours = word(0);
@@ -847,7 +905,32 @@ fn acl_from_host(locked: &mut State, state: &Shared, writer: &Writer, data: &[u8
     for reply in replies {
         send_signal(locked, writer, handle, reply)?;
     }
+    for (cid, payload) in data {
+        send_l2cap(locked, writer, handle, cid, &payload)?;
+    }
     Ok(())
+}
+
+/// Half of a channel's configuration is done (`bit`); once both are, a
+/// channel the device opened starts being used: it asks the host's SDP
+/// server about the gateway, or starts RFCOMM to it.
+fn configured(link: &mut Link, ours: u16, bit: u8, data: &mut Vec<(u16, Vec<u8>)>) {
+    let Some(channel) = link.channels.iter_mut().find(|channel| channel.ours == ours) else { return };
+    let was_open = channel.configured == 3;
+    channel.configured |= bit;
+    if was_open || channel.configured != 3 || !channel.outgoing {
+        return;
+    }
+    let (psm, theirs) = (channel.psm, channel.theirs);
+    match psm {
+        PSM_SDP => data.push((theirs, handsfree::sdp_query())),
+        PSM_RFCOMM => {
+            let (hands_free, first) = HandsFree::initiator(link.gateway_channel);
+            link.hands_free = Some(hands_free);
+            data.push((theirs, first));
+        }
+        _ => {}
+    }
 }
 
 /// The headset's answer to an AVDTP command: one audio sink endpoint
