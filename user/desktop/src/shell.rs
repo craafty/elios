@@ -148,6 +148,7 @@ const MENU_PADDING: i32 = 6;
 
 impl Desktop {
     pub fn new(screen: Screen, font: Font) -> Self {
+        apps::restore_brightness();
         let pointer = (f64::from(screen.width) / 2.0, f64::from(screen.height) / 2.0);
         Self {
             screen,

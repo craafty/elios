@@ -1,4 +1,5 @@
-//! settings: Wi-Fi and Bluetooth without commands.
+//! settings: Wi-Fi, Bluetooth, the screen's brightness and the battery,
+//! without commands.
 //!
 //! It drives the same kernel files the `wifi` and `bluetooth` commands do:
 //! it reads `/proc/wifi` and `/proc/bluetooth` twice a second for what the
@@ -7,7 +8,13 @@
 //! signing in, pairing) in the background, so the window never waits; the
 //! next reading shows how it went.
 //!
-//! `settings bluetooth` opens on the Bluetooth page.
+//! The Power page reads Linux's `/sys/class/backlight` and
+//! `/sys/class/power_supply`, and writes the brightness there; the
+//! brightness is also saved in `~/.config/brightness`, which the desktop
+//! sets again when it starts.
+//!
+//! `settings bluetooth` opens on the Bluetooth page, `settings power` on
+//! the Power page.
 
 #![no_std]
 #![no_main]
@@ -25,6 +32,8 @@ eli::main!(main);
 
 const WIFI: &str = "/proc/wifi";
 const BLUETOOTH: &str = "/proc/bluetooth";
+const BACKLIGHT: &str = "/sys/class/backlight/intel_backlight";
+const BATTERY: &str = "/sys/class/power_supply/BAT0";
 const SIDEBAR_WIDTH: i32 = 170;
 const MARGIN: i32 = 20;
 const BUTTON_HEIGHT: i32 = 32;
@@ -35,9 +44,10 @@ const REFRESH_MS: i32 = 500;
 enum Page {
     Wifi,
     Bluetooth,
+    Power,
 }
 
-const PAGES: [(Page, &str); 2] = [(Page::Wifi, "Wi-Fi"), (Page::Bluetooth, "Bluetooth")];
+const PAGES: [(Page, &str); 3] = [(Page::Wifi, "Wi-Fi"), (Page::Bluetooth, "Bluetooth"), (Page::Power, "Power")];
 
 /// What a button does.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -56,6 +66,8 @@ enum Action {
     ConnectDevice,
     DisconnectDevice,
     Forget,
+    Dimmer,
+    Brighter,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -97,6 +109,53 @@ struct Device {
     connected: bool,
 }
 
+/// From /sys/class/power_supply/BAT0.
+#[derive(PartialEq, Eq)]
+struct Battery {
+    percent: u32,
+    status: String,
+    /// What's left and full, and the power drawn or given, in mWh and mW
+    /// (or mAh and mA: `unit` is "Wh" or "Ah").
+    now: u64,
+    full: u64,
+    design: u64,
+    rate: u64,
+    unit: &'static str,
+}
+
+fn read_number(path: &str) -> Option<u64> {
+    eli::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn read_battery() -> Option<Battery> {
+    let file = |name: &str| format!("{BATTERY}/{name}");
+    let percent = read_number(&file("capacity"))? as u32;
+    let status = eli::fs::read_to_string(&file("status")).ok()?.trim().to_string();
+    let (amount, flow, unit) =
+        if eli::fs::exists(&file("energy_now")) { ("energy", "power", "Wh") } else { ("charge", "current", "Ah") };
+    let value = |name: String| read_number(&file(&name)).unwrap_or(0) / 1000;
+    Some(Battery {
+        percent,
+        status,
+        now: value(format!("{amount}_now")),
+        full: value(format!("{amount}_full")),
+        design: value(format!("{amount}_full_design")),
+        rate: value(format!("{flow}_now")),
+        unit,
+    })
+}
+
+fn read_brightness() -> Option<(u32, u32)> {
+    let brightness = read_number(&format!("{BACKLIGHT}/brightness"))?;
+    let most = read_number(&format!("{BACKLIGHT}/max_brightness"))?;
+    (most > 0).then_some((brightness as u32, most as u32))
+}
+
+/// Thousandths as "12.3".
+fn decimal(thousandths: u64) -> String {
+    format!("{}.{}", thousandths / 1000, thousandths % 1000 / 100)
+}
+
 /// The password form for the network being joined.
 struct Join {
     network: String,
@@ -114,6 +173,9 @@ struct Settings {
     bluetooth: Option<String>,
     networks: Vec<Network>,
     devices: Vec<Device>,
+    /// The backlight's (brightness, most), and the battery's files.
+    brightness: Option<(u32, u32)>,
+    battery: Option<Battery>,
     join: Option<Join>,
     user: TextField,
     password: TextField,
@@ -281,8 +343,12 @@ impl Settings {
     fn refresh(&mut self) -> bool {
         let wifi = eli::fs::read_to_string(WIFI).ok();
         let bluetooth = eli::fs::read_to_string(BLUETOOTH).ok();
+        let (brightness, battery) = (read_brightness(), read_battery());
+        let power_changed = brightness != self.brightness || battery != self.battery;
+        self.brightness = brightness;
+        self.battery = battery;
         if wifi == self.wifi && bluetooth == self.bluetooth {
-            return false;
+            return power_changed;
         }
         // A note like "Looking for devices..." is over when the state moves on.
         let state = |text: &Option<String>| {
@@ -309,6 +375,7 @@ impl Settings {
         match self.page {
             Page::Wifi => self.networks.get(index).map(|network| network.name.clone()),
             Page::Bluetooth => self.devices.get(index).map(|device| device.address.clone()),
+            Page::Power => None,
         }
     }
 
@@ -316,11 +383,13 @@ impl Settings {
         let len = match self.page {
             Page::Wifi => self.networks.len(),
             Page::Bluetooth => self.devices.len(),
+            Page::Power => 0,
         };
         self.list.len = len;
         self.list.selected = selected.and_then(|key| match self.page {
             Page::Wifi => self.networks.iter().position(|network| network.name == key),
             Page::Bluetooth => self.devices.iter().position(|device| device.address == key),
+            Page::Power => None,
         });
         self.list.top = self.list.top.min(len.saturating_sub(1));
     }
@@ -405,6 +474,29 @@ impl Settings {
                 let name = network.name.clone();
                 let result = send(WIFI, &format!("forget\n{name}"));
                 self.report(result, &format!("Forgot {name}."));
+            }
+            Action::Dimmer | Action::Brighter => {
+                let Some((brightness, most)) = self.brightness else { return };
+                // Tenths of the range, landing on whole tenths.
+                let step = most.div_ceil(10).max(1);
+                let tenth = brightness.div_ceil(step);
+                let wanted =
+                    if action == Action::Brighter { (tenth + 1) * step } else { tenth.saturating_sub(1) * step };
+                let wanted = wanted.min(most);
+                match eli::fs::write(&format!("{BACKLIGHT}/brightness"), format!("{wanted}").as_bytes()) {
+                    Ok(()) => {
+                        self.message.clear();
+                        if let Some(home) = eli::env::var("HOME") {
+                            let _ = eli::fs::create_dir(&format!("{home}/.config"));
+                            let percent = read_brightness().map_or(0, |(now, most)| now * 100 / most);
+                            let _ = eli::fs::write(
+                                &format!("{home}/.config/brightness"),
+                                format!("{percent}\n").as_bytes(),
+                            );
+                        }
+                    }
+                    Err(error) => self.report(Err(format!("Couldn't change the brightness: {error}")), ""),
+                }
             }
             Action::Pair | Action::ConnectDevice | Action::DisconnectDevice | Action::Forget => {
                 let Some(device) = self.selected_device() else { return };
@@ -551,6 +643,10 @@ impl Settings {
                 }
             }
             Page::Bluetooth => self.buttons_row(canvas, x, 104, &[("Scan", Action::Scan)]),
+            Page::Power => {
+                self.draw_power(canvas, x, 104);
+                return;
+            }
         }
 
         let list_rect = self.list_rect(width, height);
@@ -608,11 +704,13 @@ impl Settings {
                     canvas.text(font, detail_x, y, &detail, color);
                 });
             }
+            Page::Power => {}
         }
         if self.list.len == 0 {
             let empty = match self.page {
                 Page::Wifi => "No networks yet: press Scan.",
                 Page::Bluetooth => "No devices yet: press Scan with the device in pairing mode.",
+                Page::Power => "",
             };
             canvas.text(&mut self.font, list_rect.x + 12, list_rect.y + 12, empty, theme::DIM_TEXT);
         }
@@ -669,6 +767,60 @@ impl Settings {
                     ),
                 }
             }
+            Page::Power => {}
+        }
+    }
+
+    /// The Power page under its status line: brightness and the battery.
+    fn draw_power(&mut self, canvas: &mut Canvas, x: i32, y: i32) {
+        let mut y = y;
+        let line = self.font.line_height + 8;
+        match self.brightness {
+            Some((brightness, most)) => {
+                let label = format!("Screen brightness: {}%", (brightness * 100 + most / 2) / most);
+                canvas.text(&mut self.font, x, y + 6, &label, theme::TEXT);
+                let buttons_x = x + self.font.width("Screen brightness: 100%") + 24;
+                self.buttons_row(canvas, buttons_x, y, &[("Dimmer", Action::Dimmer), ("Brighter", Action::Brighter)]);
+                y += BUTTON_HEIGHT + 20;
+            }
+            None => {
+                canvas.text(&mut self.font, x, y, "The screen's brightness can't be changed here.", theme::DIM_TEXT);
+                y += line + 12;
+            }
+        }
+        let Some(battery) = &self.battery else {
+            canvas.text(&mut self.font, x, y, "No battery found.", theme::DIM_TEXT);
+            return;
+        };
+        let mut lines = Vec::new();
+        lines.push(format!("Battery: {}%, {}", battery.percent, battery.status.to_lowercase()));
+        let power = if battery.unit == "Wh" { "W" } else { "A" };
+        if battery.rate > 0 && battery.status == "Discharging" {
+            let minutes = battery.now * 60 / battery.rate;
+            lines.push(format!(
+                "Using {} {power}: about {}:{:02} left",
+                decimal(battery.rate),
+                minutes / 60,
+                minutes % 60
+            ));
+        } else if battery.rate > 0 && battery.status == "Charging" {
+            let minutes = battery.full.saturating_sub(battery.now) * 60 / battery.rate;
+            lines.push(format!(
+                "Charging at {} {power}: full in about {}:{:02}",
+                decimal(battery.rate),
+                minutes / 60,
+                minutes % 60
+            ));
+        }
+        let unit = battery.unit;
+        lines.push(format!("Charge: {} of {} {unit}", decimal(battery.now), decimal(battery.full)));
+        if let Some(health) = (battery.full * 100).checked_div(battery.design) {
+            lines.push(format!("Health: {health}% of the {} {unit} it was made for", decimal(battery.design)));
+        }
+        for (index, text) in lines.iter().enumerate() {
+            let color = if index == 0 { theme::TEXT } else { theme::DIM_TEXT };
+            canvas.text(&mut self.font, x, y, text, color);
+            y += line;
         }
     }
 
@@ -678,11 +830,20 @@ impl Settings {
         let (text, absent) = match self.page {
             Page::Wifi => (self.wifi.as_deref(), "No Wi-Fi card found."),
             Page::Bluetooth => (self.bluetooth.as_deref(), "No Bluetooth adapter found."),
+            Page::Power => {
+                let status = match &self.battery {
+                    Some(battery) if battery.status == "Discharging" => String::from("On battery"),
+                    Some(_) => String::from("Plugged in"),
+                    None => String::new(),
+                };
+                return (status, None, true);
+            }
         };
         let Some(text) = text else { return (String::from(absent), None, false) };
         let state = field(text, "state:").unwrap_or_default();
         let error = field(text, "error:").map(String::from);
         let status = match self.page {
+            Page::Power => String::new(),
             Page::Wifi => match (state, field(text, "network:")) {
                 ("connected", Some(network)) => format!("Connected to {network}"),
                 ("scanning", _) => String::from("Scanning..."),
@@ -756,6 +917,7 @@ impl Settings {
                 Some((true, false)) => self.act(Action::ConnectDevice),
                 _ => {}
             },
+            Page::Power => {}
         }
     }
 }
@@ -780,8 +942,11 @@ fn main() -> i32 {
     user.placeholder = String::from("for example, your university login");
     let mut password = TextField::new("");
     password.secret = true;
-    let page =
-        if eli::env::args().get(1).is_some_and(|page| page == "bluetooth") { Page::Bluetooth } else { Page::Wifi };
+    let page = match eli::env::args().get(1).map(String::as_str) {
+        Some("bluetooth") => Page::Bluetooth,
+        Some("power") => Page::Power,
+        _ => Page::Wifi,
+    };
     let mut settings = Settings {
         font,
         page,
@@ -791,6 +956,8 @@ fn main() -> i32 {
         bluetooth: None,
         networks: Vec::new(),
         devices: Vec::new(),
+        brightness: None,
+        battery: None,
         join: None,
         user,
         password,

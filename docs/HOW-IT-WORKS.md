@@ -1887,6 +1887,17 @@ scanline counter (`PIPEDSL`) moves; the wait sleeps while most of a frame
 is left and spins for the last couple of milliseconds, giving up after
 40 ms. Elsewhere (QEMU) the ioctl fails and the desktop stops asking.
 
+The one thing it writes is the panel's backlight. On Haswell with a Lynx
+Point chipset (the T440p) the chipset's PWM drives it: `BLC_PWM_PCH_CTL1`
+says whether it's on and whether the signal is inverted, and
+`BLC_PWM_PCH_CTL2` holds the period in its top 16 bits and the duty cycle
+in its bottom 16, as Linux's i915 driver reads them. The brightness is the
+duty cycle out of the period, offered as
+`/sys/class/backlight/intel_backlight/brightness` (writable by the
+`netdev` group) and `max_brightness`. Writes never go below a twentieth,
+so a mistake can't leave the screen dark. If GOP left the PWM off, there's
+nothing to control and the directory is empty.
+
 ### PS/2 keyboard (`keyboard.rs`)
 
 The i8042 controller is configured to interrupt on key presses and to
@@ -3600,8 +3611,8 @@ at.
 
 ### Settings (`user/ui/src/bin/settings.rs`)
 
-`settings [bluetooth]` (the user's menu on the bar, or a click on the
-network status) is Wi-Fi and Bluetooth without commands. It reads
+`settings [bluetooth|power]` (the user's menu on the bar, or a click on the
+network status) is Wi-Fi, Bluetooth and power without commands. It reads
 `/proc/wifi` and `/proc/bluetooth` every half second and writes the same
 requests the `wifi` and `bluetooth` commands do. Those requests return
 straight away: the kernel scans, signs in and pairs in the background,
@@ -3621,6 +3632,13 @@ and what it shows is always what the hardware is doing.
   their class of device (keyboard, mouse, headphones). Pair, Connect,
   Disconnect, Forget. While a keyboard is pairing by passkey, the window
   shows the number to type.
+- **Power**: the screen's brightness, with Dimmer and Brighter buttons
+  (tenths of the range), and the battery: its level, whether it's charging,
+  the power drawn and the time that leaves, and its health (full capacity
+  against what it was made for). It reads Linux's `/sys/class/backlight`
+  and `/sys/class/power_supply`. The brightness is saved as a percentage
+  in `~/.config/brightness`, and the desktop sets it again when it starts,
+  as the firmware starts the panel at its own level.
 
 Ordinary users can use it: the two files belong to the `netdev` group.
 

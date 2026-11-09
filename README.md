@@ -395,8 +395,8 @@ for web pages.
       explorer (`files`, done), a shared clipboard, an app menu (Firefox
       appears once it's added) and a status area (done), smoother touchpad
       and TrackPoint movement (resynchronizing packets, speed-based
-      acceleration; to try on the laptop), Settings for Wi-Fi and
-      Bluetooth and a Log out menu (done); next, the desktop preinstalled
+      acceleration; to try on the laptop), Settings for Wi-Fi,
+      Bluetooth, screen brightness and the battery, and a Log out menu (done); next, the desktop preinstalled
 - [x] **Firefox:** Alpine's Firefox browses HTTPS sites in the desktop
       (package triggers, `mremap`, `statx`, `prctl` and `arch_prctl`
       additions, `/proc/sys`, namespaces refused so sandboxes fall back),

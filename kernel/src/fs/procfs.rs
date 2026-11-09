@@ -72,7 +72,7 @@ struct Control {
 /// The group whose members may control Wi-Fi and Bluetooth (`netdev`, as
 /// on Alpine): everyone using the computer, so the desktop's settings
 /// work without root.
-const NETWORK_GROUP: u32 = 28;
+pub(super) const NETWORK_GROUP: u32 = 28;
 
 fn control(
     generate: impl Fn() -> String + Send + Sync + 'static,
@@ -81,7 +81,7 @@ fn control(
     control_by(generate, write, None)
 }
 
-fn control_by(
+pub(super) fn control_by(
     generate: impl Fn() -> String + Send + Sync + 'static,
     write: impl Fn(&[u8]) -> Result<()> + Send + Sync + 'static,
     group: Option<u32>,

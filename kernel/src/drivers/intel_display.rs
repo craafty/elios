@@ -10,6 +10,13 @@
 //! drawn, at or past it means vertical blank. These registers are at the
 //! same offsets from Sandy Bridge to Kaby Lake, the T440p's Haswell
 //! included; the pipes' power wells that GOP uses stay on.
+//!
+//! The one thing written is the panel's backlight. On Haswell with an
+//! 8-series (Lynx Point) chipset, the T440p's, the chipset's PWM drives it:
+//! BLC_PWM_PCH_CTL1 says whether it's on and which way round it is,
+//! BLC_PWM_PCH_CTL2 holds the period (the top 16 bits) and the duty cycle
+//! (the bottom 16), the brightness out of the period, as Linux's i915 sets
+//! it. Programs see it as `/sys/class/backlight/intel_backlight`.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -25,13 +32,19 @@ const PIPESRC: usize = 0x6001C;
 const PIPEDSL: usize = 0x70000;
 /// Primary plane control: bit 31 is "plane on".
 const DSPCNTR: usize = 0x70180;
-/// How much of the register space is mapped (past the last pipe's plane).
-const MAPPED: usize = 0x73000;
+/// The chipset's backlight PWM: control (bit 31 on, bit 29 inverted),
+/// then period and duty cycle.
+const BLC_PWM_PCH_CTL1: usize = 0xC8250;
+const BLC_PWM_PCH_CTL2: usize = 0xC8254;
+/// How much of the register space is mapped (past the backlight).
+const MAPPED: usize = 0xC9000;
 
 /// The scanline register's address (0: no display found) and the visible
 /// height, in lines.
 static SCANLINE: AtomicU64 = AtomicU64::new(0);
 static HEIGHT: AtomicU64 = AtomicU64::new(0);
+/// The register space (0: none), for the backlight.
+static BACKLIGHT: AtomicU64 = AtomicU64::new(0);
 
 fn read(base: u64, offset: usize) -> u32 {
     // SAFETY: within the mapped register space (offsets below MAPPED).
@@ -47,6 +60,7 @@ pub fn probe(devices: &[pci::Device]) {
     };
     // Memory decoding is on (GOP uses the device); nothing is written.
     let base = memory::map_device(bar, MAPPED as u64, CacheType::Uncached) as u64;
+    probe_backlight(base);
     let mut found = None;
     for pipe in 0..3 {
         let control = read(base, DSPCNTR + pipe * PIPE_STRIDE);
@@ -82,6 +96,42 @@ pub fn probe(devices: &[pci::Device]) {
         HEIGHT.store(u64::from(height), Ordering::Relaxed);
         SCANLINE.store(scanline, Ordering::Release);
     }
+}
+
+fn probe_backlight(base: u64) {
+    let (control, period_duty) = (read(base, BLC_PWM_PCH_CTL1), read(base, BLC_PWM_PCH_CTL2));
+    info!("display: backlight PWM control {control:#010x}, period/duty {period_duty:#010x}");
+    if control & (1 << 31) == 0 || period_duty >> 16 == 0 {
+        info!("display: the chipset's backlight PWM is off: no brightness control");
+        return;
+    }
+    BACKLIGHT.store(base, Ordering::Release);
+}
+
+/// The backlight's (brightness, most) if there's one to control.
+pub fn backlight() -> Option<(u32, u32)> {
+    let base = BACKLIGHT.load(Ordering::Acquire);
+    if base == 0 {
+        return None;
+    }
+    let inverted = read(base, BLC_PWM_PCH_CTL1) & (1 << 29) != 0;
+    let value = read(base, BLC_PWM_PCH_CTL2);
+    let (most, duty) = (value >> 16, value & 0xFFFF);
+    Some((if inverted { most.saturating_sub(duty) } else { duty }.min(most), most))
+}
+
+/// Sets the backlight's brightness, out of [`backlight`]'s most; never
+/// below a twentieth of that, so the screen can't go dark by mistake.
+pub fn set_backlight(brightness: u32) -> bool {
+    let base = BACKLIGHT.load(Ordering::Acquire);
+    let Some((_, most)) = backlight() else { return false };
+    let brightness = brightness.clamp(most.div_ceil(20), most);
+    let inverted = read(base, BLC_PWM_PCH_CTL1) & (1 << 29) != 0;
+    let duty = if inverted { most - brightness } else { brightness };
+    // SAFETY: the mapped register space; only the duty cycle changes.
+    unsafe { ((base as usize + BLC_PWM_PCH_CTL2) as *mut u32).write_volatile(most << 16 | duty) };
+    debug!("display: backlight {brightness} of {most}");
+    true
 }
 
 /// Returns at the start of the next vertical blank (or at once if the

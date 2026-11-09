@@ -9,6 +9,9 @@
 //!   (`status`, `capacity` in percent, energy in µWh or charge in µAh,
 //!   power in µW or current in µA, `voltage_now` in µV), read from the
 //!   embedded controller (`drivers/thinkpad_ec.rs`).
+//! - `/sys/class/backlight/intel_backlight/`: `brightness` (which the
+//!   `netdev` group, everyone at the computer, may write),
+//!   `max_brightness`, `actual_brightness`, `type`.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -16,7 +19,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::Inode;
-use super::procfs::{Listing, directory, generated};
+use super::procfs::{Listing, NETWORK_GROUP, control_by, directory, generated};
 use crate::drivers::block::{self, Disk, Partition};
 use crate::drivers::thinkpad_ec::{self, State};
 
@@ -25,7 +28,15 @@ pub fn create() -> Arc<dyn Inode> {
     directory(|| {
         let mut entries: Listing = alloc::vec![
             ("block".into(), directory(block_listing)),
-            ("class".into(), directory(|| alloc::vec![("power_supply".into(), directory(power_supplies))])),
+            (
+                "class".into(),
+                directory(|| {
+                    alloc::vec![
+                        ("power_supply".into(), directory(power_supplies)),
+                        ("backlight".into(), directory(backlights)),
+                    ]
+                })
+            ),
         ];
         // /sys/firmware/efi exists on UEFI systems, which is how programs
         // tell; its efivars directory holds the firmware's variables.
@@ -118,4 +129,28 @@ fn battery_files(battery: thinkpad_ec::Battery) -> Listing {
         (format!("{flow}_now"), value(u64::from(battery.rate) * 1000)),
         ("voltage_now".into(), value(u64::from(battery.millivolts) * 1000)),
     ]
+}
+
+fn backlights() -> Listing {
+    use crate::drivers::intel_display;
+    let Some((_, most)) = intel_display::backlight() else { return Listing::new() };
+    let brightness = || intel_display::backlight().map_or(0, |(brightness, _)| brightness);
+    let set = |text: &[u8]| {
+        let value = core::str::from_utf8(text).ok().and_then(|text| text.trim().parse().ok());
+        match value {
+            Some(value) if intel_display::set_backlight(value) => Ok(()),
+            _ => Err(crate::errno::Errno::EINVAL),
+        }
+    };
+    alloc::vec![(
+        "intel_backlight".into(),
+        directory(move || {
+            alloc::vec![
+                ("type".into(), value("raw")),
+                ("max_brightness".into(), value(most)),
+                ("brightness".into(), control_by(move || format!("{}\n", brightness()), set, Some(NETWORK_GROUP))),
+                ("actual_brightness".into(), generated(move || format!("{}\n", brightness()))),
+            ]
+        }),
+    )]
 }

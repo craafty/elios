@@ -104,6 +104,19 @@ fn split_exec(exec: &str) -> Vec<String> {
     words
 }
 
+/// Sets the screen's brightness to what Settings saved (a percentage in
+/// `~/.config/brightness`), as the firmware starts it at its own level.
+pub fn restore_brightness() {
+    const BACKLIGHT: &str = "/sys/class/backlight/intel_backlight";
+    let number =
+        |path: &str| -> Option<u32> { String::from_utf8_lossy(&eli::fs::read(path).ok()?).trim().parse().ok() };
+    let Some(home) = eli::env::var("HOME") else { return };
+    let Some(percent) = number(&alloc::format!("{home}/.config/brightness")) else { return };
+    let Some(most) = number(&alloc::format!("{BACKLIGHT}/max_brightness")) else { return };
+    let value = u64::from(most) * u64::from(percent.min(100)) / 100;
+    let _ = eli::fs::write(&alloc::format!("{BACKLIGHT}/brightness"), alloc::format!("{value}").as_bytes());
+}
+
 /// The bar's status area: the network, then the battery if there is one.
 pub fn status() -> String {
     let network = network_status();
