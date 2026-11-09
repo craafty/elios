@@ -312,7 +312,7 @@ fn connect_request(words: &[String]) -> Result<String, String> {
     let network = rest[..split].join(" ");
     let mut password = rest[split..].join(" ");
     if password.is_empty() {
-        let prompt = if user.is_some() { "Password: " } else { "Password (empty for an open network): " };
+        let prompt = if user.is_some() { "Password: " } else { "Password (empty for an open or saved network): " };
         password = eli::term::read_password(prompt).unwrap_or_default();
     }
     match &user {
@@ -326,7 +326,7 @@ fn connect_request(words: &[String]) -> Result<String, String> {
     Ok(alloc::format!("connect\n{network}\n{password}\n{}", user.unwrap_or_default()))
 }
 
-/// `wifi [scan | connect NETWORK [PASSWORD] [--user NAME] | disconnect]`:
+/// `wifi [scan | connect NETWORK [PASSWORD] [--user NAME] | disconnect | forget NETWORK]`:
 /// talks to the Wi-Fi driver through /proc/wifi, then waits for it to
 /// finish.
 pub fn wifi(arguments: &[String]) -> i32 {
@@ -341,6 +341,7 @@ pub fn wifi(arguments: &[String]) -> i32 {
         }
         Some("scan") => String::from("scan"),
         Some("disconnect") => String::from("disconnect"),
+        Some("forget") if arguments.len() >= 3 => alloc::format!("forget\n{}", arguments[2..].join(" ")),
         Some("connect") if arguments.len() >= 3 => match connect_request(&arguments[2..]) {
             Ok(request) => request,
             Err(error) => {
@@ -349,8 +350,10 @@ pub fn wifi(arguments: &[String]) -> i32 {
             }
         },
         _ => {
-            eprintln!("usage: wifi [scan | connect NETWORK [PASSWORD] [--user NAME] | disconnect]");
+            eprintln!("usage: wifi [scan | connect NETWORK [PASSWORD] [--user NAME] | disconnect | forget NETWORK]");
             eprintln!("  enterprise networks (eduroam, campus Wi-Fi): wifi connect NETWORK --user NAME");
+            eprintln!("  networks joined are joined again by themselves (with a data partition, after");
+            eprintln!("  restarting too) until forgotten");
             return 2;
         }
     };

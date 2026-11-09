@@ -18,6 +18,7 @@ mod crypto;
 mod firmware;
 mod ieee80211;
 mod runtime;
+mod saved;
 mod transport;
 mod wpa;
 

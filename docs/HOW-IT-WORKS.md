@@ -2661,7 +2661,23 @@ of words that names a network in the last scan, and anything after it is
 the password. They write to `/proc/wifi` (root and the `netdev` group, 28, which
 every configured user is in, like `audio`; `connect` sends the
 name, password and user name on separate lines) and wait for the state
-to settle; `ifconfig` then shows `wlan0`'s address. Not yet: scanning
+to settle; `ifconfig` then shows `wlan0`'s address.
+
+**Saved networks** (`saved.rs`). A network joined on request is saved,
+name, password and user name, in `/data/wifi/networks` (mode 0600, one
+line a network, each field in hexadecimal since names and passwords may
+hold any byte), the latest first, sixteen at most. Only the data
+partition keeps them: an enterprise password is someone's own account
+password, and the boot partition is FAT, with no permissions. Once the
+file is read (the thread looks for `/data` every few seconds for two
+minutes, as a live stick mounts its own late), and whenever the
+connection drops after missed beacons, the thread scans and joins the
+saved network with the strongest signal; with none in range it tries
+again after half a minute, doubling up to five minutes. `wifi disconnect`
+stops that until the next join. `wifi connect NAME` with an empty
+password uses the saved one, `wifi forget NAME` drops it, and
+`/proc/wifi`'s `saved:` line lists them (Settings marks them "saved" and
+offers Forget). Not yet: scanning
 while connected, roaming, WPA3, EAP methods other than PEAP/MS-CHAPv2,
 802.11n aggregation (so throughput is well below the card's best; the
 access point's Block Ack requests are declined with status 37, as the

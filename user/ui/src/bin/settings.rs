@@ -47,6 +47,8 @@ enum Action {
     /// Join the selected network (asking for a password first if it has one).
     Connect,
     Disconnect,
+    /// Forget the selected Wi-Fi network's saved password.
+    ForgetNetwork,
     /// Send the password form.
     Join,
     CancelJoin,
@@ -347,6 +349,12 @@ impl Settings {
         }
     }
 
+    /// Whether the kernel has a password saved for a Wi-Fi network.
+    fn saved(&self, name: &str) -> bool {
+        let saved = self.wifi.as_deref().and_then(|text| field(text, "saved:")).unwrap_or_default();
+        saved.split(", ").any(|saved| saved == name)
+    }
+
     fn selected_network(&self) -> Option<&Network> {
         self.networks.get(self.list.selected?)
     }
@@ -372,7 +380,8 @@ impl Settings {
                 if !network.supported() {
                     let problem = format!("{name} uses {}, which eliOS can't join yet.", network.security);
                     self.report(Err(problem), "");
-                } else if open {
+                } else if open || self.saved(&name) {
+                    // A saved network's password is the kernel's to fill in.
                     let result = send(WIFI, &format!("connect\n{name}"));
                     self.report(result, &format!("Joining {name}..."));
                 } else {
@@ -390,6 +399,12 @@ impl Settings {
             Action::Disconnect => {
                 let result = send(WIFI, "disconnect");
                 self.report(result, "Disconnected.");
+            }
+            Action::ForgetNetwork => {
+                let Some(network) = self.selected_network() else { return };
+                let name = network.name.clone();
+                let result = send(WIFI, &format!("forget\n{name}"));
+                self.report(result, &format!("Forgot {name}."));
             }
             Action::Pair | Action::ConnectDevice | Action::DisconnectDevice | Action::Forget => {
                 let Some(device) = self.selected_device() else { return };
@@ -549,6 +564,12 @@ impl Settings {
             Page::Wifi => {
                 let networks = &self.networks;
                 let current = self.wifi.as_deref().and_then(|text| field(text, "network:"));
+                let saved: Vec<&str> = self
+                    .wifi
+                    .as_deref()
+                    .and_then(|text| field(text, "saved:"))
+                    .map(|names| names.split(", ").collect())
+                    .unwrap_or_default();
                 self.list.draw(canvas, list_rect, focused, |canvas, index, rect, _| {
                     let network = &networks[index];
                     let y = rect.y + (rect.height - font.line_height) / 2;
@@ -566,6 +587,9 @@ impl Settings {
                     if current == Some(network.name.as_str()) {
                         right -= font.width("connected") + 20;
                         canvas.text(font, right, y, "connected", theme::TEXT);
+                    } else if saved.contains(&network.name.as_str()) {
+                        right -= font.width("saved") + 20;
+                        canvas.text(font, right, y, "saved", theme::DIM_TEXT);
                     }
                 });
             }
@@ -614,7 +638,10 @@ impl Settings {
         }
         match self.page {
             Page::Wifi => {
-                if self.selected_network().is_some() {
+                let Some(network) = self.selected_network() else { return };
+                if self.saved(&network.name.clone()) {
+                    self.buttons_row(canvas, x, y, &[("Connect", Action::Connect), ("Forget", Action::ForgetNetwork)]);
+                } else {
                     self.buttons_row(canvas, x, y, &[("Connect", Action::Connect)]);
                 }
             }

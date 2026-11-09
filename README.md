@@ -125,7 +125,9 @@ appears there, and gets its own bar button, once it's added. The bar also
 shows the network (the Wi-Fi network's name, Wired or Offline), the
 time, and your name, whose menu has Settings, Log out, Restart and Power off. Settings (also
 opened by clicking the network status) joins Wi-Fi networks, including
-enterprise ones with a user name and password, and scans for, pairs,
+enterprise ones with a user name and password (joined networks are
+joined again by themselves, also after restarting when there's a data
+partition), and scans for, pairs,
 connects and forgets Bluetooth devices, with no commands needed. Super+Enter opens a terminal,
 Super+E the file explorer, Super+Tab switches windows, Super+Q closes one, and
 Ctrl+Alt+Backspace logs out (as the menu does, ending every program the

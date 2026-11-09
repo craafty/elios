@@ -30,6 +30,7 @@ use super::commands::{self as cmd, Channel, MacContext, SmartFifo, Station, TxFr
 use super::crypto::{self, Aes128};
 use super::firmware::{Firmware, Image};
 use super::ieee80211::{self as wlan, Bss, Security};
+use super::saved::{Network, Saved};
 use super::transport::{Error, Packet, Transport};
 use super::wpa::{self, GroupKey, Handshake, Step};
 use crate::errno::{Errno, Result as SysResult};
@@ -74,6 +75,7 @@ enum Request {
         identity: Vec<u8>,
     },
     Disconnect,
+    Forget(Vec<u8>),
 }
 
 /// What the rest of the kernel sees of the card.
@@ -88,6 +90,8 @@ struct Shared {
     connected: Option<Bss>,
     /// The RADIUS server's certificate on an enterprise network.
     certificate: Option<String>,
+    /// The saved networks' names (see `saved`).
+    saved: Vec<String>,
     requests: VecDeque<Request>,
     /// Ethernet frames from the network stack.
     outgoing: VecDeque<Vec<u8>>,
@@ -105,6 +109,7 @@ static SHARED: SpinLock<Shared> = SpinLock::new(Shared {
     networks: Vec::new(),
     connected: None,
     certificate: None,
+    saved: Vec::new(),
     requests: VecDeque::new(),
     outgoing: VecDeque::new(),
     sent: 0,
@@ -164,6 +169,9 @@ pub fn status_text() -> String {
     if let Some(certificate) = &shared.certificate {
         let _ = writeln!(out, "server certificate: {certificate}");
     }
+    if !shared.saved.is_empty() {
+        let _ = writeln!(out, "saved: {}", shared.saved.join(", "));
+    }
     let _ = writeln!(out, "networks:");
     for bss in &shared.networks {
         let _ = writeln!(
@@ -179,12 +187,20 @@ pub fn status_text() -> String {
 }
 
 /// A write to /proc/wifi: "scan", "connect\nSSID\nPASSWORD",
-/// "connect\nSSID\nPASSWORD\nUSER" (enterprise networks) or "disconnect".
+/// "connect\nSSID\nPASSWORD\nUSER" (enterprise networks), "disconnect"
+/// or "forget\nSSID".
 pub fn control(bytes: &[u8]) -> SysResult<()> {
     let mut lines = bytes.split(|&byte| byte == b'\n');
     let request = match lines.next().unwrap_or_default().trim_ascii() {
         b"scan" => Request::Scan,
         b"disconnect" => Request::Disconnect,
+        b"forget" => {
+            let ssid = lines.next().unwrap_or_default().to_vec();
+            if ssid.is_empty() || ssid.len() > 32 {
+                return Err(Errno::EINVAL);
+            }
+            Request::Forget(ssid)
+        }
         b"connect" => {
             let ssid = lines.next().unwrap_or_default().to_vec();
             let password = lines.next().unwrap_or_default().to_vec();
@@ -311,7 +327,18 @@ struct Radio<'a> {
     deferred: VecDeque<Packet>,
     link: Option<Link>,
     networks: Vec<Bss>,
+    saved: Saved,
+    /// Whether to join saved networks by itself (not after being asked to
+    /// disconnect), when to try next, and how long to wait after that.
+    auto_join: bool,
+    next_auto_join: u64,
+    auto_join_wait: u64,
 }
+
+/// Between tries at joining a saved network while none is in range: from
+/// half a minute, doubling, up to five minutes.
+const AUTO_JOIN_FIRST_WAIT_MS: u64 = 30_000;
+const AUTO_JOIN_LONGEST_WAIT_MS: u64 = 300_000;
 
 /// Brings up the runtime firmware and serves requests until the card
 /// fails.
@@ -325,6 +352,10 @@ pub fn run(card: &mut Transport, firmware: &Firmware, init: InitResults) -> Resu
         deferred: VecDeque::new(),
         link: None,
         networks: Vec::new(),
+        saved: Saved::new(),
+        auto_join: true,
+        next_auto_join: u64::MAX,
+        auto_join_wait: AUTO_JOIN_FIRST_WAIT_MS,
     };
     radio.start()?;
     // Once: after a firmware error the card starts over, with the same
@@ -497,18 +528,51 @@ impl Radio<'_> {
                     if self.link.is_some() {
                         self.disconnect("connecting elsewhere")?;
                     }
-                    if let Err(error) = self.connect(&ssid, &password, &identity) {
-                        let message = match error {
-                            JoinError::Card(error) => return Err(error),
-                            JoinError::Failed(message) => message,
-                        };
-                        fail(message);
-                        self.start()?;
-                        set_state("idle");
+                    self.auto_join = true;
+                    // Without a password: the saved one, if any.
+                    let (password, identity) = match self.saved.list.iter().find(|known| known.ssid == ssid) {
+                        Some(known) if password.is_empty() && identity.is_empty() => {
+                            (known.password.clone(), known.identity.clone())
+                        }
+                        _ => (password, identity),
+                    };
+                    match self.connect(&ssid, &password, &identity) {
+                        Ok(()) => {
+                            self.saved.remember(Network { ssid, password, identity });
+                            self.publish_saved();
+                        }
+                        Err(JoinError::Card(error)) => return Err(error),
+                        Err(JoinError::Failed(message)) => {
+                            fail(message);
+                            self.start()?;
+                            set_state("idle");
+                        }
                     }
                 }
-                Some(Request::Disconnect) if self.link.is_some() => self.disconnect("asked to")?,
-                Some(Request::Disconnect) | None => {}
+                Some(Request::Disconnect) => {
+                    // Asked to: no joining by itself until asked to join.
+                    self.auto_join = false;
+                    if self.link.is_some() {
+                        self.disconnect("asked to")?;
+                    }
+                }
+                Some(Request::Forget(ssid)) => {
+                    if !self.saved.forget(&ssid) {
+                        fail(alloc::format!("{:?} isn't saved", String::from_utf8_lossy(&ssid)));
+                    }
+                    self.publish_saved();
+                    let state = if self.link.is_some() { "connected" } else { "idle" };
+                    set_state(state);
+                }
+                None => {
+                    if self.saved.load_if_ready() {
+                        self.publish_saved();
+                        self.next_auto_join = time::ticks();
+                    }
+                    if self.link.is_none() && self.auto_join && time::ticks() >= self.next_auto_join {
+                        self.join_saved()?;
+                    }
+                }
             }
 
             let mut busy = false;
@@ -543,6 +607,9 @@ impl Radio<'_> {
                 debug!("wifi: missed beacons: {since_rx} since the last frame, {total} in a row");
                 if self.link.is_some() && since_rx >= MISSED_BEACONS_LIMIT {
                     self.disconnect("the access point stopped answering")?;
+                    // Back in range soon, perhaps.
+                    self.next_auto_join = time::ticks() + 5000;
+                    self.auto_join_wait = AUTO_JOIN_FIRST_WAIT_MS;
                 }
             }
             // Statistics come with every beacon; nothing here uses them.
@@ -1281,6 +1348,54 @@ impl Radio<'_> {
             connected.signal = info.signal;
         }
         Ok(())
+    }
+
+    /// Joins the saved network with the strongest signal in range, if
+    /// any; tries again later if none is (or joining fails).
+    fn join_saved(&mut self) -> Result<(), Error> {
+        self.next_auto_join = u64::MAX;
+        if self.saved.list.is_empty() {
+            return Ok(());
+        }
+        self.scan(&[])?;
+        let best = self
+            .networks
+            .iter()
+            .filter_map(|bss| Some((bss.signal, self.saved.list.iter().find(|known| known.ssid == bss.ssid)?)))
+            .max_by_key(|&(signal, _)| signal)
+            .map(|(_, network)| network.clone());
+        let joined = match best {
+            None => {
+                debug!("wifi: no saved network in range");
+                set_state("idle");
+                false
+            }
+            Some(network) => {
+                info!("wifi: joining saved network {:?}", String::from_utf8_lossy(&network.ssid));
+                match self.connect(&network.ssid, &network.password, &network.identity) {
+                    Ok(()) => true,
+                    Err(JoinError::Card(error)) => return Err(error),
+                    Err(JoinError::Failed(message)) => {
+                        warn!("wifi: joining a saved network: {message}");
+                        self.start()?;
+                        set_state("idle");
+                        false
+                    }
+                }
+            }
+        };
+        if joined {
+            self.auto_join_wait = AUTO_JOIN_FIRST_WAIT_MS;
+        } else {
+            self.next_auto_join = time::ticks() + self.auto_join_wait;
+            self.auto_join_wait = (self.auto_join_wait * 2).min(AUTO_JOIN_LONGEST_WAIT_MS);
+        }
+        Ok(())
+    }
+
+    fn publish_saved(&self) {
+        let names = self.saved.list.iter().map(|network| String::from_utf8_lossy(&network.ssid).into_owned()).collect();
+        SHARED.lock().saved = names;
     }
 
     /// Leaves the network: tells the access point, then restarts the
