@@ -3197,6 +3197,17 @@ an EC this code misreads, and powering off at every boot would leave the
 machine unusable. QEMU has no EC, so the test runs the reading code
 against a pretend register file.
 
+The same thread looks at the lid twice a second (0x46 bit 2, "lid open").
+While it's closed the backlight is off (`intel_display::set_lid_closed`
+keeps the brightness to come back to, which is what
+`/sys/class/backlight` reports meanwhile), since the panel's light is most
+of an idle laptop's power and nobody can see it. Real suspend (S3) would
+save more, but resuming means bringing the GPU back up without firmware
+help, which needs a modesetting driver eliOS doesn't have. The lid is only
+acted on once it has been seen open: a lid that reads closed from boot is a
+bit this code misreads, not a closed laptop someone is using. Programs see
+Linux's `/proc/acpi/button/lid/LID/state`.
+
 ## 21. Userland
 
 ### libeli (`user/eli`)

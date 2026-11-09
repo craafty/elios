@@ -12,7 +12,8 @@
 //! these machines documents:
 //!
 //! - 0x38: battery 0's state (bit 4 charging, bit 5 discharging, bit 7
-//!   present); 0x46 bit 4: the charger is plugged in.
+//!   present); 0x46 bit 4: the charger is plugged in, bit 2: the lid is
+//!   open.
 //! - 0x81: a page selector for the 16 bytes at 0xA0 (battery number in
 //!   the top four bits, page in the bottom). Page 0: remaining and full
 //!   capacity, present rate (signed), voltage (mV); page 1, bit 15 of
@@ -29,11 +30,15 @@
 //! written and marked clean), as Linux desktops do. Only after watching it
 //! fall there, though: a battery that already reads empty at boot may be
 //! a layout this doesn't understand, and powering off then would make the
-//! machine unusable. Programs see it as
+//! machine unusable. The lid is looked at twice a second, and the
+//! backlight turned off while it's closed (but only once it has been seen
+//! open, so a misread can't darken the screen of a machine in use).
+//! Programs see the battery as
 //! Linux's `/sys/class/power_supply/BAT0` and `AC` (see `fs/sysfs.rs`).
 
 use alloc::format;
 use alloc::string::String;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::arch::{inb, outb};
 use crate::sync::SpinLock;
@@ -52,6 +57,10 @@ const PAGE: u8 = 0x81;
 const PAGE_DATA: u8 = 0xA0;
 
 const READ_EVERY_MS: u64 = 5000;
+/// The lid is looked at more often, so the screen goes dark promptly.
+const LID_EVERY_MS: u64 = 500;
+/// 0x46 bit 2: the lid is open.
+const LID_OPEN: u8 = 1 << 2;
 /// At or below this percentage on battery, the machine is powered off
 /// cleanly before it dies with the disks half written.
 const CRITICAL_PERCENT: u32 = 3;
@@ -97,10 +106,21 @@ pub struct Reading {
 
 static READING: SpinLock<Option<Reading>> = SpinLock::new(None);
 static TRANSACTION: SpinLock<()> = SpinLock::new(());
+/// The lid: 0 not known, 1 open, 2 closed.
+static LID: AtomicU8 = AtomicU8::new(0);
 
 /// The last reading, if the machine has a ThinkPad EC.
 pub fn reading() -> Option<Reading> {
     *READING.lock()
+}
+
+/// Whether the lid is open, if the machine has a ThinkPad EC.
+pub fn lid_open() -> Option<bool> {
+    match LID.load(Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
 }
 
 pub fn probe() {
@@ -192,7 +212,32 @@ impl Ec {
         // readings in a row since.
         let mut seen_above_critical = false;
         let mut critical = 0;
+        // The lid is only acted on once it has been seen open: closed at
+        // boot means this machine keeps it somewhere else (the owner is
+        // looking at the screen), and darkening it would be a disaster.
+        let mut seen_lid_open = false;
+        let mut since_battery = READ_EVERY_MS;
         loop {
+            match self.read(CHARGER) {
+                Ok(value) => {
+                    let open = value & LID_OPEN != 0;
+                    let was = LID.swap(if open { 1 } else { 2 }, Ordering::Relaxed);
+                    if was != if open { 1 } else { 2 } {
+                        info!("thinkpad-ec: lid {} ({value:#04x})", if open { "open" } else { "closed" });
+                    }
+                    seen_lid_open |= open;
+                    if seen_lid_open {
+                        crate::drivers::intel_display::set_lid_closed(!open);
+                    }
+                }
+                Err(error) => debug!("thinkpad-ec: lid: {error}"),
+            }
+            task::sleep_ms(LID_EVERY_MS);
+            since_battery += LID_EVERY_MS;
+            if since_battery < READ_EVERY_MS {
+                continue;
+            }
+            since_battery = 0;
             match measure(&self, first) {
                 Ok(reading) => {
                     failures = 0;
@@ -235,7 +280,6 @@ impl Ec {
                 }
             }
             first = false;
-            task::sleep_ms(READ_EVERY_MS);
         }
     }
 }

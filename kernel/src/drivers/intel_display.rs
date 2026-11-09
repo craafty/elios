@@ -22,6 +22,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::pci;
 use crate::memory::{self, CacheType};
+use crate::sync::SpinLock;
 use crate::{task, time};
 
 /// One register block per pipe (A, B, C), 0x1000 apart.
@@ -108,8 +109,20 @@ fn probe_backlight(base: u64) {
     BACKLIGHT.store(base, Ordering::Release);
 }
 
-/// The backlight's (brightness, most) if there's one to control.
+/// While the lid is closed, the brightness to go back to (the backlight
+/// itself is off).
+static DARK: SpinLock<Option<u32>> = SpinLock::new(None);
+
+/// The backlight's (brightness, most) if there's one to control. While
+/// the lid has it off, the brightness it will come back to.
 pub fn backlight() -> Option<(u32, u32)> {
+    let dark = DARK.lock();
+    let (brightness, most) = lit_backlight()?;
+    Some((dark.unwrap_or(brightness), most))
+}
+
+/// What the PWM is set to now.
+fn lit_backlight() -> Option<(u32, u32)> {
     let base = BACKLIGHT.load(Ordering::Acquire);
     if base == 0 {
         return None;
@@ -122,16 +135,46 @@ pub fn backlight() -> Option<(u32, u32)> {
 
 /// Sets the backlight's brightness, out of [`backlight`]'s most; never
 /// below a twentieth of that, so the screen can't go dark by mistake.
+/// While the lid is closed it's what comes back when it opens.
 pub fn set_backlight(brightness: u32) -> bool {
-    let base = BACKLIGHT.load(Ordering::Acquire);
-    let Some((_, most)) = backlight() else { return false };
+    let mut dark = DARK.lock();
+    let Some((_, most)) = lit_backlight() else { return false };
     let brightness = brightness.clamp(most.div_ceil(20), most);
+    match dark.as_mut() {
+        Some(saved) => *saved = brightness,
+        None => write_backlight(brightness, most),
+    }
+    debug!("display: backlight {brightness} of {most}");
+    true
+}
+
+/// Turns the backlight off while the lid is closed (nobody can see the
+/// panel, and it's most of a laptop's idle power), and back as it was
+/// when it opens.
+pub fn set_lid_closed(closed: bool) {
+    let mut dark = DARK.lock();
+    let Some((brightness, most)) = lit_backlight() else { return };
+    match (closed, *dark) {
+        (true, None) => {
+            *dark = Some(brightness);
+            write_backlight(0, most);
+            info!("display: lid closed: backlight off (was {brightness} of {most})");
+        }
+        (false, Some(saved)) => {
+            *dark = None;
+            write_backlight(saved, most);
+            info!("display: lid open: backlight back to {saved} of {most}");
+        }
+        _ => {}
+    }
+}
+
+fn write_backlight(brightness: u32, most: u32) {
+    let base = BACKLIGHT.load(Ordering::Acquire);
     let inverted = read(base, BLC_PWM_PCH_CTL1) & (1 << 29) != 0;
     let duty = if inverted { most - brightness } else { brightness };
     // SAFETY: the mapped register space; only the duty cycle changes.
     unsafe { ((base as usize + BLC_PWM_PCH_CTL2) as *mut u32).write_volatile(most << 16 | duty) };
-    debug!("display: backlight {brightness} of {most}");
-    true
 }
 
 /// Returns at the start of the next vertical blank (or at once if the

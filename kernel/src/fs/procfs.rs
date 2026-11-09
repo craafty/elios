@@ -196,6 +196,15 @@ pub fn create() -> Arc<dyn Inode> {
             // Cameras: formats, sizes, rates, and whether they're streaming.
             ("video".into(), generated(crate::video::status_text)),
         ];
+        if crate::drivers::thinkpad_ec::lid_open().is_some() {
+            // As Linux's ACPI button driver has it ("state:      open").
+            let open = || crate::drivers::thinkpad_ec::lid_open().unwrap_or(true);
+            let state = move || format!("state:      {}\n", if open() { "open" } else { "closed" });
+            let lid = directory(move || alloc::vec![("state".into(), generated(state))]);
+            let lid = directory(move || alloc::vec![("LID".into(), lid.clone())]);
+            let button = directory(move || alloc::vec![("lid".into(), lid.clone())]);
+            entries.push(("acpi".into(), directory(move || alloc::vec![("button".into(), button.clone())])));
+        }
         if crate::drivers::intel_wifi::present() {
             // Status, and requests ("scan", "connect\nSSID\nPASSWORD",
             // "disconnect") for the `wifi` command.

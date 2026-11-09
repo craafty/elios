@@ -382,7 +382,8 @@ for web pages.
       in QEMU),
       CPU speed control (turbo on, the same as Linux's "performance"),
       and the battery level, read from the ThinkPad's embedded controller,
-      on the bar and in `/sys/class/power_supply`
+      on the bar and in `/sys/class/power_supply`; the backlight goes off
+      while the lid is closed
 - [x] **Desktop groundwork:** copy-on-write `fork`, shared memory
       (`memfd`, `MAP_SHARED`, a page cache), `epoll`, `eventfd`,
       `timerfd`, Unix domain sockets with descriptor passing,
@@ -424,4 +425,6 @@ for web pages.
       H.264 (Cisco's OpenH264 plugin, which Firefox downloads), with
       Firefox's own seccomp-bpf sandboxes on (filters, traps to `SIGSYS`,
       thread sync); next, a real Teams meeting
-- [ ] **Next:** Wi-Fi working on the T440p, Bluetooth pairing and devices
+- [ ] **Next:** a real Teams meeting on the T440p (camera, headset
+      microphone), wideband Bluetooth voice where the controller allows it,
+      and graphics acceleration (an i915 driver for Mesa)
