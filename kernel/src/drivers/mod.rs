@@ -9,6 +9,7 @@ pub mod intel_display;
 pub mod intel_wifi;
 pub mod nvme;
 pub mod pci;
+pub mod thinkpad_ec;
 pub mod usb;
 
 use alloc::string::String;
@@ -54,6 +55,7 @@ pub fn init() {
     intel_display::probe(&devices);
     intel_wifi::probe(&devices);
     usb::probe(&devices);
+    thinkpad_ec::probe();
 }
 
 /// How long to wait for the root file system (and the firmware file).

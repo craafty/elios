@@ -110,7 +110,7 @@ pub struct Desktop {
     /// few seconds.
     browser_installed: bool,
     ticks: u32,
-    /// The status area left of the clock (the network, for now).
+    /// The status area left of the clock (the network and battery).
     status: String,
 }
 
@@ -162,7 +162,7 @@ impl Desktop {
             super_alone: false,
             browser_installed: browser_path().is_some(),
             ticks: 0,
-            status: apps::network_status(),
+            status: apps::status(),
             pointer,
             pointer_focus: None,
             cursor: None,
@@ -759,7 +759,7 @@ impl Desktop {
         let session_width = self.font.width(&self.user) + 16;
         let right = width - session_width - 4;
         let mut status = self.status.clone();
-        while self.font.width(&status) > 240 {
+        while self.font.width(&status) > 400 {
             status.pop();
         }
         let status_width = if status.is_empty() { 0 } else { self.font.width(&status) + 24 };
@@ -1008,7 +1008,7 @@ impl Desktop {
         if self.ticks.is_multiple_of(120) {
             self.zone = eli::time::local_zone();
             let installed = browser_path().is_some();
-            let status = apps::network_status();
+            let status = apps::status();
             if installed != self.browser_installed || status != self.status {
                 self.browser_installed = installed;
                 self.status = status;

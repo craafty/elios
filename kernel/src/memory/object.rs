@@ -238,20 +238,29 @@ mod tests {
         }
 
         fn truncating_drops_pages_and_zeroes_the_tail() {
-            let before = frames::stats().free_bytes;
-            let object = MemoryObject::new();
-            object.write(0, &[0xAA; 3 * 4096]).unwrap();
-            // A mapping's reference keeps a dropped page alive.
-            let kept = object.page(2).unwrap();
-            object.truncate(100);
-            assert_eq!(object.resident_bytes(), PAGE_SIZE);
-            object.truncate(8192);
-            let mut buffer = [0xFFu8; 8];
-            object.read(100, &mut buffer).unwrap();
-            assert_eq!(buffer, [0; 8]);
-            frames::free(kept);
-            drop(object);
-            assert_eq!(frames::stats().free_bytes, before);
+            // Other threads allocate too, so a round they disturbed is
+            // tried again.
+            for round in 1..=5 {
+                let before = frames::stats().free_bytes;
+                let object = MemoryObject::new();
+                object.write(0, &[0xAA; 3 * 4096]).unwrap();
+                // A mapping's reference keeps a dropped page alive.
+                let kept = object.page(2).unwrap();
+                object.truncate(100);
+                assert_eq!(object.resident_bytes(), PAGE_SIZE);
+                object.truncate(8192);
+                let mut buffer = [0xFFu8; 8];
+                object.read(100, &mut buffer).unwrap();
+                assert_eq!(buffer, [0; 8]);
+                frames::free(kept);
+                drop(object);
+                let after = frames::stats().free_bytes;
+                if after == before || round == 5 {
+                    assert_eq!(after, before);
+                    break;
+                }
+                crate::task::sleep_ms(100);
+            }
         }
     }
 }

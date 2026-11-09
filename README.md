@@ -380,7 +380,9 @@ for web pages.
       microphone stands in for card 0's while something records, and the
       earpiece plays meanwhile), checked against a pretend controller
       in QEMU),
-      and CPU speed control (turbo on, the same as Linux's "performance")
+      CPU speed control (turbo on, the same as Linux's "performance"),
+      and the battery level, read from the ThinkPad's embedded controller,
+      on the bar and in `/sys/class/power_supply`
 - [x] **Desktop groundwork:** copy-on-write `fork`, shared memory
       (`memfd`, `MAP_SHARED`, a page cache), `epoll`, `eventfd`,
       `timerfd`, Unix domain sockets with descriptor passing,

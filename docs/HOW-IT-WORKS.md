@@ -3154,6 +3154,32 @@ XSDT (or the older RSDT), with every checksum verified.
 `reboot` uses the FADT's reset register when present, then the keyboard
 controller's reset line, then a deliberate triple fault.
 
+### The battery (`drivers/thinkpad_ec.rs`)
+
+A laptop's battery belongs to its embedded controller (EC), a small
+microcontroller that also runs the fan and the power button. Operating
+systems normally ask the firmware's AML methods (`_BST`, `_BIF`), which
+read the EC's registers; without an AML interpreter, eliOS reads those
+registers itself. Lenovo's ThinkPad EC firmware (the "H8", the same for
+a decade of models, the T440p included) keeps the battery at fixed places,
+which coreboot's ACPI code for these machines documents: the state byte at
+0x38 (charging, discharging, present), the charger bit at 0x46, and a
+16-byte window at 0xA0 whose contents a page selector at 0x81 picks
+(remaining and full capacity, the present rate in mA and the voltage;
+whether capacities are in 10 mWh or mAh; the design capacity). It's spoken
+to with ACPI's EC protocol on ports 0x62/0x66 (or those the ECDT names):
+a command byte, the address, and a wait on the status port's input-full
+and output-full bits for each byte. Only firmware whose FADT says
+"LENOVO" is touched, and readings that make no sense (nothing full, more
+left than fits) are dropped.
+
+A thread reads it every five seconds and logs changes ("battery: 83%,
+Discharging at 9500 mW, ..."). Programs see Linux's
+`/sys/class/power_supply/AC` and `BAT0` (`status`, `capacity`,
+`energy_now`, `power_now`, ...), and the desktop's bar shows "Battery 83%"
+or "Charging 83%" next to the network. QEMU has no EC, so the test runs
+the reading code against a pretend register file.
+
 ## 21. Userland
 
 ### libeli (`user/eli`)

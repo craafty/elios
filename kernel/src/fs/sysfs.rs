@@ -5,6 +5,10 @@
 //!   `device/model`, and a directory per partition with `partition` (its
 //!   number), `start` and `size`.
 //! - `/sys/firmware/efi/efivars/`: UEFI variables (see `efivarfs.rs`).
+//! - `/sys/class/power_supply/`: on ThinkPads, `AC` (`online`) and `BAT0`
+//!   (`status`, `capacity` in percent, energy in µWh or charge in µAh,
+//!   power in µW or current in µA, `voltage_now` in µV), read from the
+//!   embedded controller (`drivers/thinkpad_ec.rs`).
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -14,11 +18,15 @@ use alloc::vec::Vec;
 use super::Inode;
 use super::procfs::{Listing, directory, generated};
 use crate::drivers::block::{self, Disk, Partition};
+use crate::drivers::thinkpad_ec::{self, State};
 
 /// The /sys directory.
 pub fn create() -> Arc<dyn Inode> {
     directory(|| {
-        let mut entries: Listing = alloc::vec![("block".into(), directory(block_listing))];
+        let mut entries: Listing = alloc::vec![
+            ("block".into(), directory(block_listing)),
+            ("class".into(), directory(|| alloc::vec![("power_supply".into(), directory(power_supplies))])),
+        ];
         // /sys/firmware/efi exists on UEFI systems, which is how programs
         // tell; its efivars directory holds the firmware's variables.
         if crate::efi::available() {
@@ -72,4 +80,42 @@ fn partition_directory(partition: Partition) -> Arc<dyn Inode> {
             ("uuid".into(), value(block::guid_text(&partition.guid))),
         ]
     })
+}
+
+fn power_supplies() -> Listing {
+    let Some(reading) = thinkpad_ec::reading() else { return Listing::new() };
+    let mut entries: Listing = alloc::vec![(
+        "AC".into(),
+        directory(move || {
+            alloc::vec![("type".into(), value("Mains")), ("online".into(), value(u8::from(reading.plugged_in)))]
+        }),
+    )];
+    if let Some(battery) = reading.battery {
+        entries.push(("BAT0".into(), directory(move || battery_files(battery))));
+    }
+    entries
+}
+
+fn battery_files(battery: thinkpad_ec::Battery) -> Listing {
+    let status = match battery.state {
+        State::Charging => "Charging",
+        State::Discharging => "Discharging",
+        State::Idle if battery.percent() >= 95 => "Full",
+        State::Idle => "Not charging",
+    };
+    // Linux names the values by their unit: energy (µWh) and power (µW),
+    // or charge (µAh) and current (µA).
+    let (amount, flow) = if battery.in_mwh { ("energy", "power") } else { ("charge", "current") };
+    alloc::vec![
+        ("type".into(), value("Battery")),
+        ("present".into(), value(1)),
+        ("status".into(), value(status)),
+        ("capacity".into(), value(battery.percent())),
+        ("technology".into(), value("Li-ion")),
+        (format!("{amount}_now"), value(u64::from(battery.remaining) * 1000)),
+        (format!("{amount}_full"), value(u64::from(battery.full) * 1000)),
+        (format!("{amount}_full_design"), value(u64::from(battery.design) * 1000)),
+        (format!("{flow}_now"), value(u64::from(battery.rate) * 1000)),
+        ("voltage_now".into(), value(u64::from(battery.millivolts) * 1000)),
+    ]
 }

@@ -54,8 +54,20 @@ static MADT: Once<Madt> = Once::new();
 /// those cover.
 pub fn init(rsdp: u64) -> Result<&'static Madt, &'static str> {
     let tables = root_tables(rsdp)?;
-    if let Some(power) = find_table(&tables, b"FACP").and_then(parse_fadt) {
-        let _ = POWER.set(power);
+    if let Some(fadt) = find_table(&tables, b"FACP") {
+        let _ = MAKER.set(read::<[u8; 6]>(fadt + 10));
+        if let Some(power) = parse_fadt(fadt) {
+            let _ = POWER.set(power);
+        }
+    }
+    if let Some(ecdt) = find_table(&tables, b"ECDT") {
+        // Two generic addresses (12 bytes each, the address 4 bytes in)
+        // after the header: the command/status port, then the data port.
+        let (command, data) = (read::<u64>(ecdt + SDT_HEADER_SIZE + 4), read::<u64>(ecdt + SDT_HEADER_SIZE + 16));
+        let in_io_space = read::<u8>(ecdt + SDT_HEADER_SIZE) == 1 && read::<u8>(ecdt + SDT_HEADER_SIZE + 12) == 1;
+        if in_io_space && command <= 0xFFFF && data <= 0xFFFF {
+            let _ = EMBEDDED_CONTROLLER.set((command as u16, data as u16));
+        }
     }
     let madt = find_table(&tables, b"APIC").ok_or("the ACPI tables have no MADT")?;
     MADT.set(parse_madt(madt, read::<u32>(madt + 4))).map_err(|_| "ACPI initialized twice")
@@ -86,6 +98,20 @@ static POWER: Once<Power> = Once::new();
 
 pub fn power() -> Option<&'static Power> {
     POWER.get()
+}
+
+static MAKER: Once<[u8; 6]> = Once::new();
+static EMBEDDED_CONTROLLER: Once<(u16, u16)> = Once::new();
+
+/// The OEM ID in the FADT: who made the firmware ("LENOVO", "BOCHS ").
+pub fn maker() -> &'static str {
+    MAKER.get().and_then(|id| core::str::from_utf8(id).ok()).map_or("", str::trim_end)
+}
+
+/// The embedded controller's command/status and data ports, from the
+/// ECDT, if the firmware has one.
+pub fn embedded_controller() -> Option<(u16, u16)> {
+    EMBEDDED_CONTROLLER.get().copied()
 }
 
 /// The addresses of every table the RSDT or XSDT lists. (This runs before

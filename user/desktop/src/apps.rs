@@ -104,9 +104,34 @@ fn split_exec(exec: &str) -> Vec<String> {
     words
 }
 
-/// The bar's network status: the Wi-Fi network's name, "Wired", or
-/// "Offline", from the default route (`/proc/net/route`) and `/proc/wifi`.
-pub fn network_status() -> String {
+/// The bar's status area: the network, then the battery if there is one.
+pub fn status() -> String {
+    let network = network_status();
+    match battery_status() {
+        Some(battery) => alloc::format!("{network}   {battery}"),
+        None => network,
+    }
+}
+
+/// "Battery 83%", "Charging 83%" or "Plugged in 100%", from Linux's
+/// `/sys/class/power_supply/BAT0`.
+fn battery_status() -> Option<String> {
+    let read = |name: &str| {
+        let text = eli::fs::read(&alloc::format!("/sys/class/power_supply/BAT0/{name}")).ok()?;
+        Some(String::from_utf8_lossy(&text).trim().to_string())
+    };
+    let capacity = read("capacity")?;
+    let label = match read("status")?.as_str() {
+        "Charging" => "Charging",
+        "Discharging" => "Battery",
+        _ => "Plugged in",
+    };
+    Some(alloc::format!("{label} {capacity}%"))
+}
+
+/// The network status: the Wi-Fi network's name, "Wired", or "Offline",
+/// from the default route (`/proc/net/route`) and `/proc/wifi`.
+fn network_status() -> String {
     let routes = eli::fs::read("/proc/net/route").unwrap_or_default();
     let routes = String::from_utf8_lossy(&routes);
     let default = routes.lines().skip(1).find_map(|line| {
