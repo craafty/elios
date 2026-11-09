@@ -2264,10 +2264,9 @@ Implementation choices:
   In the kernel the "device" is the block cache (`fs/blockcache.rs`), the
   equivalent of Linux's page cache for the disk itself, in 4 KiB pages.
   Reads stay there: the ext2 code looks up directories, inodes and block
-  maps on the disk on every operation, and on a USB stick (the live
-  system's data partition, where Firefox lives) each request costs a
-  millisecond or more, so Firefox's start made thousands of them every
-  time. The cache takes at most a quarter of the RAM, stops growing while
+  maps on the disk on every operation, and on a USB disk each request
+  costs a millisecond or more, so Firefox's start made thousands of them
+  every time. The cache takes at most a quarter of the RAM, stops growing while
   less than an eighth is free, and gives back least recently used clean
   pages (checked every second) when memory runs short. Writes wait there
   too: writing a file 4 KiB at a time rewrites the same bitmap, inode and
@@ -2281,12 +2280,11 @@ Implementation choices:
   SQLite (Firefox's profile) calls it several times a second and each one
   was five to ten separate writes. A crash loses at most those seconds,
   as with Linux's page cache; reads see what's waiting. Measured in QEMU
-  on a stick throttled like a real one (`cargo xtask run --slow-stick`:
-  30 MB/s and 1000 requests a second reading, 10 MB/s and 20 a second
-  writing): `dd bs=4096` went from 3 MB/s to over 500; booting makes half
-  the read requests (2,800); Firefox's second start reads 8 requests
-  instead of 5,900; its very first start (making the profile) went from
-  1,032 writes and 20-40 s to 422 writes and a window within 12 s.
+  on a USB disk throttled like a cheap stick (QEMU's `throttling.*` drive
+  options: 30 MB/s and 1000 requests a second reading, 10 MB/s and 20 a
+  second writing): `dd bs=4096` went from 3 MB/s to over 500; Firefox's
+  second start reads 8 requests instead of 5,900; its first start
+  (making the profile) 422 writes instead of 1,032.
 - **Allocation:** a file's blocks are taken starting just after its
   previous block (so files stay contiguous); new directories go to the
   group with the most free inodes (spreading the tree out), new files to
@@ -2720,7 +2718,7 @@ hold any byte), the latest first, sixteen at most. Only the data
 partition keeps them: an enterprise password is someone's own account
 password, and the boot partition is FAT, with no permissions. Once the
 file is read (the thread looks for `/data` every few seconds for two
-minutes, as a live stick mounts its own late), and whenever the
+minutes), and whenever the
 connection drops after missed beacons, the thread scans and joins the
 saved network with the strongest signal. The access point often refuses
 the first join after a reboot (a deauthentication, reason 8, "leaving":
@@ -2806,12 +2804,9 @@ we have a key for them, and they're authenticated with it.
 **Link keys** (`keys.rs`) are kept in `bluetooth/keys` (mode 0600) on the
 data partition, or on the boot partition of a live USB stick: one line a
 device, `ADDRESS KEY TYPE CLASS NAME`. The thread starts before file
-systems are mounted, so it looks every two seconds until one is. A live
-stick with its own data partition (section on where things live) keeps
-them in both: its boot partition is mounted first, but writing a newer
-image replaces that one, while the data partition, mounted a little later
-by `eli boot`, lasts. Both files are read once mounted and merged, and if
-one lacks keys the other has, both are written again.
+systems are mounted, so it looks every two seconds until one is. An
+installed system reads both places, merges them, and saves to the data
+partition.
 
 **ACL data and L2CAP** (`l2cap.rs`). A connection carries ACL packets,
 up to the controller's buffer size (1021 bytes for the 7260), and the
@@ -3746,34 +3741,7 @@ very large package collection instead of a new one.
 
 Everything that should last is under `/data`: the data partition on an
 installed system (the kernel mounts it from `data=PARTUUID=...` on the
-command line), or, on the live system, a partition of its own USB stick
-when there's room there, and a directory in memory when there isn't.
-
-**The live stick's data partition** (`manager/live.rs`). Writing the image
-to a stick with `dd` uses its first 130 MB and leaves the rest unused, so
-everything done on the live system (packages, Wi-Fi networks, the Firefox
-profile and its sign-ins) used to be gone at the next boot. Now, before
-anything else, `eli boot` on a live system (no `root=` or `data=` on the
-command line) reads the GPT of the disk holding `/disk` and looks for a
-partition of eliOS's data type. If there's none, it moves the table's end
-to the disk's real end (the image's table ends where the image does), and
-if at least 1 GiB is free from 1 GiB in, it adds a partition there (16 GiB
-at most, so formatting, which writes every inode table, stays quick on a
-slow stick), formats it ext2 and mounts it at `/data`. The kernel rereads
-the table with a mounted partition on the same disk, which it allows as
-long as no mounted partition moves or shrinks.
-
-It starts at a fixed place, 1 GiB in, so the image must stay smaller than
-that: writing a newer image over the stick then replaces the table (which
-no longer lists the partition) but not the file system. The next boot
-finds an ext2 superblock labelled "eliOS data" at 1 GiB, lists the
-partition again at the size the superblock gives, and mounts it without
-formatting: the packages, settings and homes are still there. Caches stay
-in memory (the desktop sets `XDG_CACHE_HOME` to the runtime directory on a
-live system) because Firefox writes hundreds of megabytes of video cache
-and USB sticks are slow to write. `cargo xtask run --big-stick` tries all
-this: a 4 GiB stick (`target/big-stick.img`) that lasts between runs, the
-image written over its start each time as `dd` would.
+command line), or a directory in memory on the live system.
 
 | Path | What |
 |------|------|
@@ -3928,9 +3896,6 @@ boots that disk alone, as a PC would after the USB stick is removed.
 `--usb-stick` attaches the image as a USB stick instead of a SATA disk (the
 firmware boots from USB, and eliOS must find its boot partition over USB,
 as on a real PC), and `--usb-hub` puts the stick and keyboard behind a hub.
-`--slow-stick` is `--big-stick` throttled to a cheap USB 2 stick's speed
-(30 MB/s and 1000 requests a second reading, 10 MB/s and 20 requests a
-second writing), for measuring what the live system does to one.
 
 A raw disk image rather than an ISO: written to a USB stick it becomes an
 ordinary, writable disk, and QEMU boots it directly.

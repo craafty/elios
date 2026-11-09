@@ -8,17 +8,15 @@
 //!
 //! Keys are kept in `bluetooth/keys` on the data partition (an installed
 //! system) or else on the boot partition (the live USB stick), one line a
-//! device: address, key, key type, class of device, name. A live stick
-//! with a data partition of its own (mounted by `eli boot`, after the
-//! boot partition) keeps them in both: the boot partition's copy is
-//! there from the start, the data partition's outlasts writing a newer
-//! image. Each file is read once its file system is mounted (the
-//! Bluetooth thread starts before the file systems are), and the two are
+//! device: address, key, key type, class of device, name. Each file is
+//! read once its file system is mounted (the Bluetooth thread starts
+//! before the file systems are), and an installed system's two are
 //! merged.
 
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
@@ -50,10 +48,6 @@ pub(super) struct Keys {
 
 /// Where keys may be kept, the preferred first.
 const PLACES: [&str; 2] = ["/data", "/disk"];
-/// A live stick's data partition is mounted within this long of booting
-/// (the first boot formats it, slowly on a slow stick),
-/// if it has one.
-const DATA_WAIT_MS: u64 = 120_000;
 
 /// How often to look for somewhere to keep keys until there is one.
 pub(super) const RETRY_MS: u64 = 2000;
@@ -88,9 +82,13 @@ impl Keys {
             self.read_from.push((base, count));
             read = true;
         }
-        // An installed system has both from the start; a live stick may
-        // get its data partition a little later, or never.
-        self.loaded = self.read_from.len() == PLACES.len() || (!self.read_from.is_empty() && now > DATA_WAIT_MS);
+        // An installed system has both; a live stick only its boot
+        // partition.
+        let installed = crate::cmdline::get("data").is_some();
+        self.loaded = PLACES
+            .iter()
+            .filter(|&&place| installed || place == "/disk")
+            .all(|&place| self.read_from.iter().any(|&(read, _)| read == place));
         // Keys only one place had go to the other too.
         if read && self.read_from.len() > 1 && self.read_from.iter().any(|&(_, count)| count < self.list.len()) {
             self.save();
@@ -176,17 +174,11 @@ impl Keys {
     }
 }
 
-/// Where keys are saved: the data partition if there is one, and the boot
-/// partition if there isn't or this is a live stick (no `data=` on the
-/// command line), whose boot partition is read before its data partition
-/// is mounted.
+/// Where keys are saved: the data partition if there is one, otherwise
+/// the boot partition (the live stick's).
 fn save_places() -> Vec<&'static str> {
-    let data = fs::mount::is_mounted("/data");
-    let live = crate::cmdline::get("data").is_none();
-    PLACES
-        .into_iter()
-        .filter(|&place| if place == "/data" { data } else { (live || !data) && fs::mount::is_mounted(place) })
-        .collect()
+    let place = if fs::mount::is_mounted("/data") { "/data" } else { "/disk" };
+    if fs::mount::is_mounted(place) { vec![place] } else { Vec::new() }
 }
 
 fn read_all(file: &Arc<dyn Inode>) -> String {

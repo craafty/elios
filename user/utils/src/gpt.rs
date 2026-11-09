@@ -15,7 +15,7 @@ use crate::storage::Device;
 const ENTRY_COUNT: usize = 128;
 const ENTRY_SIZE: usize = 128;
 /// Sectors the entries take (128 entries of 128 bytes).
-pub const ENTRY_SECTORS: u64 = (ENTRY_COUNT * ENTRY_SIZE / 512) as u64;
+const ENTRY_SECTORS: u64 = (ENTRY_COUNT * ENTRY_SIZE / 512) as u64;
 /// Partitions start on 1 MiB boundaries, as is customary (and best for
 /// flash memory).
 pub const ALIGNMENT: u64 = 2048;

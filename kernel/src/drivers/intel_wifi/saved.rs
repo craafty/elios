@@ -9,9 +9,8 @@
 //! and an enterprise password is someone's own account password. A live
 //! stick without a data partition remembers nothing past shutdown.
 //!
-//! The data partition may be mounted after the Wi-Fi thread starts (a
-//! live stick's is mounted by `eli boot`), so the file is looked for every
-//! few seconds for the first two minutes.
+//! The data partition may be mounted after the Wi-Fi thread starts, so
+//! the file is looked for every few seconds for the first two minutes.
 
 use alloc::string::String;
 use alloc::vec::Vec;

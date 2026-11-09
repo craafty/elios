@@ -270,27 +270,11 @@ pub fn remove_disk(name: &str) {
 }
 
 /// Rereads a disk's partition table (after a partitioning tool changed it)
-/// and replaces its partitions' files. Refused if a mounted partition
-/// would move, shrink or go away; adding one beside mounted ones (as a
-/// live stick does for its data) is fine.
+/// and replaces its partitions' files. Refused while any is mounted.
 fn reread_partitions(disk: &Arc<dyn Disk>) -> Result<u64> {
     let name = String::from(disk.name());
     if super::mount::disk_in_use(&name) {
-        let new = block::partitions(disk);
-        let dev = directory();
-        for (entry, inode) in dev.entries()? {
-            let Some(file) = inode.as_any().and_then(|any| any.downcast_ref::<BlockDeviceFile>()) else { continue };
-            let old = &file.partition;
-            if old.disk.name() != name
-                || old.number == 0
-                || !super::mount::source_mounted(&alloc::format!("/dev/{entry}"))
-            {
-                continue;
-            }
-            if !new.iter().any(|p| p.number == old.number && p.start == old.start && p.sectors == old.sectors) {
-                return Err(Errno::EBUSY);
-            }
-        }
+        return Err(Errno::EBUSY);
     }
     remove_disk(&name);
     add_disk(disk);

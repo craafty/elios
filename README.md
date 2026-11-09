@@ -94,8 +94,6 @@ cargo xtask run --memory 3G   # more memory (the default is 1G)
 cargo xtask run --forward 8080:80  # reach port 80 in eliOS at localhost:8080
 cargo xtask run --second-disk # an empty 2 GiB disk to format, mount, install to
 cargo xtask run --usb-stick   # start from a (virtual) USB stick, as on a real PC
-cargo xtask run --big-stick   # a 4 GiB stick that keeps its data partition between runs
-cargo xtask run --slow-stick  # the same, throttled to a cheap USB 2 stick's speed
 cargo xtask test              # boot a test kernel and run its tests
 cargo xtask image             # a fresh bootable disk image, target/eliOS.img
 ```
@@ -104,7 +102,7 @@ cargo xtask image             # a fresh bootable disk image, target/eliOS.img
 
 eliOS has a small graphical desktop of its own, `desktop`, which runs
 Wayland programs. Start QEMU with some memory to spare (installed packages
-live in memory on the live system, unless it has a data partition), then choose *Desktop* on the login
+live in memory on the live system), then choose *Desktop* on the login
 screen, or in a text session:
 
 ```sh
@@ -158,11 +156,9 @@ cargo xtask image --release
 sudo dd if=target/eliOS.img of=/dev/sdX bs=4M conv=fsync   # sdX = the stick
 ```
 
-On a stick of 2 GB or more, the first boot makes a data partition in the
-space the image leaves free (from 1 GiB in), so packages added with `eli`,
-Wi-Fi networks, settings and files in `/home` last from one boot to the
-next, and still do after writing a newer image to the stick the same way.
-(`cargo xtask run --big-stick` tries it in QEMU.)
+The live system keeps packages added with `eli`, settings and files in
+`/home` in memory: they're gone at the next boot (install eliOS for them
+to last). Files saved to `/disk` (the stick's FAT partition) do last.
 
 ### Installing it
 
@@ -362,9 +358,7 @@ for web pages.
 - [x] **Installer:** partitions a disk (or uses its free space), a data
       partition, a UEFI boot entry through the firmware's runtime services
 - [x] **System manager:** `system.conf`, packages from Alpine, generations,
-      rollback, a boot menu of generations, the time zone, and a data
-      partition the live USB stick makes for itself, so what's added to
-      it lasts (even across writing a newer image)
+      rollback, a boot menu of generations, the time zone
 - [ ] **Laptop (ThinkPad T440p):** the log saved to the USB stick, USB
       ports routed to xHCI on Intel 8-series chipsets, PS/2 and USB mice
       and `/dev/input`, the I217 Ethernet (works: gigabit, DHCP), sound

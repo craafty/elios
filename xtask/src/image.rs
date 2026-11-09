@@ -17,9 +17,6 @@ const PARTITION_SECTORS: u64 = 128 * 2048;
 /// GPT keeps a backup of its table at the end of the disk.
 const BACKUP_SECTORS: u64 = 33;
 const DISK_SECTORS: u64 = PARTITION_START + PARTITION_SECTORS + 2048;
-// A live system puts its data partition on the stick from 1 GiB in
-// (user/utils/src/manager/live.rs), so writing a newer image leaves it be.
-const _: () = assert!(DISK_SECTORS <= 1 << 21);
 
 const ESP_TYPE: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
 const DISK_GUID: &str = "E1105E1E-0000-4E11-A050-E1105E1E0001";

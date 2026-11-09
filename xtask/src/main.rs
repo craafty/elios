@@ -46,11 +46,6 @@ options:
                put there, without the live disk
   --usb-stick  attach the disk image as a USB stick instead of a SATA disk
                (as when eliOS is started from a stick on a real PC)
-  --big-stick  a USB stick of 4 GiB that lasts between runs (target/big-stick.img),
-               the image written over its start each time, as `dd` does
-  --slow-stick  like --big-stick, but as slow as a cheap USB 2.0 flash
-               stick (QEMU's throttling: about 30 MB/s and 1000 requests a
-               second reading, 10 MB/s and 20 requests a second writing)
   --usb-hub    put the USB keyboard (and stick) behind a USB hub
   --login-screen  session: boot to the login screen instead of a root shell
   --audio-wav FILE  record what eliOS plays to FILE.wav (otherwise the
@@ -60,7 +55,6 @@ options:
 const DEFAULT_CPUS: usize = 4;
 /// The size of the empty disk `--second-disk` attaches.
 const SECOND_DISK_BYTES: u64 = 2 << 30;
-const BIG_STICK_BYTES: u64 = 4 << 30;
 
 const BOOTLOADER_TARGET: &str = "x86_64-unknown-uefi";
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
@@ -108,10 +102,6 @@ struct Options {
     usb_stick: bool,
     /// USB devices go through a hub.
     usb_hub: bool,
-    /// The image written over the start of a bigger, lasting stick.
-    big_stick: bool,
-    /// The stick is throttled to a real flash stick's speed.
-    slow_stick: bool,
     /// Sessions start at the login screen, not logged in as root.
     login_screen: bool,
     /// Use a throwaway copy of the firmware's variables (for tests).
@@ -183,15 +173,6 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<Options, Stri
             "--installed" => options.installed = true,
             "--usb-stick" => options.usb_stick = true,
             "--usb-hub" => options.usb_hub = true,
-            "--big-stick" => {
-                options.big_stick = true;
-                options.usb_stick = true;
-            }
-            "--slow-stick" => {
-                options.slow_stick = true;
-                options.big_stick = true;
-                options.usb_stick = true;
-            }
             "--login-screen" => options.login_screen = true,
             "--audio-wav" => options.audio_wav = Some(args.next().ok_or("--audio-wav needs a file name")?.into()),
             "--cpus" => {
@@ -234,28 +215,7 @@ fn build(options: &Options, command_line: &str) -> Result<PathBuf, String> {
     let kernel = workspace_root().join("target").join(KERNEL_TARGET).join(profile(options.release)).join("elikernel");
     let initrd = build_initrd()?;
     let image = make_disk_image("eliOS.img", &bootloader, &kernel, &initrd, command_line, options.fresh)?;
-    if options.big_stick { big_stick(&image) } else { Ok(image) }
-}
-
-/// What writing the image to a 4 GiB USB stick does (`dd`): the image
-/// replaces the stick's start, and the rest keeps what was there, such as
-/// the data partition a live system makes there (target/big-stick.img;
-/// delete it to start again with an empty stick).
-fn big_stick(image: &Path) -> Result<PathBuf, String> {
-    use std::io::Write;
-    let path = workspace_root().join("target/big-stick.img");
-    let bytes = fs::read(image).map_err(|e| format!("reading {}: {e}", image.display()))?;
-    let mut stick = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|e| format!("opening {}: {e}", path.display()))?;
-    stick.write_all(&bytes).map_err(|e| format!("writing {}: {e}", path.display()))?;
-    if stick.metadata().map_err(|e| e.to_string())?.len() < BIG_STICK_BYTES {
-        stick.set_len(BIG_STICK_BYTES).map_err(|e| format!("sizing {}: {e}", path.display()))?;
-    }
-    Ok(path)
+    Ok(image)
 }
 
 fn test(options: &Options) -> Result<(), String> {
@@ -695,16 +655,7 @@ fn qemu_command(disk: &Path, options: &Options) -> Result<Command, String> {
         // It's first in the boot order, so the firmware starts it even if
         // the second disk has eliOS installed (as a PC would with its USB
         // stick put first).
-        // A flash stick is slowest at small requests, writes above all
-        // (each rewrites a whole erase block): QEMU's throttling limits
-        // requests a second as well as bytes.
-        let throttle = if options.slow_stick {
-            ",throttling.bps-read=31457280,throttling.iops-read=1000,\
-             throttling.bps-write=10485760,throttling.iops-write=20"
-        } else {
-            ""
-        };
-        qemu.arg("-drive").arg(format!("if=none,id=live,format=raw,file={}{throttle}", disk.display()));
+        qemu.arg("-drive").arg(format!("if=none,id=live,format=raw,file={}", disk.display()));
         if !options.usb_stick {
             qemu.args(["-device", "ide-hd,drive=live,bus=ide.0,bootindex=0"]);
         }
